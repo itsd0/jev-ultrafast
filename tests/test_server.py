@@ -419,7 +419,11 @@ def test_live_url_is_transient_never_in_db(start_service, tmp_path, monkeypatch)
 def test_task_validation(start_service):
     base, _ = start_service(lambda fake: snap("done", 0))
     assert api(base, "POST", "/api/tasks", {"goal": "", "url": "https://example.test/"})[0] == 400
-    assert api(base, "POST", "/api/tasks", {"goal": "x"})[0] == 400
+    status, created = api(base, "POST", "/api/tasks", {"goal": "x"})
+    assert status == 201
+    _, task = api(base, "GET", f"/api/tasks/{created['id']}")
+    assert task["url"] == "about:blank"
+    assert api(base, "POST", "/api/tasks", {"goal": "x", "url": "gopher://x/"})[0] == 400
     assert api(base, "POST", "/api/tasks", {
         "goal": "x", "url": "https://example.test/", "browser": "mars",
     })[0] == 400

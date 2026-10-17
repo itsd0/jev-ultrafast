@@ -9,7 +9,7 @@ import pytest
 
 from jev_ultrafast import agent as loop
 from jev_ultrafast import model
-from jev_ultrafast.browser import StalePage, browser_operation, fingerprint
+from jev_ultrafast.browser import StalePage, bind_navigate, browser_operation, fingerprint, validate_navigate_url
 
 
 def page():
@@ -196,6 +196,66 @@ def test_invalid_decision_retries_once_then_blocks(runner, monkeypatch):
     runner.command("predict")
     assert runner.state["status"] == "blocked"
     assert runner.state["blocked_reason"] == "invalid decision response"
+
+
+def test_navigate_url_gate(monkeypatch):
+    monkeypatch.delenv("JEV_ALLOW_LOCAL", raising=False)
+    assert validate_navigate_url("https://en.wikipedia.org/wiki/X") == "https://en.wikipedia.org/wiki/X"
+    assert validate_navigate_url("HTTPS://Example.COM/") == "HTTPS://Example.COM/"
+    for bad in ("http://example.test/", "file:///etc/passwd", "chrome://settings",
+                "javascript:alert(1)", "data:text/plain,x", "https://", "", "not a url",
+                "http://127.0.0.1:8766/fixture.html", "http://localhost/"):
+        with pytest.raises(ValueError, match="Refusing to navigate"):
+            validate_navigate_url(bad)
+    monkeypatch.setenv("JEV_ALLOW_LOCAL", "1")
+    assert validate_navigate_url("http://127.0.0.1:8766/fixture.html") == "http://127.0.0.1:8766/fixture.html"
+    with pytest.raises(ValueError, match="Refusing to navigate"):
+        validate_navigate_url("http://example.test/")
+
+
+def test_navigate_offered_only_on_blank():
+    blank = page()
+    blank["url"] = "about:blank"
+    bound = bind_navigate(blank)
+    assert [a["id"] for a in bound["actions"] if a.get("kind") == "navigate"] == ["navigate"]
+    assert bind_navigate(bound)["actions"].count(bound["actions"][-1]) == 1
+    assert not [a for a in bind_navigate(page())["actions"] if a.get("kind") == "navigate"]
+
+
+def test_navigate_act_uses_model_url(runner, monkeypatch):
+    from jev_ultrafast.questions import NAVIGATE_VALUE
+
+    seen = {}
+    action = {"id": "navigate", "kind": "navigate", "label": "Navigate to a URL from the goal"}
+    runner.state["page"]["actions"] = [action, {"id": "wait", "kind": "wait", "label": "Wait"}]
+    runner.state["page"]["fingerprint"] = fingerprint(runner.state["page"])
+
+    def fake_field_text(context, system=None):
+        seen["system"] = system
+        return "https://example.test/start", {"model": "test", "latency_ms": 3}
+
+    monkeypatch.setattr(loop, "field_text", fake_field_text)
+    runner.state["browser"].navigate = Mock(return_value={"executed": "navigate"})
+    runner.state["decision"] = {**decision("navigate"), "operation": "NAVIGATE"}
+    runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    assert seen["system"] == NAVIGATE_VALUE
+    runner.state["browser"].navigate.assert_called_once_with("https://example.test/start")
+    assert runner.state["history"][-1]["text"] == "https://example.test/start"
+    assert runner.state["status"] == "ready"
+
+
+def test_navigate_act_skips_invalid_url(runner, monkeypatch):
+    action = {"id": "navigate", "kind": "navigate", "label": "Navigate to a URL from the goal"}
+    runner.state["page"]["actions"] = [action, {"id": "wait", "kind": "wait", "label": "Wait"}]
+    runner.state["page"]["fingerprint"] = fingerprint(runner.state["page"])
+    monkeypatch.setattr(
+        loop, "field_text", lambda context, system=None: ("file:///etc/passwd", {"model": "t"})
+    )
+    runner.state["browser"].navigate = Mock(side_effect=ValueError("Refusing to navigate"))
+    runner.state["decision"] = {**decision("navigate"), "operation": "NAVIGATE"}
+    runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    assert runner.state["history"][-1]["note"] == "invalid navigation URL"
+    assert runner.state["status"] == "ready"
 
 
 def test_control_unchanged_rules():

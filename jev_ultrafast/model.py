@@ -901,7 +901,7 @@ def field_context(goal, action, page, history):
     }
 
 
-def field_text(context):
+def field_text(context, system=TEXT_VALUE):
     base = os.environ.get("TEXT_MODEL_BASE_URL", "https://api.inceptionlabs.ai/v1").rstrip("/")
     model_name = os.environ.get("TEXT_MODEL", "mercury-2.5")
     inception = "api.inceptionlabs.ai" in base or model_name.startswith("mercury")
@@ -951,7 +951,7 @@ def field_text(context):
         "response_format": text_schema,
         **reasoning,
         "messages": [
-            {"role": "system", "content": TEXT_VALUE},
+            {"role": "system", "content": system},
             {
                 "role": "user",
                 "content": json.dumps(context),

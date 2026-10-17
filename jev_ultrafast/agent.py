@@ -21,7 +21,7 @@ from .model import (
     match_option,
     post_json,
 )
-from .questions import MAX_STEPS
+from .questions import MAX_STEPS, NAVIGATE_VALUE
 from .vision import confirm_point, needs_vision, propose
 
 _RELOAD_WORDS = frozenset({"reload", "refresh"})
@@ -412,7 +412,28 @@ class Agent:
                     # it is a mutation with no effect; mark the step satisfied.
                     return self._skip_already_set(state, page, action, decision, selected, text, helper)
             result = {"executed": action["id"]}
-            if action["kind"] == "select_option":
+            if action["kind"] == "navigate":
+                if not state["browser"].fresh(page):
+                    raise StalePage("Page changed before text generation. Choose again.")
+                context = field_context(state["goal"], action, page, state["history"])
+                if self.pending_text and self.pending_text[0] == context:
+                    _, text, helper = self.pending_text
+                else:
+                    try:
+                        text, helper = field_text(context, system=NAVIGATE_VALUE)
+                    except ValueError:
+                        return self._skip_text_step(state, page, action, decision, selected)
+                    self.pending_text = (context, text, helper)
+                    state["text_calls"].append({**helper, "field": action["label"], "value": text})
+                try:
+                    result = state["browser"].navigate(text)
+                except ValueError:
+                    return self._skip_text_step(
+                        state, page, action, decision, selected, note="invalid navigation URL"
+                    )
+                self.pending_text = None
+                self.blocked_streak = 0
+            elif action["kind"] == "select_option":
                 options = state["browser"].read_options(action) or []
                 matched = match_option(text, options)
                 if matched:
@@ -549,7 +570,7 @@ class Agent:
         state["status"] = "ready"
         return self.snapshot()
 
-    def _skip_text_step(self, state, page, action, decision, selected):
+    def _skip_text_step(self, state, page, action, decision, selected, note="text helper failed"):
         """A bad text response skips this step. The run keeps going."""
         self.pending_text = None
         state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
@@ -568,7 +589,7 @@ class Agent:
                 "operation": decision["operation"],
                 "target": decision["target"],
                 "possible_closed_shadow": False,
-                "note": "; ".join(part for part in (state.pop("loop_note", None), "text helper failed") if part),
+                "note": "; ".join(part for part in (state.pop("loop_note", None), note) if part),
                 "page_changed": False,
                 "url": page["url"],
                 "usage": decision.get("usage", {}),

@@ -359,9 +359,11 @@ class Runner:
         goal = (goal or "").strip()
         if not goal or len(goal) > 2000:
             raise ValueError("Enter a goal of 1-2,000 characters")
-        parsed = urlparse(url or "")
-        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-            raise ValueError("Enter an http(s) start URL")
+        url = (url or "").strip() or "about:blank"
+        if url != "about:blank":
+            parsed = urlparse(url)
+            if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+                raise ValueError("Enter an http(s) start URL or leave it blank to navigate")
         if browser not in {"local", "cloud"}:
             raise ValueError("browser must be local or cloud")
         if max_decisions is not None and not 1 <= int(max_decisions) <= 10000:

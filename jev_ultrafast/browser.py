@@ -6,12 +6,13 @@ import os
 import sys
 import time
 from pathlib import Path
+from urllib.parse import urlparse
 
 from browser_harness.admin import ensure_daemon
 from browser_harness.helpers import cdp, drain_events
 
 from . import cloud
-from .config import resolve_config, snapshot_config
+from .config import env_bool, resolve_config, snapshot_config
 
 # Atomically read visible content and controls, preserving actual DOM node identity.
 READ_STATE = Path(__file__).with_name("snapshot.js").read_text()
@@ -229,6 +230,7 @@ class Browser:
         if self.config.get("frames") == "all" and state.get("cross_frames"):
             state = self._attach_oopif(state)
         state = bind_uploads(state, self.config.get("files") or {})
+        state = bind_navigate(state)
         state = bind_tabs(state, self)
         return bind_keys(state, self.config.get("keyboard", True))
 
@@ -391,6 +393,14 @@ class Browser:
             time.sleep(0.25)
         return False
 
+    def navigate(self, url):
+        """Model-directed first navigation. The URL gate fails closed."""
+        target = validate_navigate_url(url)
+        self.call("Page.navigate", url=target)
+        self.wait_until_ready()
+        self.after_input = None
+        return {"executed": "navigate", "url": target}
+
     def act(self, action, page, text=None):
         cloud_mode = (getattr(self, "config", None) or {}).get("browser") == "cloud"
         probe = None
@@ -539,6 +549,40 @@ def new_page_targets(events, owned_ids):
         seen.add(target_id)
         found.append(info)
     return found
+
+
+def validate_navigate_url(url):
+    """Fail-closed gate for model-proposed navigation. Returns the cleaned URL."""
+    text = (url or "").strip()
+    parsed = urlparse(text)
+    scheme = (parsed.scheme or "").lower()
+    host = (parsed.hostname or "").lower()
+    if scheme not in {"http", "https"} or not host:
+        raise ValueError(f"Refusing to navigate: need an http(s) URL with a host (scheme={scheme or 'none'})")
+    local = host in {"localhost", "127.0.0.1", "::1"} or host.endswith(".localhost")
+    if scheme != "https" and not local:
+        raise ValueError("Refusing to navigate to a non-https URL")
+    if local and not env_bool("JEV_ALLOW_LOCAL", False):
+        raise ValueError("Refusing to navigate to a local URL without JEV_ALLOW_LOCAL=1")
+    return text
+
+
+def bind_navigate(state):
+    """Offer one NAVIGATE control on a blank page. The text model names the URL."""
+    if (state.get("url") or "").strip() not in {"about:blank", ""}:
+        return state
+    actions = state.get("actions") or []
+    if any(action.get("kind") == "navigate" for action in actions):
+        return state
+    updated = {
+        **state,
+        "actions": [
+            *actions,
+            {"id": "navigate", "kind": "navigate", "label": "Navigate to a URL from the goal"},
+        ],
+    }
+    updated["fingerprint"] = fingerprint(updated)
+    return updated
 
 
 def bind_tabs(state, browser):
