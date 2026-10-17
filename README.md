@@ -123,7 +123,7 @@ In six alternating runs with identical models and settings, both versions passed
 
 The same policy opened the requested Wikipedia article in **2.798 s** and passed a local hotel search/filter task in **1.896 s**. Runs, failures, source hashes, and measurement boundaries are in [performance.md](docs/performance.md).
 
-A `DONE` choice still requires independent outcome verification. The DOM reader handles common HTML and ARIA controls, not the full accessible-name specification. Open shadow roots are traversed when `JEV_SHADOW_DOM` is on (the default). Closed shadow roots stay unsupported: a click on a custom-element host that does not change the page is reported as `possible closed shadow root` after the no-progress stop. Frames, canvas, uploads, pop-up tabs, nested scrolling, and arbitrary keyboard widgets remain outside this build. Owned tabs share the existing Chrome profile.
+A `DONE` choice still requires independent outcome verification. The DOM reader handles common HTML and ARIA controls, not the full accessible-name specification. Open shadow roots are traversed when `JEV_SHADOW_DOM` is on (the default). Closed shadow roots stay unsupported: a click on a custom-element host that does not change the page is reported as `possible closed shadow root` after the no-progress stop. `JEV_FRAMES=same` (the default) inlines same-origin iframes in that same snapshot. `JEV_FRAMES=all` also reads cross-origin frames, one evaluation per frame, and is slower. Canvas, uploads, pop-up tabs, nested scrolling, and arbitrary keyboard widgets remain outside this build. Owned tabs share the existing Chrome profile.
 
 ## Capability flags
 
@@ -132,6 +132,7 @@ Constructor arguments override the environment. Page text stays untrusted data, 
 | Flag | Default | Effect |
 | --- | --- | --- |
 | `JEV_SHADOW_DOM` | `1` | Collect controls and visible text inside open shadow roots. Hit-testing steps through `shadowRoot.elementFromPoint`. Pass `shadow_dom=False` to `Agent` to disable. |
+| `JEV_FRAMES` | `same` | `same` walks same-origin frames inside the one snapshot. `all` also attaches cross-origin frames and shifts their coordinates into the top viewport. `off` ignores frames. Pass `frames=` to `Agent`. |
 
 ## Development
 

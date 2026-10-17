@@ -116,15 +116,16 @@ def test_shadow_helpers_traverse_and_hit_test():
 def test_shadow_dom_defaults_on_and_constructor_overrides(monkeypatch):
     monkeypatch.delenv("JEV_SHADOW_DOM", raising=False)
     assert resolve_config()["shadow_dom"] is True
-    assert snapshot_config(resolve_config()) == {"shadow": True}
+    assert snapshot_config(resolve_config())["shadow"] is True
     monkeypatch.setenv("JEV_SHADOW_DOM", "0")
     assert resolve_config()["shadow_dom"] is False
-    assert snapshot_config(resolve_config(shadow_dom=True)) == {"shadow": True}
+    assert snapshot_config(resolve_config(shadow_dom=True))["shadow"] is True
 
 
 def test_snapshot_expression_sets_flag():
     from jev_ultrafast.browser import snapshot_expression
 
     source = snapshot_expression({"shadow_dom": False})
-    assert json.loads(source.split("globalThis.__jevCfg=", 1)[1].split(";", 1)[0]) == {"shadow": False}
+    payload = json.loads(source.split("globalThis.__jevCfg=", 1)[1].split(";", 1)[0])
+    assert payload["shadow"] is False
     assert "shadowRoot.elementFromPoint" in source

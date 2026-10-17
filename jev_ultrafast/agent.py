@@ -11,14 +11,14 @@ from .questions import MAX_STEPS
 
 
 class Agent:
-    def __init__(self, url, goals, *, record_dir=None, screenshots=False, shadow_dom=None):
+    def __init__(self, url, goals, *, record_dir=None, screenshots=False, shadow_dom=None, frames=None):
         task = goals.strip() if isinstance(goals, str) else "\n".join(goals).strip()
         if not task:
             raise ValueError("Supply a task")
         plan = [task]
         self.pending_text = None
         self.blocked_streak = 0
-        self.config = resolve_config(shadow_dom=shadow_dom)
+        self.config = resolve_config(shadow_dom=shadow_dom, frames=frames)
         self.browser = Browser(url, config=self.config)
         self.record_dir = Path(record_dir) if record_dir else None
         self.screenshots = screenshots or bool(record_dir)

@@ -142,6 +142,22 @@ def main():
         browser.act(shadow, page)
         assert browser.evaluate("window.shadowClicks") == 1
         passed.append("open shadow button is hit-tested and clicked")
+
+        browser.call("Page.navigate", url="data:text/html," + quote((FIXTURES / "iframe.html").read_text()))
+        browser.wait_until_ready()
+        page = browser.observe(screenshot=False)
+        inner = next(a for a in page["actions"] if a["label"] == "Inside frame")
+        assert inner.get("frame") not in {None, "f0"}
+        assert str(inner["id"]).startswith(inner["frame"] + ":")
+        browser.evaluate(
+            "document.querySelector('#child').contentDocument.querySelector('button').onclick="
+            "()=>{window.frameClicks=(window.frameClicks||0)+1}"
+        )
+        page = browser.observe(screenshot=False)
+        inner = next(a for a in page["actions"] if a["label"] == "Inside frame")
+        browser.act(inner, page)
+        assert browser.evaluate("window.frameClicks") == 1
+        passed.append("same-origin iframe control keeps a frame id and receives the click")
     finally:
         browser.close()
     print("\n".join(passed))

@@ -2,7 +2,12 @@
   // Defaults stay on when a caller forgets __jevCfg. Python sets the object explicitly.
   function cfg() {
     const c = globalThis.__jevCfg || {};
-    return {shadow: c.shadow !== false && c.shadow !== 0 && c.shadow !== "0"};
+    const frames = ["same", "all", "off"].includes(c.frames) ? c.frames : "same";
+    return {
+      shadow: c.shadow !== false && c.shadow !== 0 && c.shadow !== "0",
+      frames,
+      frameId: typeof c.frameId === "string" && c.frameId ? c.frameId : "f0",
+    };
   }
 
   // Light-DOM order matches querySelectorAll. Open shadow roots are appended, depth-first.
@@ -22,6 +27,11 @@
   }
 
   // elementFromPoint stops at a shadow host. Step into each open root.
+  function childDocument(iframe) {
+    try { return iframe.contentDocument || null; }
+    catch (error) { return null; }
+  }
+
   function resolveHit(doc, x, y) {
     let hit = doc.elementFromPoint(x, y);
     const seen = new Set();
@@ -30,6 +40,14 @@
       const inner = hit.shadowRoot.elementFromPoint(x, y);
       if (!inner || inner === hit) break;
       hit = inner;
+    }
+    if (cfg().frames !== "off" && hit && hit.tagName === "IFRAME") {
+      const child = childDocument(hit);
+      if (child) {
+        const rect = hit.getBoundingClientRect();
+        const inner = resolveHit(child, x - rect.x, y - rect.y);
+        if (inner) return inner;
+      }
     }
     return hit;
   }
@@ -44,7 +62,11 @@
       seen.add(node);
       if (node.parentElement) node = node.parentElement;
       else if (node.parentNode && node.parentNode.host) node = node.parentNode.host;
-      else node = null;
+      else if (node.ownerDocument && node.ownerDocument.defaultView) {
+        let frame = null;
+        try { frame = node.ownerDocument.defaultView.frameElement; } catch (error) { frame = null; }
+        node = frame && frame !== node ? frame : null;
+      } else node = null;
     }
     return false;
   }
@@ -53,27 +75,83 @@
     return !!(cfg().shadow && element.tagName && element.tagName.includes("-") && !element.shadowRoot);
   }
 
-  const api = {queryAllDeep, resolveHit, owns, possibleClosedShadow, cfg};
+  // Same-origin frames are listed here. Cross-origin frames are recorded and left for Python.
+  function frameEntries(doc, origin, top, alloc) {
+    const entries = [];
+    if (cfg().frames === "off" || !doc || typeof doc.querySelectorAll !== "function") return entries;
+    let iframes = [];
+    try { iframes = queryAllDeep(doc, "iframe"); } catch (error) { return entries; }
+    for (const iframe of iframes) {
+      const raw = iframe.getBoundingClientRect();
+      const rect = {x: origin.x + raw.x, y: origin.y + raw.y, w: raw.width, h: raw.height};
+      if (rect.w <= 0 || rect.h <= 0) continue;
+      if (rect.x >= top.w || rect.x + rect.w <= 0 || rect.y >= top.h || rect.y + rect.h <= 0) continue;
+      const child = childDocument(iframe);
+      const same = !!(child && child.body);
+      const id = alloc();
+      entries.push({
+        id, same, rect,
+        src: iframe.getAttribute ? (iframe.getAttribute("src") || "") : "",
+        url: iframe.src || "",
+        doc: same ? child : null,
+      });
+      if (same) entries.push(...frameEntries(child, {x: rect.x, y: rect.y}, top, alloc));
+    }
+    return entries;
+  }
+
+  const api = {queryAllDeep, resolveHit, owns, possibleClosedShadow, frameEntries, childDocument, cfg};
   globalThis.__jevApi = api;
   if (typeof document === "undefined") return api;
   if (!document.body) return null;
 
-  const cache = window.__jevFast ||= {ids:new WeakMap(), nodes:new Map(), next:1};
+  const cache = window.__jevFast ||= {ids:new WeakMap(), nodes:new Map(), next:1, frameWins:{}};
   cache.hit = (x, y) => resolveHit(document, x, y);
   cache.owns = owns;
+  cache.frameWins[cfg().frameId] = window;
+  function localCache(win) {
+    const store = win.__jevFast ||= {ids:new WeakMap(), nodes:new Map(), next:1, frameWins:cache.frameWins};
+    store.guard = cache.guard;
+    return store;
+  }
   const identity = e => {
-    if (!cache.ids.has(e)) cache.ids.set(e,cache.next++);
-    const id=cache.ids.get(e); cache.nodes.set(id,e); return id;
+    const win = (e.ownerDocument && e.ownerDocument.defaultView) || window;
+    const store = localCache(win);
+    if (!store.ids.has(e)) store.ids.set(e, store.next++);
+    const id = store.ids.get(e);
+    store.nodes.set(id, e);
+    return id;
   };
   for (const [id,e] of cache.nodes) if (!e.isConnected) cache.nodes.delete(id);
+  cache.resolve = action => {
+    const win = cache.frameWins[action.frame] || window;
+    const store = win.__jevFast;
+    return store ? store.nodes.get(action.node) : null;
+  };
+  cache.toTop = e => {
+    const rect = e.getBoundingClientRect();
+    let x = rect.x + rect.width / 2, y = rect.y + rect.height / 2, win = e.ownerDocument.defaultView;
+    const seen = new Set();
+    while (win && win !== win.top && !seen.has(win)) {
+      seen.add(win);
+      let frame = null;
+      try { frame = win.frameElement; } catch (error) { frame = null; }
+      if (!frame) break;
+      const host = frame.getBoundingClientRect();
+      x += host.x; y += host.y;
+      win = win.parent;
+    }
+    return {x, y};
+  };
   const safe = e => !['password','file','hidden'].includes(e.type);
   const visible = e => !e.closest('[aria-hidden="true"],[inert]') &&
     e.checkVisibility({checkOpacity:true,checkVisibilityCSS:true});
   const name = (e,seen=new Set()) => {
     if (!e || seen.has(e)) return '';
     seen.add(e);
+    const doc = e.ownerDocument || document;
     const referenced=(e.getAttribute('aria-labelledby')||'').split(/\s+/)
-      .map(id=>name(document.getElementById(id),seen)).filter(Boolean).join(' ');
+      .map(id=>name(doc.getElementById(id),seen)).filter(Boolean).join(' ');
     return referenced || e.getAttribute('aria-label') ||
       [...(e.labels||[])].map(l=>name(l,seen)).filter(Boolean).join(' ') ||
       (['button','submit','reset'].includes(e.type) ? e.value : '') || e.getAttribute('alt') ||
@@ -101,9 +179,25 @@
     }
     return null;
   };
-  cache.pageKey=()=>[performance.timeOrigin,location.href,scrollX,scrollY,innerWidth,innerHeight,
-    queryAllDeep(document,'input,textarea,select').filter(safe)
-      .map(e=>[identity(e),e.value,e.checked,e.selectedIndex,e.disabled,e.readOnly])];
+  function documentKey(doc) {
+    const win = doc.defaultView || window;
+    return [win.performance.timeOrigin, doc.location.href, win.scrollX, win.scrollY, win.innerWidth, win.innerHeight,
+      queryAllDeep(doc,'input,textarea,select').filter(safe)
+        .map(e=>[identity(e),e.value,e.checked,e.selectedIndex,e.disabled,e.readOnly])];
+  }
+  cache.pageKey=()=>{
+    const keys=[documentKey(document)];
+    if (cfg().frames==='off') return keys;
+    let serial=0;
+    const root=cfg().frameId;
+    const alloc=()=>{ serial+=1; return root==='f0' ? 'f'+serial : root+'.'+serial; };
+    for (const entry of frameEntries(document, {x:0,y:0}, {w:innerWidth,h:innerHeight}, alloc)) {
+      if (entry.same && entry.doc) {
+        try { keys.push(documentKey(entry.doc)); } catch (error) {}
+      }
+    }
+    return keys;
+  };
   cache.guard=e=>{
     if (!e?.isConnected || !visible(e)) return null;
     const scope=e.closest('form,dialog,[role="dialog"],article,li,tr,[role="row"]') || e.parentElement;
@@ -113,14 +207,18 @@
       e.getAttribute('href'),scope?.innerText?.slice(0,6000)||''];
   };
   const actions=[];
-  for (const e of queryAllDeep(document, selector)) {
-    if (!safe(e) || !visible(e) || e.matches(':disabled') || e.closest('[aria-disabled="true"]')) continue;
-    const r=e.getBoundingClientRect(), x=r.x+r.width/2, y=r.y+r.height/2, rname=role(e);
-    if (!rname || r.width<=0 || r.height<=0 || x<0 || y<0 || x>=innerWidth || y>=innerHeight) continue;
-    if (rname==='gridcell' && e.querySelector('button,[role="button"]')) continue;
-    const base={node:identity(e),role:rname,label:name(e)||rname,
-      rect:{x:r.x,y:r.y,w:r.width,h:r.height}};
-    if (possibleClosedShadow(e)) base.possible_closed_shadow = true;
+  const seenNodes=new Set();
+  function consider(e, frameId, ox, oy) {
+    if (!safe(e) || !visible(e) || e.matches(':disabled') || e.closest('[aria-disabled="true"]')) return;
+    const raw=e.getBoundingClientRect();
+    const rect={x:raw.x+ox, y:raw.y+oy, w:raw.width, h:raw.height};
+    const x=rect.x+rect.w/2, y=rect.y+rect.h/2, rname=role(e);
+    if (!rname || rect.w<=0 || rect.h<=0 || x<0 || y<0 || x>=innerWidth || y>=innerHeight) return;
+    if (rname==='gridcell' && e.querySelector('button,[role="button"]')) return;
+    const node=identity(e);
+    const base={node, frame:frameId, role:rname, label:name(e)||rname, rect};
+    if (possibleClosedShadow(e)) base.possible_closed_shadow=true;
+    seenNodes.add(frameId+':'+node);
     for (const key of ['checked','selected','expanded']) {
       const value=e.getAttribute('aria-'+key);
       if (value!==null) base[key]=value;
@@ -129,7 +227,7 @@
     if (e.tagName==='SELECT') {
       for (const o of e.options) if (!o.selected && !o.disabled && !o.closest('optgroup[disabled]'))
         actions.push({...base,kind:'select',value:o.value,
-          current_value:[...e.selectedOptions].map(o=>o.label).join(', '),label:base.label+' → '+o.label});
+          current_value:[...e.selectedOptions].map(item=>item.label).join(', '),label:base.label+' → '+o.label});
     } else {
       const editable=!e.readOnly && e.getAttribute('aria-readonly')!=='true' &&
         (['textbox','searchbox','spinbutton'].includes(rname) ||
@@ -140,57 +238,90 @@
       if (editable) actions.push({...base,kind:'click',value,label:'Open '+base.label});
     }
   }
-  // A closed shadow host is not one of the usual controls. Offer the host itself so a
-  // no-progress click can be explained. Skip hosts that already contain a light-DOM control.
-  if (cfg().shadow) {
-    const seenNodes = new Set(actions.map(a => a.node));
-    for (const e of queryAllDeep(document, '*')) {
-      if (!possibleClosedShadow(e) || !visible(e) || e.matches(':disabled')) continue;
-      if (e.querySelector(selector)) continue;
-      const label = (name(e) || '').trim();
-      if (!label || label.length > 80) continue;
-      const r = e.getBoundingClientRect(), x = r.x + r.width / 2, y = r.y + r.height / 2;
-      if (r.width <= 0 || r.height <= 0 || x < 0 || y < 0 || x >= innerWidth || y >= innerHeight) continue;
-      const node = identity(e);
-      if (seenNodes.has(node)) continue;
-      seenNodes.add(node);
-      actions.push({node, role:'button', label, kind:'click', value:'', possible_closed_shadow:true,
-        rect:{x:r.x, y:r.y, w:r.width, h:r.height}});
+  function collectClosed(doc, frameId, ox, oy) {
+    if (!cfg().shadow) return;
+    for (const e of queryAllDeep(doc, '*')) {
+      if (!possibleClosedShadow(e) || !visible(e) || e.matches(':disabled') || e.querySelector(selector)) continue;
+      const label=(name(e)||'').trim();
+      if (!label || label.length>80) continue;
+      const raw=e.getBoundingClientRect();
+      const rect={x:raw.x+ox, y:raw.y+oy, w:raw.width, h:raw.height};
+      const x=rect.x+rect.w/2, y=rect.y+rect.h/2;
+      if (rect.w<=0 || rect.h<=0 || x<0 || y<0 || x>=innerWidth || y>=innerHeight) continue;
+      const node=identity(e);
+      const key=frameId+':'+node;
+      if (seenNodes.has(key)) continue;
+      seenNodes.add(key);
+      actions.push({node, frame:frameId, role:'button', label, kind:'click', value:'',
+        possible_closed_shadow:true, rect});
     }
   }
-  const words=[]; const range=document.createRange(); let length=0;
-  function addText(scope) {
+  let frameSerial=0;
+  const rootFrame=cfg().frameId;
+  const allocFrame=()=>{ frameSerial+=1; return rootFrame==='f0' ? 'f'+frameSerial : rootFrame+'.'+frameSerial; };
+  const frames=cfg().frames==='off' ? [] : frameEntries(document,{x:0,y:0},{w:innerWidth,h:innerHeight},allocFrame);
+  for (const entry of frames) if (entry.same && entry.doc && entry.doc.defaultView) {
+    cache.frameWins[entry.id]=entry.doc.defaultView;
+    localCache(entry.doc.defaultView);
+  }
+  for (const e of queryAllDeep(document, selector)) consider(e, rootFrame, 0, 0);
+  collectClosed(document, rootFrame, 0, 0);
+  for (const entry of frames) if (entry.same && entry.doc) {
+    for (const e of queryAllDeep(entry.doc, selector)) consider(e, entry.id, entry.rect.x, entry.rect.y);
+    collectClosed(entry.doc, entry.id, entry.rect.x, entry.rect.y);
+  }
+  const words=[]; let length=0;
+  function addText(scope, ox, oy) {
     if (!scope || length>=6000) return;
-    const start = scope.nodeType===9 ? scope.body : scope;
-    if (!start) return;
-    const walker=document.createTreeWalker(start,NodeFilter.SHOW_TEXT);
+    const owner=scope.nodeType===9 ? scope : scope.ownerDocument;
+    const start=scope.nodeType===9 ? scope.body : scope;
+    if (!owner || !start || !owner.createTreeWalker) return;
+    const walker=owner.createTreeWalker(start,NodeFilter.SHOW_TEXT);
+    const range=owner.createRange();
     let node;
     while ((node=walker.nextNode()) && length<6000) {
       const value=node.textContent.trim(), parent=node.parentElement;
       if (!value || !parent || parent.closest('script,style,noscript,template') || !visible(parent)) continue;
-      range.selectNodeContents(node); const r=range.getBoundingClientRect();
-      if (r.width>0 && r.height>0 && r.bottom>0 && r.top<innerHeight && r.right>0 && r.left<innerWidth) {
+      range.selectNodeContents(node); const raw=range.getBoundingClientRect();
+      const top=raw.top+oy, bottom=raw.bottom+oy, left=raw.left+ox, right=raw.right+ox;
+      if (raw.width>0 && raw.height>0 && bottom>0 && top<innerHeight && right>0 && left<innerWidth) {
         words.push(value); length+=value.length;
       }
     }
   }
-  addText(document);
+  addText(document, 0, 0);
   if (cfg().shadow) {
-    for (const host of queryAllDeep(document, '*')) if (host.shadowRoot) addText(host.shadowRoot);
+    for (const host of queryAllDeep(document, '*')) if (host.shadowRoot) addText(host.shadowRoot, 0, 0);
+  }
+  for (const entry of frames) if (entry.same && entry.doc) {
+    addText(entry.doc, entry.rect.x, entry.rect.y);
+    if (cfg().shadow) {
+      for (const host of queryAllDeep(entry.doc, '*')) if (host.shadowRoot) addText(host.shadowRoot, entry.rect.x, entry.rect.y);
+    }
   }
   const text=words.join('\n').slice(0,6000), height=document.documentElement.scrollHeight;
   const page_key=cache.pageKey(), guards={};
-  for (const a of actions) if (!(a.node in guards)) guards[a.node]=cache.guard(cache.nodes.get(a.node));
+  for (const a of actions) {
+    const key=(a.frame||rootFrame)+':'+a.node;
+    if (key in guards) continue;
+    const win=cache.frameWins[a.frame]||window;
+    const store=win.__jevFast;
+    guards[key]=store ? store.guard(store.nodes.get(a.node)) : null;
+  }
   // Compare meaning and identity. Geometry is always resolved and hit-tested just before input.
   const semantics=actions.map(({rect,...action})=>action);
   const marker=[performance.timeOrigin,location.href,scrollX,scrollY,innerWidth,innerHeight,
-    document.title,text,semantics,page_key[6]];
+    document.title,text,semantics,page_key];
   const omitted_actions=Math.max(0,actions.length-250);
   actions.splice(250);
-  actions.forEach((a,i)=>a.id='e'+(i+1));
+  actions.forEach((a,i)=>{
+    const prefix=a.frame && a.frame!=='f0' ? a.frame+':' : '';
+    a.id=prefix+'e'+(i+1);
+  });
   if (scrollY+innerHeight<height-2) actions.push({id:'scroll_down',kind:'scroll',label:'Scroll down',delta:560});
   if (scrollY>0) actions.push({id:'scroll_up',kind:'scroll',label:'Scroll up',delta:-560});
   actions.push({id:'wait',kind:'wait',label:'Wait for the page to update'});
+  const cross_frames=frames.filter(entry=>!entry.same).map(({id,rect,src,url})=>({id,rect,src,url}));
   return {url:location.href,title:document.title,w:innerWidth,h:innerHeight,text,
-    scroll:{y:scrollY,height},actions,marker,page_key,guards,omitted_actions};
+    scroll:{y:scrollY,height},actions,marker,page_key,guards,omitted_actions,cross_frames};
 })()
