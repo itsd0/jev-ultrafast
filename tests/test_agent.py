@@ -213,13 +213,15 @@ def test_navigate_url_gate(monkeypatch):
         validate_navigate_url("http://example.test/")
 
 
-def test_navigate_offered_only_on_blank():
+def test_navigate_offered_on_every_page_exactly_once():
+    # Multi-site goals must leave the current page, so the blank-only rule is gone.
     blank = page()
     blank["url"] = "about:blank"
     bound = bind_navigate(blank)
     assert [a["id"] for a in bound["actions"] if a.get("kind") == "navigate"] == ["navigate"]
     assert bind_navigate(bound)["actions"].count(bound["actions"][-1]) == 1
-    assert not [a for a in bind_navigate(page())["actions"] if a.get("kind") == "navigate"]
+    loaded = bind_navigate(page())
+    assert [a["id"] for a in loaded["actions"] if a.get("kind") == "navigate"] == ["navigate"]
 
 
 def test_navigate_act_uses_model_url(runner, monkeypatch):
@@ -1130,3 +1132,106 @@ def test_requirement_probabilities_are_reused_on_the_next_step(monkeypatch, runn
     runner.command("predict", {})
     assert seen["decompose"] == 1
     assert seen["progress"] == [{}, {"r1": 0.4}]
+
+
+def test_done_records_final_answer(runner, monkeypatch):
+    from jev_ultrafast.questions import ANSWER_VALUE
+
+    seen = {}
+
+    def fake_field_text(context, system=None):
+        seen["system"] = system
+        seen["goal"] = context["goal"]
+        return "The answer.", {"model": "test", "latency_ms": 3, "usage": {}}
+
+    monkeypatch.setattr(loop, "field_text", fake_field_text)
+    runner.state["decision"] = decision("DONE")
+    runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    assert runner.state["status"] == "done"
+    assert runner.state["answer"] == "The answer."
+    assert seen["system"] == ANSWER_VALUE
+    assert seen["goal"] == "Find a book"
+    assert runner.state["text_calls"][-1]["field"] == "final answer"
+
+
+def test_done_without_answer_when_helper_fails(runner, monkeypatch):
+    def boom(context, system=None):
+        raise ValueError("invalid field text")
+
+    monkeypatch.setattr(loop, "field_text", boom)
+    runner.state["decision"] = decision("DONE")
+    runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    assert runner.state["status"] == "done"
+    assert runner.state["answer"] is None
+
+
+def test_blocked_third_time_scrolls_once_then_accepts(runner):
+    scrolled = page()
+    scrolled["url"] = "https://example.test/scrolled"
+    scrolled["fingerprint"] = fingerprint(scrolled)
+    runner.state["page"]["actions"].append(
+        {"id": "scroll_down", "kind": "scroll", "label": "Scroll down", "delta": 560}
+    )
+    runner.state["page"]["fingerprint"] = fingerprint(runner.state["page"])
+    runner.state["browser"].act = Mock(return_value={"executed": "scroll_down"})
+    runner.state["browser"].wait_until_ready = Mock()
+    runner.state["browser"].observe = Mock(return_value=scrolled)
+    runner.blocked_streak = 2
+    runner.state["decision"] = decision("BLOCKED")
+    runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    assert runner.state["status"] == "ready"
+    assert runner.state["history"][-1]["operation"] == "SCROLL_DOWN"
+    assert runner.blocked_streak == 3
+    runner.state["decision"] = decision("BLOCKED")
+    runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    assert runner.state["status"] == "blocked"
+    runner.state["browser"].act.assert_called_once()
+
+
+def test_blocked_without_scroll_settles_as_before(runner):
+    runner.state["browser"].settled = Mock()
+    runner.blocked_streak = 2
+    runner.state["decision"] = decision("BLOCKED")
+    runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    assert runner.state["status"] == "ready"
+    runner.state["browser"].settled.assert_called_once()
+    runner.state["browser"].act.assert_not_called()
+
+
+def test_action_budget_follows_decision_budget(runner):
+    runner.config = {"max_decisions": 3}
+    runner.state["history"] = [{"step": 1}, {"step": 2}, {"step": 3}]
+    runner.state["decision"] = decision("e3")
+    runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    assert runner.state["status"] == "blocked"
+    assert runner.state["blocked_reason"] == "action budget"
+
+
+def test_stale_tick_blocks_when_page_never_settles(runner):
+    runner.state["browser"].fresh = Mock(return_value=False)
+    runner.state["browser"].observe = Mock(side_effect=StalePage("Document is navigating"))
+    runner.command("tick", {})
+    assert runner.state["status"] == "blocked"
+    assert runner.state["blocked_reason"] == "page never settled"
+
+
+def test_observe_backs_off_through_navigation(monkeypatch):
+    import jev_ultrafast.browser as browser_mod
+
+    browser = browser_mod.Browser.__new__(browser_mod.Browser)
+    browser.session = "sess-test"
+    browser.config = {}
+    calls, sleeps = [], []
+
+    def flaky(request):
+        calls.append(request)
+        if len(calls) < 3:
+            raise StalePage("Document is navigating")
+        return {"ok": True}
+
+    monkeypatch.setattr(browser_mod, "browser_operation", flaky)
+    monkeypatch.setattr(browser_mod.Browser, "_finish_observation", lambda self, state: state)
+    monkeypatch.setattr(time, "sleep", sleeps.append)
+    assert browser.observe(screenshot=False) == {"ok": True}
+    assert [round(s, 3) for s in sleeps] == [0.05, 0.1]
+    assert len(calls) == 3

@@ -209,7 +209,7 @@ class Browser:
                 )
             except RuntimeError:
                 pass
-        for attempt in range(10):
+        for attempt in range(12):
             try:
                 state = browser_operation(
                     {
@@ -221,9 +221,11 @@ class Browser:
                 )
                 return self._finish_observation(state)
             except StalePage:
-                if attempt == 9:
+                if attempt == 11:
                     raise
-                time.sleep(0.02)
+                # Heavy pages can navigate for seconds; back off instead of
+                # failing the run after 200ms of impatience.
+                time.sleep(min(0.05 * (2**attempt), 1.0))
         raise StalePage("Page did not settle")
 
     def _finish_observation(self, state):
@@ -568,9 +570,9 @@ def validate_navigate_url(url):
 
 
 def bind_navigate(state):
-    """Offer one NAVIGATE control on a blank page. The text model names the URL."""
-    if (state.get("url") or "").strip() not in {"about:blank", ""}:
-        return state
+    """Offer one NAVIGATE control on every page. The text model names the URL
+    from the goal and the progress so far, so multi-site goals can leave the
+    current page. The URL gate and the loop detector bound abuse."""
     actions = state.get("actions") or []
     if any(action.get("kind") == "navigate" for action in actions):
         return state

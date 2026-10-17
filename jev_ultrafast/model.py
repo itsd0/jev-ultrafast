@@ -901,6 +901,16 @@ def field_context(goal, action, page, history):
     }
 
 
+def answer_context(goal, page, history):
+    return {
+        "goal": goal,
+        "page": {"url": page.get("url"), "title": page.get("title"), "text": (page.get("text") or "")[:6000]},
+        "recent_actions": [
+            {k: h.get(k) for k in ("action", "text", "url")} for h in history[-10:]
+        ],
+    }
+
+
 def field_text(context, system=TEXT_VALUE):
     base = os.environ.get("TEXT_MODEL_BASE_URL", "https://api.inceptionlabs.ai/v1").rstrip("/")
     model_name = os.environ.get("TEXT_MODEL", "mercury-2.5")

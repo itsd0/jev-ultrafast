@@ -12,6 +12,7 @@ from .config import resolve_config
 from .model import (
     INVALID_RESPONSE,
     action_space,
+    answer_context,
     choose,
     choose_mercury,
     decision_provider,
@@ -21,7 +22,7 @@ from .model import (
     match_option,
     post_json,
 )
-from .questions import MAX_STEPS, NAVIGATE_VALUE
+from .questions import ANSWER_VALUE, NAVIGATE_VALUE
 from .vision import confirm_point, needs_vision, propose
 
 _RELOAD_WORDS = frozenset({"reload", "refresh"})
@@ -300,7 +301,13 @@ class Agent:
                     state["held_actions"] = note_no_progress(
                         state.get("held_actions"), {"id": pending, "kind": None}, False
                     )
-                state["page"] = state["browser"].observe(screenshot=self.screenshots)
+                try:
+                    state["page"] = state["browser"].observe(screenshot=self.screenshots)
+                except StalePage:
+                    # The document never settled, even after observe's own
+                    # backoff. Block honestly instead of failing the run.
+                    state["status"] = "blocked"
+                    state["blocked_reason"] = "page never settled"
                 state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
                 return self.snapshot()
         elif name == "predict":
@@ -369,6 +376,8 @@ class Agent:
                     # A loading page looks identical to a dead end. Only trust
                     # BLOCKED once the page has settled; otherwise look again.
                     self.blocked_streak += 1
+                    if self.blocked_streak == 3 and self._unblock_scroll(state, page, decision):
+                        return self.snapshot()
                     state["browser"].settled(page)
                     state["decision"] = None
                     state["page"] = state["browser"].observe(screenshot=self.screenshots)
@@ -376,6 +385,8 @@ class Agent:
                     return self.snapshot()
                 state["status"] = "done" if selected == "DONE" else "blocked"
                 state["plan_index"] = int(selected == "DONE")
+                if selected == "DONE":
+                    state["answer"] = self._final_answer(state, page)
                 state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
                 return self.snapshot()
             if selected == "VISION_CLICK":
@@ -389,9 +400,14 @@ class Agent:
                 }
             else:
                 action = next(a for a in page["actions"] if a["id"] == selected)
-            if len(state["history"]) >= MAX_STEPS:
+            action_budget = (getattr(self, "config", None) or {}).get("max_decisions") or DEFAULT_MAX_DECISIONS
+            if len(state["history"]) >= action_budget:
+                # Every action costs a decision, so the action cap follows the
+                # run's decision budget instead of a smaller fixed number.
                 state["status"] = "blocked"
-                raise ValueError(f"Stopped at the {MAX_STEPS}-action demo budget")
+                state["blocked_reason"] = "action budget"
+                state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
+                return self.snapshot()
             text, helper = None, None
             unmatched_option = False
             if action["kind"] in {"fill", "select_option"}:
@@ -569,6 +585,64 @@ class Agent:
         state["loop_window"] = state["loop_window"][-LOOP_WINDOW:]
         state["status"] = "ready"
         return self.snapshot()
+
+    def _final_answer(self, state, page):
+        """One best-effort summary of what the goal asked for. Never fails the run."""
+        try:
+            text, helper = field_text(
+                answer_context(state["goal"], page, state["history"]), system=ANSWER_VALUE
+            )
+        except (ValueError, RuntimeError):
+            print("[jev:answer] text helper failed; finishing without an answer", file=sys.stderr, flush=True)
+            return None
+        state["text_calls"].append({**helper, "field": "final answer", "value": text})
+        return text
+
+    def _unblock_scroll(self, state, page, decision):
+        """One look below the fold before accepting BLOCKED. Only
+        visible-viewport controls are indexed, so a long page can hide the way
+        forward. Bounded: once per page, and the streak stays spent, so the
+        next consecutive BLOCKED still ends the run."""
+        if state.get("unblock_scrolled") == page["fingerprint"]:
+            return False
+        scroll = next((a for a in page.get("actions", []) if a["id"] == "scroll_down"), None)
+        if scroll is None:
+            return False
+        state["unblock_scrolled"] = page["fingerprint"]
+        state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
+        state["history"].append(
+            {
+                "step": len(state["history"]) + 1,
+                "action": "Scroll down (look below the fold)",
+                "kind": "scroll",
+                "choice": scroll["id"],
+                "probability": (decision.get("probabilities") or {}).get(decision.get("choice")),
+                "confidence": decision.get("confidence"),
+                "latency_ms": decision.get("latency_ms"),
+                "text": None,
+                "text_helper": None,
+                "text_latency_ms": 0,
+                "operation": "SCROLL_DOWN",
+                "target": scroll["id"],
+                "possible_closed_shadow": False,
+                "note": "exploring below the fold before giving up",
+                "page_changed": None,
+                "url": page["url"],
+                "usage": decision.get("usage", {}),
+                "executed_ms": state["elapsed_ms"],
+                "elapsed_ms": state["elapsed_ms"],
+            }
+        )
+        state["browser"].act(scroll, page)
+        state["browser"].wait_until_ready()
+        state["page"] = state["browser"].observe(screenshot=self.screenshots)
+        changed = state["page"]["fingerprint"] != page["fingerprint"]
+        state["history"][-1].update(page_changed=changed, url=state["page"]["url"])
+        window = state.get("loop_window") or []
+        window.append(loop_step({**decision, "operation": "SCROLL_DOWN"}, scroll, state["page"], changed))
+        state["loop_window"] = window[-LOOP_WINDOW:]
+        state["status"] = "ready"
+        return True
 
     def _skip_text_step(self, state, page, action, decision, selected, note="text helper failed"):
         """A bad text response skips this step. The run keeps going."""
