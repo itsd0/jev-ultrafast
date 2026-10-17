@@ -93,7 +93,31 @@ uv run --env-file .env python examples/run.py \
 
 ## Hosted task API
 
-`uv run --env-file .env jev-server` serves a task queue on **http://127.0.0.1:8770** (loopback only). `POST /api/tasks` takes a goal, a start URL, a browser (`local` or `cloud`), and an optional `max_decisions`; each task runs its own agent and its own browser, and steps land in `jev_runs.db`. The page shows a run form, live steps, and history. `JEV_MAX_CONCURRENT` (default 2) caps running tasks, `JEV_SERVER_TOKEN` adds an optional bearer token, and `JEV_COST_PER_1K_TOKENS` enables the cost estimate. The agent core is unchanged; `verified_by_agent` means the agent chose DONE, not that the outcome was independently checked.
+`POST /api/tasks` takes a goal, an optional start URL, a browser (`local` or `cloud`), and an optional `max_decisions`. Without a start URL the agent starts on a blank page and a `NAVIGATE` step proposes the first URL from the goal (https only; local URLs need `JEV_ALLOW_LOCAL=1`). Each task runs its own agent and browser, and steps land in `jev_runs.db`. The page shows a run form, live steps, and a live browser panel (local screencast, or the cloud live view when `JEV_CLOUD_SHOW_LIVE_URL=1`). `verified_by_agent` means the agent chose DONE, not that the outcome was independently checked.
+
+### Run locally
+
+```bash
+uv run --env-file .env jev-server
+```
+
+Serves **http://127.0.0.1:8770** (loopback only). Local tasks drive one Chrome through a dedicated `jev-server` browser-harness daemon; set `BU_CDP_URL=http://127.0.0.1:9222` to pin which Chrome. `JEV_MAX_CONCURRENT` (default 2) caps running tasks, `JEV_SERVER_TOKEN` adds an optional bearer token, and `JEV_COST_PER_1K_TOKENS` enables the cost estimate. `GET /api/health` reports `{"status": "ok"}`.
+
+### Deploy
+
+The image runs the server only; there is no Chrome inside, so deploy it for cloud-browser tasks:
+
+```bash
+docker build -t jev-server .
+docker run -p 8770:8770 \
+  -e JEV_SERVER_TOKEN=your-token \
+  -e TYPESAFE_API_KEY=your-key \
+  -e INCEPTION_API_KEY=your-key \
+  -e BROWSER_USE_API_KEY=your-key \
+  jev-server
+```
+
+Binding anywhere but loopback refuses to start without `JEV_SERVER_TOKEN`. Pass API keys as runtime `-e` flags, never bake them into the image (`.dockerignore` keeps `.env` out).
 
 ## Why it moves
 

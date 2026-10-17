@@ -224,6 +224,8 @@ def test_bearer_token_gates_the_api(start_service):
     assert api(base, "GET", "/api/tasks", token="secret")[0] == 200
     status, _ = api(base, "POST", "/api/tasks", {"goal": "x", "url": "https://example.test/"})
     assert status == 401
+    status, body = api(base, "GET", "/api/health")
+    assert (status, body) == (200, {"status": "ok"})
 
 
 def read_sse_image(base, task_id, timeout=10):

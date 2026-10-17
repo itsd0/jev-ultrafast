@@ -559,8 +559,18 @@ class Handler(BaseHTTPRequestHandler):
         presented = self.headers.get("Authorization") or ""
         return hmac.compare_digest(presented, f"Bearer {self.TOKEN}")
 
+    def host_ok(self):
+        if self.HOST in {"0.0.0.0", "::"}:
+            return True
+        return self.headers.get("Host") == f"{self.HOST}:{self.PORT}"
+
+    def origin_ok(self):
+        if self.HOST in {"0.0.0.0", "::"}:
+            return True
+        return self.headers.get("Origin") in (None, f"http://{self.HOST}:{self.PORT}")
+
     def do_GET(self):
-        if self.headers.get("Host") != f"{self.HOST}:{self.PORT}":
+        if not self.host_ok():
             return self.send(403, "Forbidden", "text/plain")
         path = urlparse(self.path).path
         if path == "/":
@@ -571,6 +581,8 @@ class Handler(BaseHTTPRequestHandler):
             )
         if not path.startswith("/api/"):
             return self.send(404, json.dumps({"error": "Not found"}))
+        if path == "/api/health":
+            return self.send(200, json.dumps({"status": "ok"}))
         if not self.authorized():
             return self.send(401, json.dumps({"error": "Bearer token required"}))
         if path == "/api/tasks":
@@ -624,11 +636,7 @@ class Handler(BaseHTTPRequestHandler):
             viewer.remove_viewer()
 
     def do_POST(self):
-        origin = f"http://{self.HOST}:{self.PORT}"
-        if (
-            self.headers.get("Host") != f"{self.HOST}:{self.PORT}"
-            or self.headers.get("Origin") not in (None, origin)
-        ):
+        if not (self.host_ok() and self.origin_ok()):
             return self.send(403, json.dumps({"error": "Local requests only"}))
         if not self.authorized():
             return self.send(401, json.dumps({"error": "Bearer token required"}))
@@ -682,6 +690,8 @@ def main():
     Handler.HOST = host
     Handler.PORT = port
     Handler.TOKEN = os.environ.get("JEV_SERVER_TOKEN", "")
+    if host not in {"127.0.0.1", "localhost", "::1"} and not Handler.TOKEN:
+        raise SystemExit(f"Refusing to bind {host} without JEV_SERVER_TOKEN")
     server = ThreadingHTTPServer((host, port), Handler)
     print(f"Jev tasks: http://{host}:{port}/", flush=True)
     try:
