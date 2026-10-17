@@ -59,3 +59,11 @@ Cross-origin frames are not readable from the parent. With `frames=all`, one `Pa
 ## Keyboard
 
 `JEV_KEYBOARD` defaults on (`Agent(..., keyboard=True)`). After `Input.insertText`, the executor reads the node's value (or `innerText` for a contenteditable). A match is done. A mismatch selects all, sends Backspace, then `keyDown` / `char` / `keyUp` per character, and reads once more. A second mismatch is stored as `text entry failed` and is not retried. `PRESS_KEY` targets are exactly Enter, Tab, Escape, ArrowDown, ArrowUp, ArrowLeft, ArrowRight, Space, and Backspace. Any other key is rejected before a CDP key event. The event goes to the focused node.
+
+## Large native selects
+
+`JEV_LARGE_SELECT` defaults on. `JEV_SELECT_INLINE_MAX` defaults to 12 (`Agent(..., select_inline_max=12)`). A `<select>` with more enabled options than that emits one `SELECT_OPTION` action instead of one action per option. The option list is not copied into the TypeSafe request. The text helper returns a label. `match_option` accepts one exact label, otherwise one case-insensitive label, otherwise one prefix, otherwise one contains. Disabled options and ambiguous sets do not match. No match skips the mutation and records `no matching option`. A match executes the existing native-select path with the option's value. Smaller selects keep `index:option` targets.
+
+## Vision fallback
+
+`JEV_VISION` defaults off (`Agent(..., vision=False)`). This is the one path that clicks a coordinate instead of a code-owned node, and it lives in `vision.py`. It runs only when the flag is on and either the page has no click, fill, select, or upload target, or a canvas/svg covers at least 60% of the viewport. The snapshot then records those surface rectangles. One JPEG is captured if the page does not already have one. The model must return `{x, y, confirm: true}`. The point is rejected unless it lies in the viewport and inside one of those rectangles. A rejected point falls through to the normal operation choice. An accepted point is dispatched with `Input.dispatchMouseEvent` and logged as `coordinate-based`, including on stderr. Closed shadow roots, and cross-origin frames whose target URL cannot be matched, stay unsupported.

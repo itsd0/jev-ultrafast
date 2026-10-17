@@ -35,8 +35,27 @@ def parse_files(override=None):
     return files
 
 
+def _inline_max(override):
+    if override is None:
+        raw = os.environ.get("JEV_SELECT_INLINE_MAX", "12")
+        try:
+            override = int(raw)
+        except ValueError:
+            override = 12
+    return max(0, int(override))
+
+
 def resolve_config(
-    *, shadow_dom=None, frames=None, files=None, tabs=None, nested_scroll=None, keyboard=None
+    *,
+    shadow_dom=None,
+    frames=None,
+    files=None,
+    tabs=None,
+    nested_scroll=None,
+    keyboard=None,
+    large_select=None,
+    select_inline_max=None,
+    vision=None,
 ):
     if frames is None:
         chosen = env_choice("JEV_FRAMES", "same", {"same", "all", "off"})
@@ -52,6 +71,9 @@ def resolve_config(
         "tabs": env_bool("JEV_TABS", True) if tabs is None else bool(tabs),
         "nested_scroll": env_bool("JEV_NESTED_SCROLL", True) if nested_scroll is None else bool(nested_scroll),
         "keyboard": env_bool("JEV_KEYBOARD", True) if keyboard is None else bool(keyboard),
+        "large_select": env_bool("JEV_LARGE_SELECT", True) if large_select is None else bool(large_select),
+        "select_inline_max": _inline_max(select_inline_max),
+        "vision": env_bool("JEV_VISION", False) if vision is None else bool(vision),
     }
 
 
@@ -61,6 +83,9 @@ def snapshot_config(config):
         "shadow": bool(config.get("shadow_dom", True)),
         "frames": config.get("frames", "same"),
         "nested": bool(config.get("nested_scroll", True)),
+        "largeSelect": bool(config.get("large_select", True)),
+        "selectInlineMax": int(config.get("select_inline_max", 12)),
+        "vision": bool(config.get("vision", False)),
     }
     if config.get("frame_id"):
         payload["frameId"] = config["frame_id"]

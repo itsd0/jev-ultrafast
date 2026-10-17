@@ -113,6 +113,7 @@ Every executed target is resolved from an observed node. The executor rechecks p
 | [browser.py](jev_ultrafast/browser.py) | Browser connection, current geometry, execution |
 | [model.py](jev_ultrafast/model.py) | Dynamic operation/target heads and text generation |
 | [questions.py](jev_ultrafast/questions.py) | Model instructions |
+| [vision.py](jev_ultrafast/vision.py) | Optional coordinate fallback for canvas and SVG |
 | [demo.py](jev_ultrafast/demo.py) | Local inspector |
 
 ## Evidence and limits
@@ -123,7 +124,7 @@ In six alternating runs with identical models and settings, both versions passed
 
 The same policy opened the requested Wikipedia article in **2.798 s** and passed a local hotel search/filter task in **1.896 s**. Runs, failures, source hashes, and measurement boundaries are in [performance.md](docs/performance.md).
 
-A `DONE` choice still requires independent outcome verification. The DOM reader handles common HTML and ARIA controls, not the full accessible-name specification. Open shadow roots are traversed when `JEV_SHADOW_DOM` is on (the default). Closed shadow roots stay unsupported: a click on a custom-element host that does not change the page is reported as `possible closed shadow root` after the no-progress stop. `JEV_FRAMES=same` (the default) inlines same-origin iframes in that same snapshot. `JEV_FRAMES=all` also reads cross-origin frames, one evaluation per frame, and is slower. File inputs are offered only from an allowlist (`JEV_UPLOAD_FILES` or `files=`). `JEV_TABS` (default on) follows pages opened by the owned tab, keeps at most five, and offers `SWITCH_TAB` / `CLOSE_TAB` by code-owned ids. `JEV_NESTED_SCROLL` (default on) adds scroll targets for up to eight overflow containers. `JEV_KEYBOARD` (default on) checks text after `insertText` and retypes once with key events if the field does not match, and offers `PRESS_KEY` for a fixed set of keys. Canvas remains outside this build. Owned tabs share the existing Chrome profile.
+A `DONE` choice still requires independent outcome verification. The DOM reader handles common HTML and ARIA controls, not the full accessible-name specification. Open shadow roots are traversed when `JEV_SHADOW_DOM` is on (the default). Closed shadow roots stay unsupported: a click on a custom-element host that does not change the page is reported as `possible closed shadow root` after the no-progress stop. `JEV_FRAMES=same` (the default) inlines same-origin iframes in that same snapshot. `JEV_FRAMES=all` also reads cross-origin frames, one evaluation per frame, and is slower. File inputs are offered only from an allowlist (`JEV_UPLOAD_FILES` or `files=`). `JEV_TABS` (default on) follows pages opened by the owned tab, keeps at most five, and offers `SWITCH_TAB` / `CLOSE_TAB` by code-owned ids. `JEV_NESTED_SCROLL` (default on) adds scroll targets for up to eight overflow containers. `JEV_KEYBOARD` (default on) checks text after `insertText` and retypes once with key events if the field does not match, and offers `PRESS_KEY` for a fixed set of keys. A native `<select>` with more than `JEV_SELECT_INLINE_MAX` options (default 12) is one `SELECT_OPTION` target; the text model names the option and code matches it. `JEV_VISION` defaults off. When it is on, a page with no usable controls, or a canvas/svg covering most of the viewport, can take one JPEG and click a confirmed point. That path is coordinate-based and is the only exception to the node-id rule. Owned tabs share the existing Chrome profile.
 
 ## Capability flags
 
@@ -137,6 +138,8 @@ Constructor arguments override the environment. Page text stays untrusted data, 
 | `JEV_TABS` | `1` | Track pages opened by the owned tab. After that action the agent switches to the new tab and records `switched to new tab <url>`. Pass `tabs=False` to disable. |
 | `JEV_NESTED_SCROLL` | `1` | Scroll targets for the eight largest visible overflow containers. The wheel event hits the container center; if `scrollTop` does not change, the executor calls `scrollBy` on that node. Pass `nested_scroll=False` to keep document scroll only. |
 | `JEV_KEYBOARD` | `1` | After typing, read the field back. On a mismatch, clear it and retype with key events once. `PRESS_KEY` offers only Enter, Tab, Escape, the arrows, Space, and Backspace. Pass `keyboard=False` to disable both. |
+| `JEV_LARGE_SELECT` | `1` | Selects with more than `JEV_SELECT_INLINE_MAX` options (default 12) become one `SELECT_OPTION` target. The text model returns a label; code matches exact, then case-insensitive, then a unique prefix or contains. No match means no mutation. Pass `large_select=False` to keep one target per option. |
+| `JEV_VISION` | `0` | Off by default. When on, and the page has no usable controls or a canvas/svg covers most of the viewport, one JPEG is sent to a vision model. The point must be confirmed, inside the viewport, and inside a visible canvas or svg. The click is logged as coordinate-based. Pass `vision=True` to enable. |
 
 ## Development
 

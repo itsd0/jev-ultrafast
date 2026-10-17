@@ -8,6 +8,9 @@
       frames,
       frameId: typeof c.frameId === "string" && c.frameId ? c.frameId : "f0",
       nested: c.nested !== false && c.nested !== 0 && c.nested !== "0",
+      largeSelect: c.largeSelect !== false && c.largeSelect !== 0 && c.largeSelect !== "0",
+      selectInlineMax: Number.isFinite(+c.selectInlineMax) ? +c.selectInlineMax : 12,
+      vision: c.vision === true || c.vision === 1 || c.vision === "1",
     };
   }
 
@@ -257,9 +260,15 @@
       return;
     }
     if (e.tagName==='SELECT') {
-      for (const o of e.options) if (!o.selected && !o.disabled && !o.closest('optgroup[disabled]'))
-        actions.push({...base,kind:'select',value:o.value,
-          current_value:[...e.selectedOptions].map(item=>item.label).join(', '),label:base.label+' → '+o.label});
+      const enabled=[...e.options].filter(o=>!o.disabled && !o.closest('optgroup[disabled]'));
+      const current=[...e.selectedOptions].map(item=>item.label).join(', ');
+      const useOne=cfg().largeSelect && enabled.length>cfg().selectInlineMax;
+      if (useOne) {
+        actions.push({...base, kind:'select_option', value:'', current_value:current, option_count:enabled.length});
+      } else {
+        for (const o of enabled) if (!o.selected)
+          actions.push({...base,kind:'select',value:o.value,current_value:current,label:base.label+' → '+o.label});
+      }
     } else {
       const editable=!e.readOnly && e.getAttribute('aria-readonly')!=='true' &&
         (['textbox','searchbox','spinbutton'].includes(rname) ||
@@ -387,6 +396,16 @@
   }
   actions.push({id:'wait',kind:'wait',label:'Wait for the page to update'});
   const cross_frames=frames.filter(entry=>!entry.same).map(({id,rect,src,url})=>({id,rect,src,url}));
+  const surfaces=[];
+  if (cfg().vision) {
+    for (const e of queryAllDeep(document, 'canvas,svg')) {
+      if (!visible(e)) continue;
+      const raw=e.getBoundingClientRect();
+      if (raw.width<8 || raw.height<8 || raw.right<=0 || raw.bottom<=0 || raw.left>=innerWidth || raw.top>=innerHeight) continue;
+      surfaces.push({id:'s'+surfaces.length, tag:e.tagName.toLowerCase(),
+        rect:{x:raw.x, y:raw.y, w:raw.width, h:raw.height}});
+    }
+  }
   return {url:location.href,title:document.title,w:innerWidth,h:innerHeight,text,
-    scroll:{y:scrollY,height},actions,marker,page_key,guards,omitted_actions,cross_frames};
+    scroll:{y:scrollY,height},actions,marker,page_key,guards,omitted_actions,cross_frames,surfaces};
 })()

@@ -1,13 +1,15 @@
 """The complete agent loop. Typed choices, observable state, bounded execution."""
 
 import base64
+import os
 import time
 from pathlib import Path
 
 from .browser import Browser, StalePage
 from .config import resolve_config
-from .model import action_space, choose, field_context, field_text
+from .model import action_space, choose, field_context, field_text, match_option, post_json
 from .questions import MAX_STEPS
+from .vision import confirm_point, needs_vision, propose
 
 
 class Agent:
@@ -24,6 +26,9 @@ class Agent:
         tabs=None,
         nested_scroll=None,
         keyboard=None,
+        large_select=None,
+        select_inline_max=None,
+        vision=None,
     ):
         task = goals.strip() if isinstance(goals, str) else "\n".join(goals).strip()
         if not task:
@@ -38,6 +43,9 @@ class Agent:
             tabs=tabs,
             nested_scroll=nested_scroll,
             keyboard=keyboard,
+            large_select=large_select,
+            select_inline_max=select_inline_max,
+            vision=vision,
         )
         self.browser = Browser(url, config=self.config)
         self.record_dir = Path(record_dir) if record_dir else None
@@ -65,6 +73,48 @@ class Agent:
         if self.record_dir:
             self.record_dir.mkdir(parents=True, exist_ok=True)
             (self.record_dir / "000000.jpg").write_bytes(base64.b64decode(page["screenshot"]))
+
+    def _maybe_vision(self, state):
+        if not (getattr(self, "config", None) or {}).get("vision"):
+            return None
+        page = state["page"]
+        if not needs_vision(page):
+            return None
+        key = os.environ.get("VISION_API_KEY") or os.environ.get("TEXT_MODEL_API_KEY")
+        if not key:
+            return None
+        if not page.get("screenshot") and getattr(state["browser"], "call", None):
+            try:
+                shot = state["browser"].call("Page.captureScreenshot", format="jpeg", quality=72)
+                page = {**page, "screenshot": shot.get("data")}
+                state["page"] = page
+            except (RuntimeError, TypeError, KeyError):
+                return None
+        if not page.get("screenshot"):
+            return None
+        base = os.environ.get("TEXT_MODEL_BASE_URL", "https://api.deepseek.com/v1").rstrip("/")
+
+        def post(body):
+            return post_json(base + "/chat/completions", key, body)
+
+        try:
+            raw = propose(page, state["goal"], post)
+        except (RuntimeError, ValueError):
+            return None
+        confirmed = confirm_point(raw, page)
+        if not confirmed:
+            return None
+        return {
+            "choice": "VISION_CLICK",
+            "operation": "VISION_CLICK",
+            "target": None,
+            "confidence": 1.0,
+            "probabilities": {"VISION_CLICK": 1.0},
+            "latency_ms": 0,
+            "usage": {},
+            "vision": confirmed,
+            "model": "vision",
+        }
 
     def snapshot(self):
         return {
@@ -97,7 +147,7 @@ class Agent:
                 raise ValueError("This run has stopped. Start a fresh demo.")
             if len(state["decisions"]) >= MAX_STEPS * 2:
                 raise ValueError("Reached the demo's model-call budget")
-            state["decision"] = choose(state["page"], state["goal"], state["history"])
+            state["decision"] = self._maybe_vision(state) or choose(state["page"], state["goal"], state["history"])
             state["decisions"].append(
                 {
                     **state["decision"],
@@ -130,12 +180,23 @@ class Agent:
                 state["plan_index"] = int(selected == "DONE")
                 state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
                 return self.snapshot()
-            action = next(a for a in page["actions"] if a["id"] == selected)
+            if selected == "VISION_CLICK":
+                point = decision.get("vision") or {}
+                action = {
+                    "id": "VISION_CLICK",
+                    "kind": "vision",
+                    "label": f"coordinate-based click at {float(point.get('x', 0)):.0f},{float(point.get('y', 0)):.0f}",
+                    "x": point.get("x"),
+                    "y": point.get("y"),
+                }
+            else:
+                action = next(a for a in page["actions"] if a["id"] == selected)
             if len(state["history"]) >= MAX_STEPS:
                 state["status"] = "blocked"
                 raise ValueError(f"Stopped at the {MAX_STEPS}-action demo budget")
             text, helper = None, None
-            if action["kind"] == "fill":
+            unmatched_option = False
+            if action["kind"] in {"fill", "select_option"}:
                 if not state["browser"].fresh(page):
                     raise StalePage("Page changed before text generation. Choose again.")
                 context = field_context(state["goal"], action, page, state["history"])
@@ -145,11 +206,26 @@ class Agent:
                     text, helper = field_text(context)
                     self.pending_text = (context, text, helper)
                     state["text_calls"].append({**helper, "field": action["label"], "value": text})
-            # Browser.act checks freshness immediately before input, including after text generation.
-            result = state["browser"].act(action, page, text=text)
-            self.pending_text = None
-            self.blocked_streak = 0
+            result = {"executed": action["id"]}
+            if action["kind"] == "select_option":
+                options = state["browser"].read_options(action) or []
+                matched = match_option(text, options)
+                if matched:
+                    action = {**action, "kind": "select", "value": matched["value"]}
+                    result = state["browser"].act(action, page, text=text)
+                else:
+                    unmatched_option = True
+            elif action["kind"] == "vision":
+                result = state["browser"].vision_click(action["x"], action["y"])
+            else:
+                # Browser.act checks freshness immediately before input, including after text generation.
+                result = state["browser"].act(action, page, text=text)
+            if not unmatched_option:
+                self.pending_text = None
+                self.blocked_streak = 0
             text_failed = isinstance(result, dict) and result.get("text_verified") is False
+            if unmatched_option:
+                text_failed = False
             switched = None
             if getattr(type(state["browser"]), "collect_new_tabs", None):
                 opened = state["browser"].collect_new_tabs()
@@ -176,7 +252,10 @@ class Agent:
                     "target": decision["target"],
                     "possible_closed_shadow": bool(action.get("possible_closed_shadow")),
                     "note": "; ".join(part for part in (
-                        switched, "text entry failed" if text_failed else None
+                        switched,
+                        "text entry failed" if text_failed else None,
+                        "no matching option" if unmatched_option else None,
+                        "coordinate-based" if action.get("kind") == "vision" else None,
                     ) if part) or None,
                     "page_changed": None,
                     "url": page["url"],

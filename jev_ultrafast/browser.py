@@ -61,6 +61,34 @@ class Browser:
     def call(self, method, **params):
         return cdp(method, session_id=self.session, **params)
 
+    def vision_click(self, x, y):
+        """Coordinate input. This is the only path that does not use a code-owned node id."""
+        print(
+            f"[jev:vision] coordinate-based click x={x:.1f} y={y:.1f} "
+            "breaks the node-id invariant",
+            file=sys.stderr,
+            flush=True,
+        )
+        for event in ("mousePressed", "mouseReleased"):
+            self.call("Input.dispatchMouseEvent", type=event, x=x, y=y, button="left", clickCount=1)
+        self.after_input = {"kind": "vision", "node": None}
+        return {"executed": "VISION_CLICK", "coordinate_based": True}
+
+    def read_options(self, action):
+        """Current enabled-state of a native select. Labels stay out of the model request."""
+        if type(action.get("node")) is not int:
+            return []
+        frame = json.dumps(action.get("frame") or "f0")
+        node = int(action["node"])
+        value = self.evaluate(
+            "(() => { const c=window.__jevFast; if (!c) return null; "
+            f"const win=(c.frameWins&&c.frameWins[{frame}])||window; const local=win.__jevFast; "
+            f"const e=local&&local.nodes.get({node}); if (!e||e.tagName!=='SELECT') return null; "
+            "return [...e.options].map(o=>({label:o.label, value:o.value, "
+            "disabled:!!(o.disabled||o.closest('optgroup[disabled]'))})); })()"
+        )
+        return value or []
+
     def evaluate(self, expression, session=None):
         response = cdp(
             "Runtime.evaluate",
