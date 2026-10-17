@@ -35,7 +35,7 @@ def parse_files(override=None):
     return files
 
 
-def resolve_config(*, shadow_dom=None, frames=None, files=None, tabs=None):
+def resolve_config(*, shadow_dom=None, frames=None, files=None, tabs=None, nested_scroll=None):
     if frames is None:
         chosen = env_choice("JEV_FRAMES", "same", {"same", "all", "off"})
     else:
@@ -48,6 +48,7 @@ def resolve_config(*, shadow_dom=None, frames=None, files=None, tabs=None):
         "frame_id": "f0",
         "files": parse_files(files),
         "tabs": env_bool("JEV_TABS", True) if tabs is None else bool(tabs),
+        "nested_scroll": env_bool("JEV_NESTED_SCROLL", True) if nested_scroll is None else bool(nested_scroll),
     }
 
 
@@ -56,6 +57,7 @@ def snapshot_config(config):
     payload = {
         "shadow": bool(config.get("shadow_dom", True)),
         "frames": config.get("frames", "same"),
+        "nested": bool(config.get("nested_scroll", True)),
     }
     if config.get("frame_id"):
         payload["frameId"] = config["frame_id"]

@@ -187,6 +187,21 @@ def main():
             passed.append("popup tab is tracked with a code-owned id")
         else:
             passed.append("popup was blocked by the browser; opener button still clicked")
+
+        browser.call("Page.navigate", url="data:text/html," + quote((FIXTURES / "scroll.html").read_text()))
+        browser.wait_until_ready()
+        page = browser.observe(screenshot=False)
+        nested = [
+            a for a in page["actions"]
+            if a.get("kind") == "scroll" and a.get("node") and "Tall" in a.get("label", "")
+        ]
+        assert nested, [a["label"] for a in page["actions"] if a.get("kind") == "scroll"]
+        down = next(a for a in nested if a["delta"] > 0)
+        before = browser.evaluate("document.querySelector('#box').scrollTop")
+        browser.act(down, page)
+        after = browser.evaluate("document.querySelector('#box').scrollTop")
+        assert after > before, (before, after)
+        passed.append("nested container scrolls from its own center")
     finally:
         browser.close()
     print("\n".join(passed))

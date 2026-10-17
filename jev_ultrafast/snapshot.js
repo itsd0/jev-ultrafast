@@ -7,6 +7,7 @@
       shadow: c.shadow !== false && c.shadow !== 0 && c.shadow !== "0",
       frames,
       frameId: typeof c.frameId === "string" && c.frameId ? c.frameId : "f0",
+      nested: c.nested !== false && c.nested !== 0 && c.nested !== "0",
     };
   }
 
@@ -100,7 +101,33 @@
     return entries;
   }
 
-  const api = {queryAllDeep, resolveHit, owns, possibleClosedShadow, frameEntries, childDocument, cfg};
+  function scrollTargets(candidates) {
+    const ranked = candidates
+      .filter(item => item && (item.vertical || item.horizontal))
+      .sort((a, b) => b.area - a.area)
+      .slice(0, 8);
+    const actions = [];
+    for (const item of ranked) {
+      const label = item.label || "container";
+      if (item.vertical) {
+        const delta = Math.max(1, Math.round(item.clientHeight * 0.8));
+        actions.push({kind:"scroll", node:item.node, frame:item.frame, axis:"y", delta,
+          label:"Scroll down " + label});
+        actions.push({kind:"scroll", node:item.node, frame:item.frame, axis:"y", delta:-delta,
+          label:"Scroll up " + label});
+      }
+      if (item.horizontal) {
+        const delta = Math.max(1, Math.round(item.clientWidth * 0.8));
+        actions.push({kind:"scroll", node:item.node, frame:item.frame, axis:"x", delta,
+          label:"Scroll right " + label});
+        actions.push({kind:"scroll", node:item.node, frame:item.frame, axis:"x", delta:-delta,
+          label:"Scroll left " + label});
+      }
+    }
+    return actions;
+  }
+
+  const api = {queryAllDeep, resolveHit, owns, possibleClosedShadow, frameEntries, scrollTargets, childDocument, cfg};
   globalThis.__jevApi = api;
   if (typeof document === "undefined") return api;
   if (!document.body) return null;
@@ -325,6 +352,39 @@
   });
   if (scrollY+innerHeight<height-2) actions.push({id:'scroll_down',kind:'scroll',label:'Scroll down',delta:560});
   if (scrollY>0) actions.push({id:'scroll_up',kind:'scroll',label:'Scroll up',delta:-560});
+  if (cfg().nested) {
+    const candidates=[];
+    function addContainers(doc, frameId, ox, oy) {
+      if (!doc || typeof doc.querySelectorAll!=='function') return;
+      let nodes=[];
+      try { nodes=queryAllDeep(doc, '*'); } catch (error) { return; }
+      for (const e of nodes) {
+        if (e===document.body || e===document.documentElement || !visible(e)) continue;
+        const style=getComputedStyle(e);
+        const vertical=['auto','scroll','overlay'].includes(style.overflowY) && e.scrollHeight>e.clientHeight+4;
+        const horizontal=['auto','scroll','overlay'].includes(style.overflowX) && e.scrollWidth>e.clientWidth+4;
+        if (!vertical && !horizontal) continue;
+        const raw=e.getBoundingClientRect();
+        const rect={x:raw.x+ox, y:raw.y+oy, w:raw.width, h:raw.height};
+        if (rect.w<8 || rect.h<8 || rect.x>=innerWidth || rect.x+rect.w<=0 || rect.y>=innerHeight || rect.y+rect.h<=0) continue;
+        const area=Math.max(0, Math.min(rect.x+rect.w, innerWidth)-Math.max(rect.x, 0))
+          * Math.max(0, Math.min(rect.y+rect.h, innerHeight)-Math.max(rect.y, 0));
+        candidates.push({
+          node:identity(e), frame:frameId, vertical, horizontal, area,
+          clientHeight:e.clientHeight, clientWidth:e.clientWidth,
+          label:(name(e)||'container').trim().slice(0, 40),
+        });
+      }
+    }
+    addContainers(document, rootFrame, 0, 0);
+    for (const entry of frames) if (entry.same && entry.doc) addContainers(entry.doc, entry.id, entry.rect.x, entry.rect.y);
+    let n=0;
+    for (const action of scrollTargets(candidates)) {
+      n+=1;
+      action.id='scroll:'+(action.frame||rootFrame)+':'+action.node+':'+n;
+      actions.push(action);
+    }
+  }
   actions.push({id:'wait',kind:'wait',label:'Wait for the page to update'});
   const cross_frames=frames.filter(entry=>!entry.same).map(({id,rect,src,url})=>({id,rect,src,url}));
   return {url:location.href,title:document.title,w:innerWidth,h:innerHeight,text,

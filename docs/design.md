@@ -51,3 +51,7 @@ Cross-origin frames are not readable from the parent. With `frames=all`, one `Pa
 ## Popup tabs
 
 `JEV_TABS` defaults on (`Agent(..., tabs=True)`). `Target.setDiscoverTargets` runs once at startup. After each action, `drain_events` keeps `Target.targetCreated` / `Target.attachedToTarget` pages whose `openerId` is one of our targets. Other Chrome tabs are ignored. Each accepted page gets a code-owned id `t1`…`t5`. The sixth page is not tracked. The agent activates the new tab and stores `switched to new tab <url>` on that history entry before the next observation. `SWITCH_TAB` targets are those ids. `CLOSE_TAB` closes the current tab and returns to a remaining one. The last tab cannot be closed. Input still uses the session stored for that id, never a model-supplied target id.
+
+## Nested scrolling
+
+`JEV_NESTED_SCROLL` defaults on (`Agent(..., nested_scroll=True)`). During the single snapshot, visible elements with `overflow` of `auto`, `scroll`, or `overlay` and a scroll range above 4 pixels are ranked by visible area. At most eight are kept. Each gets `SCROLL_DOWN` / `SCROLL_UP`, plus `SCROLL_LEFT` / `SCROLL_RIGHT` when the overflow is horizontal. Delta is `0.8 * clientHeight` (or width). Document `scroll_down` / `scroll_up` stay as they are. Container targets carry the code-owned node id. Execution wheels at the current center, reads `scrollTop` or `scrollLeft`, and calls `scrollBy` on that node only when the wheel did not move it. The container list is not rebuilt per action.

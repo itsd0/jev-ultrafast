@@ -517,6 +517,41 @@ def browser_operation(request):
     if operation == "act":
         action = request["action"]
         kind = action["kind"]
+        if kind == "scroll" and type(action.get("node")) is int:
+            axis = "x" if action.get("axis") == "x" else "y"
+            delta = int(action.get("delta") or 0)
+            locator = {k: action[k] for k in ("node", "frame") if k in action}
+            before = evaluate(
+                "(action => { const fast=window.__jevFast; "
+                "const e=fast?.resolve ? fast.resolve(action) : fast?.nodes.get(action.node); if (!e) return null; "
+                "const point=fast.toTop ? fast.toTop(e) : null; const r=e.getBoundingClientRect(); "
+                "return {x:point?point.x:r.x+r.width/2, y:point?point.y:r.y+r.height/2, "
+                "before: action.axis==='x' ? e.scrollLeft : e.scrollTop}; })("
+                + json.dumps({**locator, "axis": axis})
+                + ")"
+            )
+            if not before:
+                raise StalePage("Scroll container changed. Observe again.")
+            call(
+                "Input.dispatchMouseEvent",
+                type="mouseWheel",
+                x=before["x"],
+                y=before["y"],
+                deltaX=delta if axis == "x" else 0,
+                deltaY=delta if axis == "y" else 0,
+            )
+            after = evaluate(
+                "(action => { const fast=window.__jevFast; "
+                "const e=fast?.resolve ? fast.resolve(action) : fast?.nodes.get(action.node); if (!e) return null; "
+                "const value=action.axis==='x' ? e.scrollLeft : e.scrollTop; "
+                "if (value===action.before) "
+                "e.scrollBy(action.axis==='x'?action.delta:0, action.axis==='y'?action.delta:0); "
+                "const now=action.axis==='x' ? e.scrollLeft : e.scrollTop; "
+                "return {after:now, fallback:value===action.before}; })("
+                + json.dumps({**locator, "axis": axis, "before": before["before"], "delta": delta})
+                + ")"
+            )
+            return {"executed": action["id"], "scrolled": bool(after and after.get("after") != before["before"])}
         if kind == "scroll":
             call("Input.dispatchMouseEvent", type="mouseWheel", x=550, y=650, deltaX=0, deltaY=action["delta"])
         elif kind == "upload":

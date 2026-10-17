@@ -22,6 +22,7 @@ class Agent:
         frames=None,
         files=None,
         tabs=None,
+        nested_scroll=None,
     ):
         task = goals.strip() if isinstance(goals, str) else "\n".join(goals).strip()
         if not task:
@@ -29,7 +30,9 @@ class Agent:
         plan = [task]
         self.pending_text = None
         self.blocked_streak = 0
-        self.config = resolve_config(shadow_dom=shadow_dom, frames=frames, files=files, tabs=tabs)
+        self.config = resolve_config(
+            shadow_dom=shadow_dom, frames=frames, files=files, tabs=tabs, nested_scroll=nested_scroll
+        )
         self.browser = Browser(url, config=self.config)
         self.record_dir = Path(record_dir) if record_dir else None
         self.screenshots = screenshots or bool(record_dir)

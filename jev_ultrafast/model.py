@@ -106,6 +106,14 @@ def action_space(actions):
     operations = {"click": "CLICK", "fill": "TYPE_TEXT", "select": "SELECT", "upload": "UPLOAD_FILE"}
     for action in actions:
         kind = action["kind"]
+        if kind == "scroll":
+            delta = action.get("delta") or 0
+            if action.get("axis") == "x":
+                operation_name = "SCROLL_RIGHT" if delta > 0 else "SCROLL_LEFT"
+            else:
+                operation_name = "SCROLL_DOWN" if delta > 0 else "SCROLL_UP"
+            targets.setdefault(operation_name, {})[action["id"]] = action
+            continue
         if kind == "switch_tab":
             tab = action.get("tab")
             if not isinstance(tab, str) or not tab.startswith("t") or not tab[1:].isdigit():
@@ -159,6 +167,10 @@ def choose(state, goal, history):
         "SELECT": "Select an observed dropdown value.",
         "UPLOAD_FILE": "Upload an allowlisted file. Choose the offered key. A key is not a filesystem path.",
         "SWITCH_TAB": "Switch to another tab opened by this task. Choose an offered tab id.",
+        "SCROLL_DOWN": "Scroll down the document or an offered container.",
+        "SCROLL_UP": "Scroll up the document or an offered container.",
+        "SCROLL_LEFT": "Scroll an offered container left.",
+        "SCROLL_RIGHT": "Scroll an offered container right.",
     }
     operations = {key: labels[key] for key in targets}
     operations.update({key: value["label"] for key, value in controls.items()})
