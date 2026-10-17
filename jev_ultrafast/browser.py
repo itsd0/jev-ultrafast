@@ -59,6 +59,17 @@ class Browser:
             self.call("Emulation.setDeviceMetricsOverride", width=1120, height=780, deviceScaleFactor=1, mobile=False)
             # Keep rAF/menus rendering in an owned background tab, without activating the user's Chrome tab.
             self.call("Emulation.setFocusEmulationEnabled", enabled=True)
+            options = self.config.get("cloud") or {}
+            if options.get("locale"):
+                try:
+                    self.call("Emulation.setLocaleOverride", locale=options["locale"])
+                except RuntimeError:
+                    pass
+            if options.get("timezone"):
+                try:
+                    self.call("Emulation.setTimezoneOverride", timezoneId=options["timezone"])
+                except RuntimeError:
+                    pass
             self.active = self._register_tab(self.target, self.session, url)
             if self.config.get("tabs", True):
                 try:

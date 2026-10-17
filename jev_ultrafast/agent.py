@@ -50,6 +50,31 @@ def decay_holds(holds):
     return {key: left - 1 for key, left in (holds or {}).items() if left - 1 > 0}
 
 
+def control_unchanged(action, before, after):
+    """The click's own committed state did not move, even if the page re-rendered.
+
+    A calendar cell that is already selected, or an "Open Departure" field that
+    still shows the same value, must not be clicked again two steps later.
+    """
+    if action.get("kind") != "click":
+        return None
+    label = action.get("label")
+    if not label:
+        return None
+    match = next(
+        (item for item in (after.get("actions") or []) if item.get("kind") == "click" and item.get("label") == label),
+        None,
+    )
+    if match is None:
+        return None
+    if action.get("value") and match.get("value") == action.get("value"):
+        return "value unchanged"
+    for key in ("pressed", "selected"):
+        if action.get(key) == "true" and match.get(key) == "true":
+            return "already selected"
+    return None
+
+
 def page_for_choice(state):
     holds = state.get("held_actions") or {}
     if not holds:
@@ -196,12 +221,20 @@ class Agent:
         body = body or {}
         state = self.state
         if name == "tick":
+            pending = None
             try:
                 self.command("predict", {})
+                pending = (state.get("decision") or {}).get("choice")
                 return self.command("act", {"fingerprint": state["page"]["fingerprint"]})
             except StalePage:
                 state["decision"] = None
                 state["status"] = "ready"
+                if pending and pending not in {"DONE", "BLOCKED"}:
+                    # This target stopped matching at execution time. Re-picking
+                    # it against the same page would loop forever.
+                    state["held_actions"] = note_no_progress(
+                        state.get("held_actions"), {"id": pending, "kind": None}, False
+                    )
                 state["page"] = state["browser"].observe(screenshot=self.screenshots)
                 state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
                 return self.snapshot()
@@ -280,6 +313,10 @@ class Agent:
                         return self._skip_text_step(state, page, action, decision, selected)
                     self.pending_text = (context, text, helper)
                     state["text_calls"].append({**helper, "field": action["label"], "value": text})
+                if action["kind"] == "fill" and action.get("value") == text:
+                    # The committed value already equals the goal value. Re-typing
+                    # it is a mutation with no effect; mark the step satisfied.
+                    return self._skip_already_set(state, page, action, decision, selected, text, helper)
             result = {"executed": action["id"]}
             if action["kind"] == "select_option":
                 options = state["browser"].read_options(action) or []
@@ -340,6 +377,10 @@ class Agent:
             )
             state["page"] = state["browser"].observe(screenshot=self.screenshots)
             changed = state["page"]["fingerprint"] != page["fingerprint"]
+            unchanged = control_unchanged(action, page, state["page"])
+            if unchanged:
+                base_note = state["history"][-1]["note"]
+                state["history"][-1]["note"] = f"{base_note}; {unchanged}" if base_note else unchanged
             if not changed and reload_like(action) and getattr(state["browser"], "wait_for_refresh", None):
                 refreshed = state["browser"].wait_for_refresh(
                     page["fingerprint"], timeout=3, screenshot=self.screenshots
@@ -356,7 +397,7 @@ class Agent:
             state["held_actions"] = note_no_progress(
                 state.get("held_actions"),
                 {"id": selected, "kind": action.get("kind")},
-                changed,
+                False if unchanged else changed,
             )
             if state["record"]:
                 (self.record_dir / f"{state['elapsed_ms']:06d}.jpg").write_bytes(
@@ -371,6 +412,39 @@ class Agent:
                 state["blocked_reason"] = "possible closed shadow root"
         else:
             raise ValueError("Unknown command")
+        return self.snapshot()
+
+    def _skip_already_set(self, state, page, action, decision, selected, _text, helper):
+        """The field already holds the goal value. Do not mutate it again."""
+        self.pending_text = None
+        state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
+        state["history"].append(
+            {
+                "step": len(state["history"]) + 1,
+                "action": action["label"],
+                "kind": action["kind"],
+                "choice": selected,
+                "probability": decision["probabilities"].get(selected),
+                "confidence": decision["confidence"],
+                "latency_ms": decision["latency_ms"],
+                "text": None,
+                "text_helper": helper["model"] if helper else None,
+                "text_latency_ms": helper["latency_ms"] if helper else 0,
+                "operation": decision["operation"],
+                "target": decision["target"],
+                "possible_closed_shadow": False,
+                "note": "value already set",
+                "page_changed": False,
+                "url": page["url"],
+                "usage": decision.get("usage", {}),
+                "executed_ms": state["elapsed_ms"],
+                "elapsed_ms": state["elapsed_ms"],
+            }
+        )
+        state["held_actions"] = note_no_progress(
+            state.get("held_actions"), {"id": selected, "kind": action.get("kind")}, False
+        )
+        state["status"] = "ready"
         return self.snapshot()
 
     def _skip_text_step(self, state, page, action, decision, selected):

@@ -327,3 +327,43 @@ def test_ready_after_the_verify_skips_the_extra_ready_call():
     assert tab.wait_until_ready() is True
     tab.evaluate.assert_not_called()
     assert tab.wait_until_ready(timeout=0) is False
+
+
+def test_cloud_locale_and_timezone_defaults_and_overrides(monkeypatch):
+    import jev_ultrafast.config as config_module
+
+    monkeypatch.delenv("JEV_CLOUD_LOCALE", raising=False)
+    monkeypatch.delenv("JEV_CLOUD_TIMEZONE", raising=False)
+    monkeypatch.delenv("LC_ALL", raising=False)
+    monkeypatch.delenv("LC_MESSAGES", raising=False)
+    monkeypatch.setenv("LANG", "en_US.UTF-8")
+    monkeypatch.setattr(config_module, "_local_timezone", lambda: "Asia/Bangkok")
+    settings = config_module.cloud_settings()
+    assert settings["locale"] == "en-US"
+    assert settings["timezone"] == "Asia/Bangkok"
+    monkeypatch.setenv("JEV_CLOUD_LOCALE", "th-TH")
+    monkeypatch.setenv("JEV_CLOUD_TIMEZONE", "none")
+    settings = config_module.cloud_settings()
+    assert settings["locale"] == "th-TH"
+    assert settings["timezone"] is None
+
+
+def test_cloud_browser_sets_locale_and_timezone(monkeypatch, fake_cloud):
+    monkeypatch.setenv("JEV_BROWSER", "cloud")
+    monkeypatch.setenv("JEV_CLOUD_LOCALE", "en-US")
+    monkeypatch.setenv("JEV_CLOUD_TIMEZONE", "Asia/Bangkok")
+    monkeypatch.delenv("JEV_VISIBLE_TAB", raising=False)
+    calls = []
+    monkeypatch.setattr(browser_module, "cdp", _cdp(calls))
+    monkeypatch.setattr(browser_module, "ensure_daemon", lambda: None)
+    Browser("https://example.test/").close()
+    methods = [method for method, _ in calls]
+    assert "Emulation.setLocaleOverride" in methods
+    assert "Emulation.setTimezoneOverride" in methods
+
+
+def test_local_browser_never_sends_locale_overrides(local_browser):
+    calls, _ = local_browser
+    Browser("https://example.test/").close()
+    assert not [method for method, _ in calls if method.startswith("Emulation.setLocaleOverride")]
+    assert not [method for method, _ in calls if method.startswith("Emulation.setTimezoneOverride")]

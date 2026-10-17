@@ -61,6 +61,37 @@ def _custom_proxy():
     return value
 
 
+def _local_locale():
+    """Best-effort BCP-47 locale from the shell environment, e.g. "en-US"."""
+    for name in ("LC_ALL", "LC_MESSAGES", "LANG"):
+        value = os.environ.get(name)
+        if value and value.strip():
+            return value.split(".")[0].strip().replace("_", "-") or None
+    return None
+
+
+def _local_timezone():
+    """IANA zone name from /etc/localtime, e.g. "Asia/Bangkok". None when unknown."""
+    try:
+        target = os.path.realpath("/etc/localtime")
+    except OSError:
+        return None
+    marker = "zoneinfo/"
+    index = target.rfind(marker)
+    return target[index + len(marker):] if index >= 0 else None
+
+
+def _matched_env(name, detected):
+    """Env value, the local default, or "none" to disable."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return detected
+    raw = raw.strip()
+    if not raw or raw.lower() == "none":
+        return None
+    return raw
+
+
 def cloud_settings():
     """Browser Use Cloud request options. Read only when the cloud browser is selected."""
     country = str(os.environ.get("JEV_CLOUD_PROXY_COUNTRY") or "us").strip() or "us"
@@ -71,6 +102,10 @@ def cloud_settings():
         "record": env_bool("JEV_CLOUD_RECORD", False),
         "custom_proxy": _custom_proxy(),
         "show_live_url": env_bool("JEV_CLOUD_SHOW_LIVE_URL", False),
+        # Cloud Chrome drifts to a US timezone and locale. Match this machine by
+        # default so pages render the same; "none" opts out.
+        "locale": _matched_env("JEV_CLOUD_LOCALE", _local_locale()),
+        "timezone": _matched_env("JEV_CLOUD_TIMEZONE", _local_timezone()),
     }
 
 

@@ -290,7 +290,8 @@ def action_space(actions):
         if node not in indices:
             index = str(len(elements) + 1)
             indices[node] = index
-            element = {k: action[k] for k in ("role", "value", "checked", "selected", "expanded") if k in action}
+            state_keys = ("role", "value", "checked", "selected", "expanded", "pressed")
+            element = {k: action[k] for k in state_keys if k in action}
             element.update(index=index, label=action["label"].split(" → ")[0], operations=[])
             if kind == "select":
                 element["value"] = action.get("current_value", "")
@@ -315,9 +316,16 @@ def action_space(actions):
     return elements, targets, controls
 
 
+PROGRESS_NOTES = frozenset({"value already set", "value unchanged", "already selected"})
+
+
 def recent_actions(history, limit=10):
+    """Only satisfied-step markers reach the model; failure notes stay internal."""
     return [
-        {k: item.get(k) for k in ("action", "kind", "text", "page_changed")}
+        {
+            **{k: item.get(k) for k in ("action", "kind", "text", "page_changed")},
+            "note": item.get("note") if item.get("note") in PROGRESS_NOTES else None,
+        }
         for item in history[-limit:]
     ]
 
@@ -467,7 +475,7 @@ def effect_for(action, operation):
     lowered = label.lower()
     if lowered.startswith("view ") or lowered.startswith("open "):
         return "open this result page"
-    if "checked" in action:
+    if "checked" in action or "pressed" in action:
         return "toggle this control"
     return "activate this control"
 
@@ -482,7 +490,7 @@ def action_description(action, operation, target_key):
     }
     if action.get("role"):
         description["role"] = action["role"]
-    for key in ("checked", "selected", "expanded"):
+    for key in ("checked", "selected", "expanded", "pressed"):
         if key in action:
             description[key] = action[key]
     return description
@@ -822,7 +830,7 @@ def typesafe_body(state, goal, history, elements, targets, operations):
                 index: {
                     "element": f"[{index}] {action['label']}",
                     "current_value": action.get("current_value", action.get("value", "")),
-                    **{k: action[k] for k in ("role", "checked", "selected", "expanded") if k in action},
+                    **{k: action[k] for k in ("role", "checked", "selected", "expanded", "pressed") if k in action},
                 }
                 for index, action in candidates.items()
             },

@@ -12,6 +12,8 @@ that `Browser` uses unless `JEV_BROWSER=cloud` is set.
 | `JEV_CLOUD_RECORD` | `0` | `enableRecording`. |
 | `JEV_CLOUD_CUSTOM_PROXY` | empty | JSON `{host, port, username, password}`. |
 | `JEV_CLOUD_SHOW_LIVE_URL` | `0` | Print the live URL to stderr. It is never written to artifacts. |
+| `JEV_CLOUD_LOCALE` | this machine | Locale passed to `Emulation.setLocaleOverride`. `none` disables. |
+| `JEV_CLOUD_TIMEZONE` | this machine | Timezone passed to `Emulation.setTimezoneOverride`. `none` disables. |
 
 Every request also sends `browserScreenWidth: 1120`, `browserScreenHeight: 780`,
 and `allowResizing: false`. Cloud mode defaults `JEV_VISIBLE_TAB` to on so the
@@ -65,56 +67,83 @@ replaces the focused input when the search box is clicked, so the observed node
 was disconnected. The live-control read removes that retype. Mean calls per
 action fell by 80.7%.
 
+## Date-picker loop
+
+The snapshot exposes `pressed` (with `checked`, `selected`, `expanded`) and the
+committed value on the fill and "Open …" click twins. Three generic guards stop
+a control that is already in the goal state from being clicked again:
+
+- a fill whose observed value already equals the generated text is skipped with
+  a `value already set` history note instead of re-typed;
+- a click whose same-labelled control still carries the same value, or is still
+  pressed/selected, is held for two steps with a `value unchanged` or
+  `already selected` note;
+- a target that goes stale at execution time is held for two steps instead of
+  being re-picked against the same page.
+
+Only those satisfied-step notes reach the model; `text entry failed` and the
+other failure notes stay internal. On the traced Google Flights runs the model
+now clicks the date cell and then Done on the first try, the same step local
+takes.
+
 ## Measurement: 2026-10-17
 
-Local host was macOS; local Chrome listened on `127.0.0.1:9222` (isolated
-headless profile). Cloud used the managed proxy disabled for wiki and `us` for
-flights. Decision provider was TypeSafe (`jev-latest`), field text was Mercury
-2.5 with `reasoning_effort=instant`. n = 3 attempts per cell. Cloud startup is
-the create-browser call, measured separately and excluded from total seconds.
-Total seconds start at the first decision, as in [performance.md](performance.md).
+Local host was macOS (Asia/Bangkok); local Chrome listened on
+`127.0.0.1:9222` (isolated headless profile). Cloud used the managed proxy
+disabled for wiki and `us` for flights, with the timezone matched to local.
+Decision provider was TypeSafe (`jev-latest`), field text was Mercury 2.5 with
+`reasoning_effort=instant`. n = 3 attempts per cell. Cloud startup is the
+create-browser call, measured separately and excluded from total seconds. Total
+seconds start at the first decision, as in [performance.md](performance.md).
 This pass reran wiki and flights; hotel was not rerun.
 
 | provider | browser | task | run | verified | total s | startup s | actions | decision calls | median decision ms | verifier calls | input tokens | output tokens |
 | --- | --- | --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| typesafe | local | wiki | 1 | True | 3.082 | 0.0 | 2 | 4 | 306.5 | 0 | 29612 | 2451 |
-| typesafe | local | wiki | 2 | True | 3.086 | 0.0 | 2 | 5 | 286 | 0 | 36412 | 2994 |
-| typesafe | local | wiki | 3 | True | 2.635 | 0.0 | 2 | 3 | 284 | 0 | 22743 | 1884 |
-| typesafe | local | flights | 1 | True | 8.006 | 0.0 | 10 | 18 | 289.5 | 0 | 115199 | 8960 |
-| typesafe | local | flights | 2 | True | 7.657 | 0.0 | 10 | 17 | 286 | 0 | 105883 | 8296 |
-| typesafe | local | flights | 3 | True | 8.463 | 0.0 | 10 | 17 | 285 | 0 | 105907 | 8876 |
-| typesafe | cloud | wiki | 1 | True | 9.779 | 7.446 | 2 | 3 | 414 | 0 | 15781 | 1335 |
-| typesafe | cloud | wiki | 2 | True | 9.536 | 4.802 | 2 | 3 | 357 | 0 | 16418 | 1394 |
-| typesafe | cloud | wiki | 3 | True | 9.506 | 4.98 | 2 | 3 | 326 | 0 | 19458 | 1641 |
-| typesafe | cloud | flights | 1 | False | 78.487 | 4.742 | 20 | 24 | 327.0 | 0 | 138753 | 10838 |
-| typesafe | cloud | flights | 2 | False | 52.189 | 5.268 | 12 | 16 | 344.5 | 0 | 147330 | 10603 |
-| typesafe | cloud | flights | 3 | False | 68.054 | 4.795 | 16 | 23 | 353 | 0 | 245721 | 17322 |
+| typesafe | cloud | wiki | 1 | True | 9.49 | 4.848 | 2 | 3 | 330 | 0 | 15796 | 1341 |
+| typesafe | cloud | wiki | 2 | True | 9.548 | 4.809 | 2 | 3 | 275 | 0 | 15805 | 1338 |
+| typesafe | cloud | wiki | 3 | True | 11.169 | 4.791 | 2 | 3 | 399 | 0 | 15749 | 1357 |
+| typesafe | cloud | flights | 1 | False | 234.163 | 4.834 | 22 | 120 | 329.0 | 0 | 1732342 | 118968 |
+| typesafe | cloud | flights | 2 | True | 44.518 | 5.265 | 10 | 11 | 300 | 0 | 63436 | 4870 |
+| typesafe | cloud | flights | 3 | True | 56.221 | 5.153 | 10 | 11 | 300 | 0 | 63451 | 4847 |
+| typesafe | local | wiki | 1 | True | 3.462 | 0.0 | 2 | 4 | 282.5 | 0 | 29430 | 2426 |
+| typesafe | local | wiki | 2 | True | 6.534 | 0.0 | 4 | 8 | 302.0 | 0 | 44953 | 3770 |
+| typesafe | local | wiki | 3 | True | 4.397 | 0.0 | 4 | 6 | 323.5 | 0 | 42477 | 3453 |
+| typesafe | local | flights | 1 | False | 29.158 | 0.0 | 37 | 52 | 293.5 | 0 | 281076 | 21407 |
+| typesafe | local | flights | 2 | True | 12.865 | 0.0 | 12 | 23 | 278 | 0 | 135369 | 10430 |
+| typesafe | local | flights | 3 | True | 26.464 | 0.0 | 26 | 45 | 270 | 0 | 268831 | 20582 |
 
 Medians use verified runs only (`n` is the verified count); every attempt stays
 in the table above.
 
 | task | local median s | local n | cloud median s | cloud n | cloud startup s | per-action overhead |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| wiki | 3.082 | 3/3 | 9.536 | 3/3 | 4.980 | +3,227 ms |
-| flights | 8.006 | 3/3 | n/a | 0/3 | n/a | n/a |
+| wiki | 4.397 | 3/3 | 9.548 | 3/3 | 4.809 | +2,576 ms |
+| flights | 19.665 | 2/3 | 50.370 | 2/3 | 5.209 | +3,071 ms |
 
 Per-action overhead is `(cloud median - local median) / cloud median actions`
-using the verified medians above. Cloud startup was 4.74-7.45 s across runs and
+using the verified medians above. Cloud startup was 4.79-5.27 s across runs and
 is not included in either total.
 
 ### Failures and limits
 
-- Cloud flights was 0/3 this pass. All three runs set the correct one-way
-  route and November 16, 2026 date, then looped on the date picker's selected
-  date and "Open Departure" until the no-progress stop. The independent
-  route/date/results verifier failed. The same loop appeared in one of the
-  three cloud flights runs in the earlier pass. It is a policy/UI problem, not a
-  CDP failure.
+- Cloud flights run 1 reached the results page, then ping-ponged between the
+  results pager's "Next"/"Previous" controls until the 120-decision budget
+  stopped it. Runs 2 and 3 verified in 44.5 s and 56.2 s. The date picker was
+  not the cause: all three runs clicked Done on the first try.
+- Local flights run 1 met a different Google Flights variant ("Explore deals
+  with AI" / "When, where, and how do you want to travel?") and wandered for 37
+  actions; runs 2 and 3 verified.
 - Cloud hotel was not rerun. The fixture at `127.0.0.1:8766` is not reachable
   from the cloud browser and `JEV_FIXTURE_PUBLIC_URL` was unset.
 - Cloud wiki was 3/3. Each run paid one content-filtered text request before
   the page-text-free retry succeeded.
-- No CDP method failed in cloud mode. `Runtime.evaluate`, `Input.insertText`,
+- `Emulation.setLocaleOverride` is rejected by the cloud Chrome and is recorded
+  as unsupported; the timezone override succeeds. Both sides were `en-US`, so
+  only the timezone actually differed.
+- The cloud window is 1120x559-568 at DPR 1.25-2, while local is 1120x780 at
+  DPR 1. The metrics override sent at attach does not stick on the cloud
+  browser, so the two sides do not render the same viewport.
+- No other CDP method failed. `Runtime.evaluate`, `Input.insertText`,
   `Input.dispatchMouseEvent`, `Input.dispatchKeyEvent`, `Target.createTarget`,
   `Target.attachToTarget`, `Target.setDiscoverTargets`,
   `Emulation.setDeviceMetricsOverride`, `Emulation.setFocusEmulationEnabled`,

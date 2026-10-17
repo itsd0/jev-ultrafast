@@ -74,6 +74,38 @@ def test_one_index_per_node_with_operation_specific_targets():
     assert "WAIT" in controls
 
 
+def test_pressed_state_and_history_note_reach_the_model():
+    actions = [{
+        "id": "e7", "kind": "click", "label": "November 16", "role": "button",
+        "node": 9, "pressed": "true", "value": "",
+    }]
+    elements, targets, _controls = model.action_space(actions)
+    assert elements[0]["pressed"] == "true"
+    assert targets["CLICK"]["1"]["pressed"] == "true"
+    description = model.action_description(actions[0], "CLICK", "1")
+    assert description["pressed"] == "true"
+    assert description["effect"] == "toggle this control"
+    recent = model.recent_actions([{"action": "a", "note": "value unchanged"}])
+    assert recent[0]["note"] == "value unchanged"
+    failed = model.recent_actions([{"action": "a", "note": "text entry failed"}])
+    assert failed[0]["note"] is None
+
+
+def test_control_unchanged_rules():
+    from jev_ultrafast.agent import control_unchanged
+
+    field = {"kind": "click", "label": "Open Departure", "value": "Mon, Nov 16"}
+    same = {"actions": [{"kind": "click", "label": "Open Departure", "value": "Mon, Nov 16"}]}
+    assert control_unchanged(field, {}, same) == "value unchanged"
+    cell = {"kind": "click", "label": "Nov 16", "pressed": "true"}
+    still = {"actions": [{"kind": "click", "label": "Nov 16", "pressed": "true"}]}
+    assert control_unchanged(cell, {}, still) == "already selected"
+    moved = {"actions": [{"kind": "click", "label": "Open Departure", "value": ""}]}
+    assert control_unchanged(field, {}, moved) is None
+    assert control_unchanged(field, {}, {"actions": []}) is None
+    assert control_unchanged({"kind": "fill", "label": "Open Departure", "value": "x"}, {}, same) is None
+
+
 def test_all_heads_are_one_request_and_only_matching_head_executes(monkeypatch):
     calls = []
 
@@ -312,6 +344,43 @@ def test_text_mismatch_is_recorded_without_another_attempt(runner, monkeypatch):
     assert runner.state["browser"].act.call_count == 1
 
 
+def test_fill_already_set_skips_the_mutation_and_holds(runner, monkeypatch):
+    runner.state["page"]["actions"].append(
+        {"id": "e5", "kind": "fill", "label": "Departure", "value": "Mon, Nov 16", "node": 30}
+    )
+    monkeypatch.setattr(loop, "field_text", Mock(return_value=("Mon, Nov 16", {"model": "t", "latency_ms": 1})))
+    runner.state["decision"] = {
+        "choice": "e5", "operation": "TYPE_TEXT", "target": "5", "confidence": 1,
+        "probabilities": {"e5": 1}, "latency_ms": 1, "usage": {},
+    }
+    runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    runner.state["browser"].act.assert_not_called()
+    assert runner.state["history"][-1]["note"] == "value already set"
+    assert runner.state["history"][-1]["page_changed"] is False
+    assert runner.state["held_actions"]["e5"] == 2
+    assert runner.state["status"] == "ready"
+
+
+def test_click_with_unchanged_value_is_held(runner):
+    runner.state["page"]["actions"].append(
+        {"id": "e6", "kind": "click", "label": "Open Departure", "value": "Mon, Nov 16", "node": 40}
+    )
+    runner.state["decision"] = {
+        "choice": "e6", "operation": "CLICK", "target": "6", "confidence": 1,
+        "probabilities": {"e6": 1}, "latency_ms": 1, "usage": {},
+    }
+    after = page()
+    after["fingerprint"] = "changed"
+    after["actions"].append(
+        {"id": "e9", "kind": "click", "label": "Open Departure", "value": "Mon, Nov 16", "node": 50}
+    )
+    runner.state["browser"].observe.return_value = after
+    runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    runner.state["browser"].act.assert_called_once()
+    assert runner.state["history"][-1]["note"] == "value unchanged"
+    assert runner.state["held_actions"]["e6"] == 2
+
+
 def test_executed_action_resets_blocked_streak(runner):
     runner.blocked_streak = 2
     runner.state["decision"] = {**decision("e3"), "operation": "CLICK"}
@@ -439,6 +508,18 @@ def test_navigation_during_prediction_reobserves_without_action(runner):
     assert runner.state["status"] == "ready"
     assert runner.state["decision"] is None
     runner.state["browser"].act.assert_not_called()
+
+
+def test_stale_execution_target_is_held_before_the_retry(runner, monkeypatch):
+    monkeypatch.setattr(loop, "choose", lambda *_args, **_kwargs: decision("e3"))
+    runner.state["browser"].fresh.return_value = True
+    runner.state["browser"].observe.side_effect = [page(), page()]
+    runner.state["browser"].act.side_effect = StalePage("Target changed or is covered. Observe again.")
+    runner.command("tick")
+    assert runner.state["held_actions"]["e3"] == 2
+    runner.state["browser"].act.side_effect = None
+    runner.command("tick")
+    assert runner.state["history"][-1]["choice"] == "e3"
 
 
 def test_debug_log_reports_tokens_per_second(monkeypatch, capsys):

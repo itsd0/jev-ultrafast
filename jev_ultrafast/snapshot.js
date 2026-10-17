@@ -250,7 +250,7 @@
     const base={node, frame:frameId, role:rname, label:name(e)||rname, rect};
     if (possibleClosedShadow(e)) base.possible_closed_shadow=true;
     seenNodes.add(frameId+':'+node);
-    for (const key of ['checked','selected','expanded']) {
+    for (const key of ['checked','selected','expanded','pressed']) {
       const value=e.getAttribute('aria-'+key);
       if (value!==null) base[key]=value;
     }
