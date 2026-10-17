@@ -1,6 +1,10 @@
 """Feature flags. Constructor options override environment variables."""
 
+import json
 import os
+import sys
+
+_cloud_upload_warned = False
 
 
 def env_bool(name, default):
@@ -35,6 +39,59 @@ def parse_files(override=None):
     return files
 
 
+def _clamped_int(name, default, low, high):
+    raw = os.environ.get(name)
+    try:
+        value = int(str(raw).strip()) if raw is not None and str(raw).strip() else default
+    except ValueError:
+        value = default
+    return max(low, min(high, value))
+
+
+def _custom_proxy():
+    raw = os.environ.get("JEV_CLOUD_CUSTOM_PROXY")
+    if raw is None or not str(raw).strip():
+        return None
+    try:
+        value = json.loads(raw)
+    except ValueError:
+        raise ValueError("JEV_CLOUD_CUSTOM_PROXY must be a JSON object") from None
+    if not isinstance(value, dict):
+        raise ValueError("JEV_CLOUD_CUSTOM_PROXY must be a JSON object")
+    return value
+
+
+def cloud_settings():
+    """Browser Use Cloud request options. Read only when the cloud browser is selected."""
+    country = str(os.environ.get("JEV_CLOUD_PROXY_COUNTRY") or "us").strip() or "us"
+    return {
+        "proxy_country": None if country.lower() == "none" else country,
+        "timeout_min": _clamped_int("JEV_CLOUD_TIMEOUT_MIN", 15, 1, 240),
+        "profile_id": str(os.environ.get("JEV_CLOUD_PROFILE_ID") or "").strip() or None,
+        "record": env_bool("JEV_CLOUD_RECORD", False),
+        "custom_proxy": _custom_proxy(),
+        "show_live_url": env_bool("JEV_CLOUD_SHOW_LIVE_URL", False),
+    }
+
+
+def disable_cloud_uploads(files):
+    """Local paths are not visible to a remote browser, so fail closed."""
+    global _cloud_upload_warned
+    if not files:
+        return files
+    if not _cloud_upload_warned:
+        _cloud_upload_warned = True
+        # TODO: upload through POST /api/v2/files/browsers/{session_id}/presigned-url
+        # (the destination path is undocumented), then reach the remote copy from
+        # the browser. Until that exists, cloud runs offer no upload targets.
+        print(
+            "[jev:cloud] uploads disabled: the remote browser cannot read local paths",
+            file=sys.stderr,
+            flush=True,
+        )
+    return {}
+
+
 def _inline_max(override):
     if override is None:
         raw = os.environ.get("JEV_SELECT_INLINE_MAX", "12")
@@ -63,11 +120,17 @@ def resolve_config(
         chosen = str(frames).strip().lower()
         if chosen not in {"same", "all", "off"}:
             chosen = "same"
+    browser = env_choice("JEV_BROWSER", "local", {"local", "cloud"})
+    uploads = parse_files(files)
+    if browser == "cloud":
+        uploads = disable_cloud_uploads(uploads)
     return {
+        "browser": browser,
+        "cloud": cloud_settings() if browser == "cloud" else {},
         "shadow_dom": env_bool("JEV_SHADOW_DOM", True) if shadow_dom is None else bool(shadow_dom),
         "frames": chosen,
         "frame_id": "f0",
-        "files": parse_files(files),
+        "files": uploads,
         "tabs": env_bool("JEV_TABS", True) if tabs is None else bool(tabs),
         "nested_scroll": env_bool("JEV_NESTED_SCROLL", True) if nested_scroll is None else bool(nested_scroll),
         "keyboard": env_bool("JEV_KEYBOARD", True) if keyboard is None else bool(keyboard),

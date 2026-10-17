@@ -10,6 +10,7 @@ from pathlib import Path
 from browser_harness.admin import ensure_daemon
 from browser_harness.helpers import cdp, drain_events
 
+from . import cloud
 from .config import resolve_config, snapshot_config
 
 # Atomically read visible content and controls, preserving actual DOM node identity.
@@ -36,27 +37,42 @@ class Browser:
         self.tabs = {}
         self.active = None
         self._tab_serial = 0
-        ensure_daemon()
-        visible = os.environ.get("JEV_VISIBLE_TAB", "").strip().lower() in {"1", "true", "yes", "on"}
-        self.target = cdp("Target.createTarget", url="about:blank", background=not visible)["targetId"]
-        self.session = cdp("Target.attachToTarget", targetId=self.target, flatten=True)["sessionId"]
-        if visible:
-            self.call("Page.bringToFront")
-        self.call("Emulation.setDeviceMetricsOverride", width=1120, height=780, deviceScaleFactor=1, mobile=False)
-        # Keep rAF/menus rendering in an owned background tab, without activating the user's Chrome tab.
-        self.call("Emulation.setFocusEmulationEnabled", enabled=True)
-        self.active = self._register_tab(self.target, self.session, url)
-        if self.config.get("tabs", True):
-            try:
-                cdp("Target.setDiscoverTargets", discover=True)
-            except RuntimeError:
-                pass
-        self.call("Page.navigate", url=url)
-        deadline = time.monotonic() + 15
-        while time.monotonic() < deadline:
-            if self.evaluate("document.readyState") == "complete":
-                break
-            time.sleep(0.02)
+        self.cloud = None
+        cloud_mode = self.config.get("browser") == "cloud"
+        if cloud_mode:
+            # The cloud daemon is already attached. ensure_daemon() would spawn a
+            # local Chrome daemon if the cloud one died.
+            self.cloud = cloud.start(self.config)
+        else:
+            ensure_daemon()
+        try:
+            visible_env = os.environ.get("JEV_VISIBLE_TAB")
+            if visible_env is None or not visible_env.strip():
+                visible = cloud_mode
+            else:
+                visible = visible_env.strip().lower() in {"1", "true", "yes", "on"}
+            self.target = cdp("Target.createTarget", url="about:blank", background=not visible)["targetId"]
+            self.session = cdp("Target.attachToTarget", targetId=self.target, flatten=True)["sessionId"]
+            if visible:
+                self.call("Page.bringToFront")
+            self.call("Emulation.setDeviceMetricsOverride", width=1120, height=780, deviceScaleFactor=1, mobile=False)
+            # Keep rAF/menus rendering in an owned background tab, without activating the user's Chrome tab.
+            self.call("Emulation.setFocusEmulationEnabled", enabled=True)
+            self.active = self._register_tab(self.target, self.session, url)
+            if self.config.get("tabs", True):
+                try:
+                    cdp("Target.setDiscoverTargets", discover=True)
+                except RuntimeError:
+                    pass
+            self.call("Page.navigate", url=url)
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline:
+                if self.evaluate("document.readyState") == "complete":
+                    break
+                time.sleep(0.02)
+        except BaseException:
+            self.stop_cloud()
+            raise
 
     def call(self, method, **params):
         return cdp(method, session_id=self.session, **params)
@@ -343,17 +359,27 @@ class Browser:
         return result
 
     def close(self):
-        owned = [tab["target"] for tab in self.tabs.values()]
-        if not owned and getattr(self, "target", None):
-            owned = [self.target]
-        targets = owned
-        self.target = None
-        self.tabs = {}
-        for target in targets:
-            try:
-                cdp("Target.closeTarget", targetId=target)
-            except RuntimeError:
-                pass
+        try:
+            owned = [tab["target"] for tab in self.tabs.values()]
+            if not owned and getattr(self, "target", None):
+                owned = [self.target]
+            targets = owned
+            self.target = None
+            self.tabs = {}
+            for target in targets:
+                try:
+                    cdp("Target.closeTarget", targetId=target)
+                except RuntimeError:
+                    pass
+        finally:
+            self.stop_cloud()
+
+    def stop_cloud(self):
+        handle, self.cloud = self.cloud, None
+        if handle:
+            cloud.stop(handle)
+            return True
+        return False
 
     def _register_tab(self, target_id, session, url, opener=None):
         for key, tab in self.tabs.items():

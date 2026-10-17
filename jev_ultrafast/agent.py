@@ -408,7 +408,10 @@ class Agent:
             yield self.command("tick")
 
     def close(self):
-        self.browser.close()
+        try:
+            self.browser.close()
+        finally:
+            self.browser.stop_cloud()
 
     def __enter__(self):
         return self
