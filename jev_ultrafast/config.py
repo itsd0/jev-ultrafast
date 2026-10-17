@@ -172,6 +172,7 @@ def resolve_config(
         "large_select": env_bool("JEV_LARGE_SELECT", True) if large_select is None else bool(large_select),
         "select_inline_max": _inline_max(select_inline_max),
         "vision": env_bool("JEV_VISION", False) if vision is None else bool(vision),
+        "max_decisions": _clamped_int("JEV_MAX_DECISIONS", 80, 1, 10000),
     }
 
 

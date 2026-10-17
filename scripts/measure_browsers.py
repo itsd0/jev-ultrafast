@@ -292,14 +292,31 @@ def overhead(local, remote):
     return result
 
 
+def parse_task_runs(raw, tasks, default):
+    values = {task: default for task in tasks}
+    for part in (raw or "").split(","):
+        if "=" not in part:
+            continue
+        name, count = part.split("=", 1)
+        name = name.strip()
+        if name in values:
+            try:
+                values[name] = max(1, int(count))
+            except ValueError:
+                pass
+    return values
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", default=str(ROOT / "artifacts" / "browser-measurement.json"))
     parser.add_argument("--browsers", nargs="+", choices=("local", "cloud"), default=["local", "cloud"])
     parser.add_argument("--runs", type=int, default=RUNS)
+    parser.add_argument("--task-runs", default="", help="Per-task overrides, e.g. flights=5,wiki=3")
     parser.add_argument("--tasks", nargs="+", choices=TASKS, default=list(TASKS))
     parser.add_argument("--region", default=os.environ.get("JEV_REGION", "unspecified"))
     args = parser.parse_args()
+    task_runs = parse_task_runs(args.task_runs, args.tasks, args.runs)
     load_environment()
     browser_module.cdp = _record_cdp
     cloud_module.start = _timed_cloud_start
@@ -312,7 +329,7 @@ def main():
         "decision_provider": "typesafe",
         "text_model": "mercury-2.5",
         "text_reasoning": "instant",
-        "runs_per_cell": args.runs,
+        "runs_per_cell": task_runs,
         "tasks": args.tasks,
         "cloud_proxy": {"wiki": "none", "hotel": "none", "flights": "us"},
         "arms": {},
@@ -323,7 +340,7 @@ def main():
     rows = []
     for browser in args.browsers:
         for task in args.tasks:
-            for run in range(1, args.runs + 1):
+            for run in range(1, task_runs[task] + 1):
                 rows.append(run_one(browser, task, run))
                 arm_rows = [row for row in rows if row["browser"] == browser]
                 report["arms"][browser] = aggregate(arm_rows)

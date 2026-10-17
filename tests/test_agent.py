@@ -91,6 +91,90 @@ def test_pressed_state_and_history_note_reach_the_model():
     assert failed[0]["note"] is None
 
 
+def _loop_step(operation, label, url="u", title="t", progress=False):
+    return {
+        "key": (operation, label, url, title),
+        "id": label,
+        "label": label,
+        "progress": progress,
+    }
+
+
+def test_detect_cycle_finds_ab_and_abc_without_false_positives():
+    from jev_ultrafast.agent import detect_cycle
+
+    ab = [_loop_step("CLICK", "A"), _loop_step("CLICK", "B")] * 2
+    assert detect_cycle(ab)["labels"] == ["A", "B"]
+    abc = [_loop_step("CLICK", name) for name in ("A", "B", "C")] * 2
+    assert detect_cycle(abc)["labels"] == ["A", "B", "C"]
+    assert detect_cycle([_loop_step("CLICK", "A"), _loop_step("CLICK", "B")]) is None
+    progress = [
+        _loop_step("CLICK", "A"),
+        _loop_step("CLICK", "B", progress=True),
+        _loop_step("CLICK", "A"),
+        _loop_step("CLICK", "B"),
+    ]
+    assert detect_cycle(progress) is None
+    moved = [
+        _loop_step("CLICK", "A"),
+        _loop_step("CLICK", "B"),
+        _loop_step("CLICK", "A", url="u2"),
+        _loop_step("CLICK", "B"),
+    ]
+    assert detect_cycle(moved) is None
+
+
+def test_loop_detector_fires_twice_then_blocks(runner, monkeypatch):
+    ids = ["e2", "e3"]
+
+    def click(index):
+        return {**decision(ids[index % 2]), "operation": "CLICK"}
+
+    monkeypatch.setattr(loop, "choose", lambda *_args, **_kwargs: click(len(runner.state["history"])))
+    rerenders = {"n": 0}
+
+    def rerender(*_args, **_kwargs):
+        rerenders["n"] += 1
+        return {**page(), "fingerprint": f"fp{rerenders['n']}"}
+
+    runner.state["browser"].fresh.return_value = True
+    runner.state["browser"].observe.side_effect = rerender
+    runner.state["browser"].act.return_value = {"executed": "x"}
+    for _ in range(12):
+        runner.command("tick")
+        if runner.state["status"] == "blocked":
+            break
+    assert runner.state["status"] == "blocked"
+    assert runner.state["blocked_reason"] == "loop detected"
+    assert runner.state["loop_fires"] >= 3
+    assert any("loop detected" in (h.get("note") or "") for h in runner.state["history"])
+
+
+def test_decision_budget_stops_cleanly(runner, monkeypatch):
+    ids = ["e2", "e3"]
+    monkeypatch.setattr(
+        loop, "choose",
+        lambda *_args, **_kwargs: {**decision(ids[len(runner.state["history"]) % 2]), "operation": "CLICK"},
+    )
+    runner.config = {"max_decisions": 3}
+    rerenders = {"n": 0}
+
+    def rerender(*_args, **_kwargs):
+        rerenders["n"] += 1
+        return {**page(), "fingerprint": f"fp{rerenders['n']}"}
+
+    runner.state["browser"].fresh.return_value = True
+    runner.state["browser"].observe.side_effect = rerender
+    runner.state["browser"].act.return_value = {"executed": "x"}
+    for _ in range(6):
+        runner.command("tick")
+        if runner.state["status"] == "blocked":
+            break
+    assert runner.state["status"] == "blocked"
+    assert runner.state["blocked_reason"] == "decision budget"
+    assert len(runner.state["decisions"]) == 3
+
+
 def test_control_unchanged_rules():
     from jev_ultrafast.agent import control_unchanged
 

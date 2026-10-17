@@ -11,6 +11,17 @@ from browser_harness.admin import start_remote_daemon, stop_remote_daemon
 
 SCREEN_WIDTH = 1120
 SCREEN_HEIGHT = 780
+SCREEN_DPR = 1
+
+# Methods the cloud Chrome rejects. Recorded here so callers skip them instead
+# of paying a failed round trip and a logged error on every run.
+UNSUPPORTED_METHODS = {
+    "Emulation.setLocaleOverride": "cloud Chrome rejects locale overrides",
+}
+
+
+def supported(method):
+    return method not in UNSUPPORTED_METHODS
 
 _lock = threading.RLock()
 _active = {}

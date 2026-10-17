@@ -348,7 +348,7 @@ def test_cloud_locale_and_timezone_defaults_and_overrides(monkeypatch):
     assert settings["timezone"] is None
 
 
-def test_cloud_browser_sets_locale_and_timezone(monkeypatch, fake_cloud):
+def test_cloud_browser_sets_timezone_and_skips_unsupported_locale(monkeypatch, fake_cloud):
     monkeypatch.setenv("JEV_BROWSER", "cloud")
     monkeypatch.setenv("JEV_CLOUD_LOCALE", "en-US")
     monkeypatch.setenv("JEV_CLOUD_TIMEZONE", "Asia/Bangkok")
@@ -358,7 +358,8 @@ def test_cloud_browser_sets_locale_and_timezone(monkeypatch, fake_cloud):
     monkeypatch.setattr(browser_module, "ensure_daemon", lambda: None)
     Browser("https://example.test/").close()
     methods = [method for method, _ in calls]
-    assert "Emulation.setLocaleOverride" in methods
+    assert cloud.supported("Emulation.setLocaleOverride") is False
+    assert "Emulation.setLocaleOverride" not in methods
     assert "Emulation.setTimezoneOverride" in methods
 
 
@@ -367,3 +368,50 @@ def test_local_browser_never_sends_locale_overrides(local_browser):
     Browser("https://example.test/").close()
     assert not [method for method, _ in calls if method.startswith("Emulation.setLocaleOverride")]
     assert not [method for method, _ in calls if method.startswith("Emulation.setTimezoneOverride")]
+
+
+def _viewport_cdp(calls, reading):
+    def cdp(method, **params):
+        calls.append((method, params))
+        if method == "Target.createTarget":
+            return {"targetId": "t1"}
+        if method == "Target.attachToTarget":
+            return {"sessionId": "s1"}
+        if method == "Runtime.evaluate":
+            if "innerWidth" in params["expression"]:
+                return {"result": {"value": reading}}
+            return {"result": {"value": "complete"}}
+        return {}
+
+    return cdp
+
+
+def test_cloud_viewport_mismatch_is_reapplied_and_logged(monkeypatch, fake_cloud, capsys):
+    monkeypatch.setenv("JEV_BROWSER", "cloud")
+    monkeypatch.delenv("JEV_VISIBLE_TAB", raising=False)
+    calls = []
+    monkeypatch.setattr(browser_module, "cdp", _viewport_cdp(calls, {"w": 1120, "h": 568, "dpr": 1.25}))
+    monkeypatch.setattr(browser_module, "ensure_daemon", lambda: None)
+    Browser("https://example.test/").close()
+    metrics = [params for method, params in calls if method == "Emulation.setDeviceMetricsOverride"]
+    assert len(metrics) == 2
+    assert "viewport mismatch" in capsys.readouterr().err
+
+
+def test_cloud_viewport_match_is_not_reapplied(monkeypatch, fake_cloud, capsys):
+    monkeypatch.setenv("JEV_BROWSER", "cloud")
+    monkeypatch.delenv("JEV_VISIBLE_TAB", raising=False)
+    calls = []
+    monkeypatch.setattr(browser_module, "cdp", _viewport_cdp(calls, {"w": 1120, "h": 780, "dpr": 1}))
+    monkeypatch.setattr(browser_module, "ensure_daemon", lambda: None)
+    Browser("https://example.test/").close()
+    metrics = [params for method, params in calls if method == "Emulation.setDeviceMetricsOverride"]
+    assert len(metrics) == 1
+    assert "viewport mismatch" not in capsys.readouterr().err
+
+
+def test_max_decisions_default_and_override(monkeypatch):
+    monkeypatch.delenv("JEV_MAX_DECISIONS", raising=False)
+    assert resolve_config()["max_decisions"] == 80
+    monkeypatch.setenv("JEV_MAX_DECISIONS", "5")
+    assert resolve_config()["max_decisions"] == 5

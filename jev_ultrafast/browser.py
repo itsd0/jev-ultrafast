@@ -60,7 +60,7 @@ class Browser:
             # Keep rAF/menus rendering in an owned background tab, without activating the user's Chrome tab.
             self.call("Emulation.setFocusEmulationEnabled", enabled=True)
             options = self.config.get("cloud") or {}
-            if options.get("locale"):
+            if options.get("locale") and cloud.supported("Emulation.setLocaleOverride"):
                 try:
                     self.call("Emulation.setLocaleOverride", locale=options["locale"])
                 except RuntimeError:
@@ -83,12 +83,55 @@ class Browser:
                 if self.evaluate("document.readyState") == "complete":
                     break
                 time.sleep(poll)
+            if cloud_mode:
+                self._verify_viewport()
         except BaseException:
             self.stop_cloud()
             raise
 
     def call(self, method, **params):
         return cdp(method, session_id=self.session, **params)
+
+    VIEWPORT = (1120, 780, 1)
+
+    def _set_viewport(self):
+        width, height, dpr = self.VIEWPORT
+        self.call(
+            "Emulation.setDeviceMetricsOverride",
+            width=width,
+            height=height,
+            deviceScaleFactor=dpr,
+            mobile=False,
+        )
+
+    def _viewport_reading(self):
+        return self.evaluate("(()=>({w:innerWidth,h:innerHeight,dpr:devicePixelRatio}))()")
+
+    def _verify_viewport(self):
+        """The cloud window ignores the attach-time override; re-apply and report."""
+        expected = {"w": self.VIEWPORT[0], "h": self.VIEWPORT[1], "dpr": self.VIEWPORT[2]}
+        try:
+            actual = self._viewport_reading()
+        except StalePage:
+            return None
+        if not isinstance(actual, dict) or actual == expected:
+            return actual
+        try:
+            self._set_viewport()
+        except RuntimeError:
+            pass
+        try:
+            retry = self._viewport_reading()
+        except StalePage:
+            return actual
+        if isinstance(retry, dict) and retry != expected:
+            print(
+                f"[jev:cloud] viewport mismatch: got {retry.get('w')}x{retry.get('h')} "
+                f"dpr={retry.get('dpr')}, expected {expected['w']}x{expected['h']} dpr={expected['dpr']}",
+                file=sys.stderr,
+                flush=True,
+            )
+        return retry
 
     def vision_click(self, x, y):
         """Coordinate input. This is the only path that does not use a code-owned node id."""

@@ -50,6 +50,67 @@ def decay_holds(holds):
     return {key: left - 1 for key, left in (holds or {}).items() if left - 1 > 0}
 
 
+LOOP_WINDOW = 8
+LOOP_PERIODS = (2, 3)
+LOOP_REPEATS = 2
+LOOP_HOLD_STEPS = 3
+LOOP_STOP_FIRES = 3
+DEFAULT_MAX_DECISIONS = 80
+
+
+def loop_step(decision, action, page, progress):
+    """One executed step: operation, target label, and the page it acted on.
+
+    Progress means a real navigation (new url/title) or a satisfied marker, not
+    a DOM re-render of the same page.
+    """
+    return {
+        "key": (
+            decision.get("operation") or "",
+            action.get("label") or "",
+            page.get("url") or "",
+            page.get("title") or "",
+        ),
+        "identity": (page.get("url") or "", page.get("title") or ""),
+        "id": action.get("id"),
+        "label": action.get("label") or "?",
+        "progress": bool(progress),
+    }
+
+
+def same_page(window, page):
+    """True when this page keeps the url and title of the previous step."""
+    return bool(window) and window[-1].get("identity") == (page.get("url") or "", page.get("title") or "")
+
+
+def detect_cycle(window, periods=LOOP_PERIODS, repeats=LOOP_REPEATS):
+    """The smallest repeated A-B / A-B-C cycle at the tail with no progress step."""
+    for period in periods:
+        span = period * repeats
+        if len(window) < span:
+            continue
+        tail = window[-span:]
+        if any(step.get("progress") for step in tail):
+            continue
+        pattern = tail[:period]
+        if not all(step.get("key") for step in pattern):
+            continue
+        if all(tail[index].get("key") == pattern[index % period].get("key") for index in range(span)):
+            return {
+                "ids": [step.get("id") for step in pattern],
+                "labels": [step.get("label") or "?" for step in pattern],
+            }
+    return None
+
+
+def hold_actions(holds, action_ids, steps=LOOP_HOLD_STEPS):
+    holds = dict(holds or {})
+    for action_id in action_ids:
+        if action_id:
+            holds[action_id] = max(holds.get(action_id, 0), steps)
+    return holds
+
+
 def control_unchanged(action, before, after):
     """The click's own committed state did not move, even if the page re-rendered.
 
@@ -224,6 +285,8 @@ class Agent:
             pending = None
             try:
                 self.command("predict", {})
+                if state["status"] in {"done", "blocked"}:
+                    return self.snapshot()
                 pending = (state.get("decision") or {}).get("choice")
                 return self.command("act", {"fingerprint": state["page"]["fingerprint"]})
             except StalePage:
@@ -248,8 +311,23 @@ class Agent:
             state["decision"] = None
             if state["status"] in {"done", "blocked"}:
                 raise ValueError("This run has stopped. Start a fresh demo.")
-            if len(state["decisions"]) >= MAX_STEPS * 2:
-                raise ValueError("Reached the demo's model-call budget")
+            cycle = detect_cycle(state.get("loop_window") or [])
+            if cycle:
+                state["held_actions"] = hold_actions(state.get("held_actions"), cycle["ids"])
+                state["loop_fires"] = state.get("loop_fires", 0) + 1
+                state["loop_note"] = "loop detected: avoid " + "/".join(cycle["labels"])
+                if state["loop_fires"] >= LOOP_STOP_FIRES:
+                    state["status"] = "blocked"
+                    state["blocked_reason"] = "loop detected"
+                    state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
+                    return self.snapshot()
+            config = getattr(self, "config", None) or {}
+            budget = config.get("max_decisions") or DEFAULT_MAX_DECISIONS
+            if len(state["decisions"]) >= budget:
+                state["status"] = "blocked"
+                state["blocked_reason"] = "decision budget"
+                state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
+                return self.snapshot()
             state["decision"] = self._maybe_vision(state) or self._decide(state, page_for_choice(state))
             state["held_actions"] = decay_holds(state.get("held_actions"))
             state["decisions"].append(
@@ -363,6 +441,7 @@ class Agent:
                     "target": decision["target"],
                     "possible_closed_shadow": bool(action.get("possible_closed_shadow")),
                     "note": "; ".join(part for part in (
+                        state.pop("loop_note", None),
                         switched,
                         "text entry failed" if text_failed else None,
                         "no matching option" if unmatched_option else None,
@@ -399,6 +478,11 @@ class Agent:
                 {"id": selected, "kind": action.get("kind")},
                 False if unchanged else changed,
             )
+            if action.get("kind") != "wait":
+                window = state.get("loop_window") or []
+                progress = bool(switched) or not same_page(window, state["page"])
+                window.append(loop_step(decision, action, state["page"], progress))
+                state["loop_window"] = window[-LOOP_WINDOW:]
             if state["record"]:
                 (self.record_dir / f"{state['elapsed_ms']:06d}.jpg").write_bytes(
                     base64.b64decode(state["page"]["screenshot"])
@@ -433,7 +517,7 @@ class Agent:
                 "operation": decision["operation"],
                 "target": decision["target"],
                 "possible_closed_shadow": False,
-                "note": "value already set",
+                "note": "; ".join(part for part in (state.pop("loop_note", None), "value already set") if part),
                 "page_changed": False,
                 "url": page["url"],
                 "usage": decision.get("usage", {}),
@@ -444,6 +528,8 @@ class Agent:
         state["held_actions"] = note_no_progress(
             state.get("held_actions"), {"id": selected, "kind": action.get("kind")}, False
         )
+        state.setdefault("loop_window", []).append(loop_step(decision, action, page, True))
+        state["loop_window"] = state["loop_window"][-LOOP_WINDOW:]
         state["status"] = "ready"
         return self.snapshot()
 
@@ -466,7 +552,7 @@ class Agent:
                 "operation": decision["operation"],
                 "target": decision["target"],
                 "possible_closed_shadow": False,
-                "note": "text helper failed",
+                "note": "; ".join(part for part in (state.pop("loop_note", None), "text helper failed") if part),
                 "page_changed": False,
                 "url": page["url"],
                 "usage": decision.get("usage", {}),
@@ -474,6 +560,8 @@ class Agent:
                 "elapsed_ms": state["elapsed_ms"],
             }
         )
+        state.setdefault("loop_window", []).append(loop_step(decision, action, page, False))
+        state["loop_window"] = state["loop_window"][-LOOP_WINDOW:]
         state["status"] = "ready"
         return self.snapshot()
 
