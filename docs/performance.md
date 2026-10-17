@@ -78,6 +78,20 @@ The 10% bands around the published numbers are 3.078 s, 2.086 s, and 7.801 s. No
 
 Flights did not produce a time to compare with 7.092 s. One attempt stopped on HTTP 429 before typing a city. Later attempts selected one-way, Zürich, and London, then stayed on the October/November 2026 calendar. The final page text contained no "September". The goal date, 2026-09-20, is before the run date, 2026-10-17. The text model also returned `Zurich` for the Departure field. A keyboard bug found in these runs typed each fallback character twice (`LLoonnddoonn`) and cleared combobox text that `insertText` had already changed. That path now retypes only when the field value is unchanged, and it sends the character on `keyDown` only. After that fix, London was selectable, and the run still blocked at 21.253 s without a verified result. `JEV_FRAMES=all` was not used.
 
+## Mercury Decide, 2026-10-17
+
+Chrome 155.0.8059.40 on 127.0.0.1:9222 (isolated headless profile). Text was Mercury 2.5 with `reasoning_effort=instant` in both arms. n=3 runs per task. The Mercury arm in this table predates the DONE requirement gate (`apply_done_gate`); [mercury.md](mercury.md) records the later post-gate pass where Mercury hotel went 3/3. Wall time starts after the first observation. Decision latency is the median TypeSafe or `mercury-decide` call inside that run; the table's decision and text figures are the median of those three run medians. Token counts are summed per run (prompt / completion / reasoning). Reasoning tokens come from the text-call usage details. Decide reported none.
+
+| Arm | Task | Verified | Median wall | Median decision | Median text | Run walls | Decision tokens (3 runs) | Text tokens (3 runs) |
+| --- | --- | ---: | ---: | ---: | ---: | --- | --- | --- |
+| TypeSafe + Mercury text | Wikipedia | 3/3 | 3.043 s | 292.5 ms | 987 ms | 3.043, 2.685, 3.202 s | 29257/2381/0, 28950/2349/0, 22079/1786/0 | 673/96/74, 693/69/48, 673/62/41 |
+| TypeSafe + Mercury text | Hotel fixture | 3/3 | 2.794 s | 271 ms | 918 ms | 4.184, 2.794, 2.502 s | 22747/1869/0 each run | 386/103/87, 392/76/62, 393/113/97 |
+| Mercury Decide + Mercury text | Wikipedia | 3/3 | 3.489 s | 549 ms | 654 ms | 3.489, 3.726, 3.212 s | 11427/15/0, 11346/15/0, 8658/15/0 | 686/78/55, 662/64/44, 689/65/50 |
+| Mercury Decide + Mercury text | Hotel fixture | 0/3 | 1.343 s | 412 ms | none | 1.343, 1.390, 1.302 s | 4227/15/0, 4135/15/0, 4165/15/0 | no text call |
+| Mercury Decide + Mercury text | Flights, 2026-11-16 | 3/3 | 14.325 s | 504 ms | 1.618 s | 14.325, 16.179, 12.539 s | 58095/97/0, 62875/104/0, 50581/92/0 | 711/613/398, 715/123/96, 701/111/89 |
+
+Wikipedia's exact article URL was reached in all six runs. The hotel check requires Casa Flora plus the visible sentence for Design, Free cancellation, and Lisbon. TypeSafe did that in 5 actions. Mercury Decide clicked Free cancellation and Casa Flora, skipped the destination and the Design select, and chose DONE. The page URL ended at Casa Flora, and the filter sentence was absent, so those three pre-gate runs are failures; the post-gate rerun in mercury.md passes 3/3 after the gate rejects the early DONE. Flights used today + 30 days (Monday, November 16, 2026). All three runs passed the independent one-way, Zürich, London, date, and results checks. That is not the old 7.092 s September 20 measurement.
+
 ## Limits
 
 The DOM reader still does not implement the full accessible-name algorithm. Open shadow roots are walked when `JEV_SHADOW_DOM` is on. Closed shadow roots are not entered; a no-progress click on a custom-element host is reported as `possible closed shadow root`. Same-origin frames are inlined by default. Cross-origin frames need `JEV_FRAMES=all` and a CDP target whose URL matches the iframe. File uploads require an allowlist. Popup tabs are capped at five and only when this task opened them. Nested scroll keeps eight containers. `PRESS_KEY` is a fixed enum. Canvas clicks exist only with `JEV_VISION=1` and are coordinate-based. A valid operation can still be wrong, and DONE is never independent evidence of success.
