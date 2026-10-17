@@ -175,6 +175,29 @@ def test_decision_budget_stops_cleanly(runner, monkeypatch):
     assert len(runner.state["decisions"]) == 3
 
 
+def test_invalid_decision_retries_once_then_blocks(runner, monkeypatch):
+    calls = {"n": 0}
+
+    def flaky(*_args, **_kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise ValueError(model.INVALID_RESPONSE)
+        return {**decision("e3"), "operation": "CLICK"}
+
+    monkeypatch.setattr(loop, "choose", flaky)
+    runner.state["status"] = "ready"
+    runner.command("predict")
+    assert runner.state["status"] == "predicted"
+    assert calls["n"] == 2
+    monkeypatch.setattr(loop, "choose", Mock(side_effect=ValueError("boom")))
+    with pytest.raises(ValueError, match="boom"):
+        runner.command("predict")
+    monkeypatch.setattr(loop, "choose", Mock(side_effect=ValueError(model.INVALID_RESPONSE)))
+    runner.command("predict")
+    assert runner.state["status"] == "blocked"
+    assert runner.state["blocked_reason"] == "invalid decision response"
+
+
 def test_control_unchanged_rules():
     from jev_ultrafast.agent import control_unchanged
 
@@ -227,6 +250,23 @@ def test_click_cannot_consume_a_text_target(monkeypatch):
     monkeypatch.setattr(model, "post_json", post)
     with pytest.raises(ValueError, match="Invalid TypeSafe"):
         model.choose(page(), "Find a book", [])
+
+
+def test_invalid_decision_logs_redacted_body(monkeypatch, capsys):
+    def post(_url, _key, _body):
+        return {
+            "model": "test",
+            "answers": {"operation": {"choice": "CLICK", "leaked": "fake-test-key-12345678"}},
+        }
+
+    monkeypatch.setenv("TYPESAFE_API_KEY", "fake-test-key-12345678")
+    monkeypatch.setattr(model, "post_json", post)
+    with pytest.raises(ValueError, match="Invalid TypeSafe"):
+        model.choose(page(), "Find a book", [])
+    err = capsys.readouterr().err
+    assert "[jev:decision] invalid response body=" in err
+    assert "fake-test-key-12345678" not in err
+    assert "[redacted]" in err
 
 
 def test_target_head_receives_control_state_and_full_next_step_rules(monkeypatch):

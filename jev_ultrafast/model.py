@@ -25,6 +25,7 @@ RETRY_STATUSES = {429, 500, 502, 503, 504, 529}
 MAX_POSTS = 4  # first try plus three retries
 CHOICE_LIMIT = 255
 REASONING_EFFORTS = {"instant", "low", "medium", "high"}
+INVALID_RESPONSE = "Invalid TypeSafe response; no action executed."
 
 
 def debug_level():
@@ -237,7 +238,7 @@ def validate_choice(answer, ids):
     except (KeyError, TypeError, ValueError):
         valid = False
     if not valid:
-        raise ValueError("Invalid TypeSafe response; no action executed.")
+        raise ValueError(INVALID_RESPONSE)
     return answer
 
 
@@ -394,7 +395,16 @@ def choose(state, goal, history, requirements=None, progress=None):
     except (ValueError, KeyError, TypeError) as error:
         latency_ms = round((time.perf_counter() - started) * 1000)
         log_model_call("typesafe", url, body, result, latency_ms, f"error={error}")
-        raise
+        try:
+            safe_result = str(redact_secrets(result))
+        except Exception:
+            safe_result = ""
+        print(
+            f"[jev:decision] invalid response body={safe_result[:2000]}",
+            file=sys.stderr,
+            flush=True,
+        )
+        raise ValueError(INVALID_RESPONSE) from error
     latency_ms = round((time.perf_counter() - started) * 1000)
     log_model_call(
         "typesafe",
@@ -716,7 +726,7 @@ def apply_done_gate(answer, reqs, verifier):
         return answer, None
     remaining = {key: value for key, value in probabilities.items() if key != "DONE"}
     if not remaining:
-        raise ValueError("Invalid TypeSafe response; no action executed.")
+        raise ValueError(INVALID_RESPONSE)
     total = sum(value for value in remaining.values() if isinstance(value, (int, float)))
     if total <= 0:
         share = 1 / len(remaining)

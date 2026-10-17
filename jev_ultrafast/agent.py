@@ -3,12 +3,14 @@
 import base64
 import os
 import re
+import sys
 import time
 from pathlib import Path
 
 from .browser import Browser, StalePage
 from .config import resolve_config
 from .model import (
+    INVALID_RESPONSE,
     action_space,
     choose,
     choose_mercury,
@@ -328,7 +330,21 @@ class Agent:
                 state["blocked_reason"] = "decision budget"
                 state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
                 return self.snapshot()
-            state["decision"] = self._maybe_vision(state) or self._decide(state, page_for_choice(state))
+            try:
+                state["decision"] = self._maybe_vision(state) or self._decide(state, page_for_choice(state))
+            except ValueError as exc:
+                if str(exc) != INVALID_RESPONSE:
+                    raise
+                print("[jev:decision] invalid response; retrying once", file=sys.stderr, flush=True)
+                try:
+                    state["decision"] = self._maybe_vision(state) or self._decide(state, page_for_choice(state))
+                except ValueError as retry_exc:
+                    if str(retry_exc) != INVALID_RESPONSE:
+                        raise
+                    state["status"] = "blocked"
+                    state["blocked_reason"] = "invalid decision response"
+                    state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
+                    return self.snapshot()
             state["held_actions"] = decay_holds(state.get("held_actions"))
             state["decisions"].append(
                 {

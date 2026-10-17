@@ -74,6 +74,36 @@ def sanitize(value, key=""):
     return text[:300]
 
 
+def flights_variant(text, page):
+    """Which Google Flights UI served this run: classic, alternate (AI), or unknown.
+
+    "Where from?" is an aria-label and never appears in body text, while the
+    "Explore deals with AI" section coexists with classic controls, so neither
+    alone classifies the run. The alternate homepage heading plus the observed
+    action labels and URL together do.
+    """
+    text = text or ""
+    page = page or {}
+    labels = {action.get("label", "") for action in page.get("actions") or []}
+    alternate_heading = "When, where, and how do you want to travel?" in text
+    classic_labels = bool({"Where from?", "Where to?"} & labels) or any(
+        "Select flight" in label for label in labels
+    )
+    search_url = "/travel/flights/search" in (page.get("url") or "")
+    if alternate_heading:
+        variant = "alternate"
+    elif classic_labels or search_url:
+        variant = "classic"
+    else:
+        variant = "unknown"
+    return variant, {
+        "alternate_heading": alternate_heading,
+        "explore_section": "Explore deals with AI" in text,
+        "classic_labels": classic_labels,
+        "search_url": search_url,
+    }
+
+
 def billing_guard():
     """Refuse to create a cloud browser while another is active or the balance is low."""
     key = os.environ.get("BROWSER_USE_API_KEY", "")
@@ -201,11 +231,16 @@ def run_one(browser, task, run):
     except Exception as exc:
         verified, detail = False, f"verify {type(exc).__name__}: {sanitize(exc)}"
     measured = summarize(state, verified, detail)
+    variant, variant_detail = None, None
+    if task == "flights":
+        variant, variant_detail = flights_variant(state.get("verification_text"), state.get("page"))
     row = {
         "provider": "typesafe",
         "browser": browser,
         "task": task,
         "run": run,
+        "variant": variant,
+        "variant_detail": variant_detail,
         "verified": bool(verified),
         "total_s": None if state.get("elapsed_ms") is None else round(state["elapsed_ms"] / 1000, 3),
         "startup_s": round(startup, 3),
@@ -223,7 +258,7 @@ def run_one(browser, task, run):
     }
     print(
         f"verified={row['verified']} total={row['total_s']}s startup={row['startup_s']}s "
-        f"actions={row['actions']} decisions={row['decision_calls']}",
+        f"actions={row['actions']} decisions={row['decision_calls']} variant={row.get('variant')}",
         flush=True,
     )
     return row
