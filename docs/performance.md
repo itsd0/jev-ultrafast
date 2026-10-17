@@ -54,11 +54,29 @@ The previous 11.387-second recording and post-recording 12.898-second policy reg
 
 `scripts/measure_features.py` loads the local fixtures (shadow, iframe, scroll, keyboard, select, upload) three times with every flag off and three times with the defaults. It records median wall time, CDP call count, and snapshot time. It does not call TypeSafe or the text model.
 
-A run on this machine did not collect those numbers. Browser Harness failed before the first navigation:
+Re-run on 2026-10-17 against Chrome 155.0.8059.40 started with `--remote-debugging-port=9222` and a dedicated user-data-dir. Browser Harness used `BU_CDP_URL=http://127.0.0.1:9222`. n=3 per arm. Wall time includes six data-URL navigations and one snapshot each. One flags-off run and one default run were much slower than the other two, so the median is the figure to use.
 
-`RuntimeError: daemon default didn't come up — remote debugging is turned off for this browser instance.`
+| Arm | Median wall | Median CDP calls | Median snapshot | Samples (wall ms) |
+| --- | ---: | ---: | ---: | --- |
+| Flags off | 668.4 ms | 20 | 43.4 ms | 668.4, 1181.6, 657.8 |
+| Defaults | 653.6 ms | 20 | 34.9 ms | 402.1, 908.2, 653.6 |
 
-Sample size for the new comparison is therefore 0. The published Wikipedia (2.798 s), hotel (1.896 s), and flights (median 7.092 s) figures above were not re-run, so this change set does not show that default flags stay within 10% of that baseline. `JEV_FRAMES=all` is not the default. It adds `Page.getFrameTree`, `Target.getTargets`, and one snapshot evaluation per visible cross-origin frame, so it can be slower than `JEV_FRAMES=same` and should be measured separately.
+Default wall / flags-off wall = 0.978. Three runs are too few to call that a speedup. They do not show the defaults making fixture snapshots slower. `JEV_FRAMES=all` was not in this arm. It adds `Page.getFrameTree`, `Target.getTargets`, and one snapshot evaluation per visible cross-origin frame, so it can be slower than `JEV_FRAMES=same` and was not measured.
+
+### Published smoke checks, same day
+
+Model settings were the local `.env`: TypeSafe `jev-latest` (the published flights arm used `jev-1.13.0`), Mercury 2.5, reasoning off, `JEV_DEBUG=1`, `JEV_VISIBLE_TAB=1`. Feature flags stayed at their defaults unless noted. Mercury returned HTTP 429 on several text calls; the client sleeps 0.5 s then 1 s and retries twice.
+
+| Task | Runs | Wall time | Independent result | Text-call time inside the wall |
+| --- | ---: | --- | --- | --- |
+| Wikipedia, defaults | 2 | 7.314 s, 9.073 s | Exact article URL both times | 4.744 s (one 429), 6.465 s (two 429s) |
+| Wikipedia, every flag off | 1 | 10.120 s | Exact article URL | 7.799 s |
+| Hotel fixture, defaults | 1 | 8.240 s | Casa Flora plus Design, Free cancellation, Lisbon | 5.614 s for Lisbon |
+| Flights, defaults | 4 attempts | no verified completion | Route/date checks failed or the text call returned 429 | 2.9–12.2 s per successful text call |
+
+The 10% bands around the published numbers are 3.078 s, 2.086 s, and 7.801 s. None of these re-runs landed inside those bands. The fixture table is the flag comparison: turning the defaults on did not add wall time there. On Wikipedia, the flags-off run was the slowest because its text call was the slowest. Subtracting the reported text latency leaves about 2.3–2.6 s of Wikipedia time with or without the flags. The first Wikipedia decision was 6,791 prompt tokens with defaults and 6,084 with the flags off. Hotel's seven TypeSafe calls summed to about 2.36 s and the browser work outside the model calls was about 0.26 s, while the Lisbon text call alone was 5.614 s.
+
+Flights did not produce a time to compare with 7.092 s. One attempt stopped on HTTP 429 before typing a city. Later attempts selected one-way, Zürich, and London, then stayed on the October/November 2026 calendar. The final page text contained no "September". The goal date, 2026-09-20, is before the run date, 2026-10-17. The text model also returned `Zurich` for the Departure field. A keyboard bug found in these runs typed each fallback character twice (`LLoonnddoonn`) and cleared combobox text that `insertText` had already changed. That path now retypes only when the field value is unchanged, and it sends the character on `keyDown` only. After that fix, London was selectable, and the run still blocked at 21.253 s without a verified result. `JEV_FRAMES=all` was not used.
 
 ## Limits
 
