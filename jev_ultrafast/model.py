@@ -145,6 +145,26 @@ def redact_secrets(value):
     return value
 
 
+class ModelHTTPError(RuntimeError):
+    """A provider HTTP error with its status and machine-readable code."""
+
+    def __init__(self, status_code, body=""):
+        super().__init__(f"Model provider returned HTTP {status_code}; no action executed.")
+        self.status_code = status_code
+        self.body = body
+        self.code = ""
+        try:
+            payload = json.loads(body)
+        except (TypeError, ValueError):
+            payload = None
+        if isinstance(payload, dict):
+            error = payload.get("error")
+            if isinstance(error, dict):
+                self.code = str(error.get("code") or error.get("type") or "")
+            elif payload.get("code"):
+                self.code = str(payload["code"])
+
+
 def post_json(url, key, body):
     for attempt in range(MAX_POSTS):
         try:
@@ -163,7 +183,18 @@ def post_json(url, key, body):
             time.sleep(delay)
             continue
         if response.is_error:
-            raise RuntimeError(f"Model provider returned HTTP {response.status_code}; no action executed.")
+            # The body usually names the invalid field. Credentials are redacted
+            # before it reaches stderr or any captured log.
+            try:
+                safe_body = str(redact_secrets(response.text))
+            except Exception:
+                safe_body = ""
+            print(
+                f"[jev:http] error url={url} status={response.status_code} body={safe_body[:2000]}",
+                file=sys.stderr,
+                flush=True,
+            )
+            raise ModelHTTPError(response.status_code, safe_body)
         return response.json()
     raise RuntimeError("Model unavailable")
 
@@ -909,11 +940,52 @@ def field_text(context):
             },
         ],
     }
+    def without_page_text(value):
+        if not isinstance(value, dict):
+            return value
+        lean = dict(value)
+        page = lean.get("page")
+        if isinstance(page, dict):
+            lean["page"] = {key: item for key, item in page.items() if key != "text"}
+        return lean
+
+    filtered = False
+
+    def request_text():
+        nonlocal payload, filtered
+        try:
+            return post_json(endpoint, key, payload)
+        except ModelHTTPError as error:
+            if error.code != "content_filter" or filtered:
+                raise
+            # Live news text can trip the provider's content filter. The goal,
+            # field, title, and recent actions still identify the value.
+            filtered = True
+            payload = {
+                **payload,
+                "messages": [
+                    payload["messages"][0],
+                    {"role": "user", "content": json.dumps(without_page_text(context))},
+                ],
+            }
+            print(
+                "[jev:text] provider content filter; retrying without page text",
+                file=sys.stderr,
+                flush=True,
+            )
+            return post_json(endpoint, key, payload)
+
     result = {}
     for attempt in range(2):
         if attempt:
             payload = {**payload, "reasoning_effort": "low"}
-        result = post_json(endpoint, key, payload)
+        try:
+            result = request_text()
+        except ModelHTTPError as error:
+            if error.code == "content_filter":
+                print("[jev:text] error=provider content filter; step skipped", file=sys.stderr, flush=True)
+                raise ValueError("Text helper was content-filtered; nothing typed.") from None
+            raise
         try:
             value = parse_field_text(result)
         except (ValueError, KeyError, TypeError, json.JSONDecodeError):

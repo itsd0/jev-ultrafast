@@ -37,6 +37,7 @@ class Browser:
         self.tabs = {}
         self.active = None
         self._tab_serial = 0
+        self._ready_after_act = False
         self.cloud = None
         cloud_mode = self.config.get("browser") == "cloud"
         if cloud_mode:
@@ -66,10 +67,11 @@ class Browser:
                     pass
             self.call("Page.navigate", url=url)
             deadline = time.monotonic() + 15
+            poll = 0.5 if cloud_mode else 0.02
             while time.monotonic() < deadline:
                 if self.evaluate("document.readyState") == "complete":
                     break
-                time.sleep(0.02)
+                time.sleep(poll)
         except BaseException:
             self.stop_cloud()
             raise
@@ -297,6 +299,9 @@ class Browser:
 
     def wait_until_ready(self, timeout=10):
         """Bounded wait for document completion. Returns immediately if already ready."""
+        if getattr(self, "_ready_after_act", False):
+            self._ready_after_act = False
+            return True
         deadline = time.monotonic() + timeout
         while True:
             try:
@@ -330,7 +335,15 @@ class Browser:
         return False
 
     def act(self, action, page, text=None):
-        if not self.fresh(page, action):
+        cloud_mode = (getattr(self, "config", None) or {}).get("browser") == "cloud"
+        probe = None
+        if cloud_mode and action["kind"] in {"click", "fill", "select"}:
+            # One cloud call rechecks the guard, resolves geometry, and reads the
+            # previous field value. Local keeps its existing calls.
+            probe = action_freshness(page, action)
+            if probe is None:
+                raise StalePage("Page changed since this decision. Observe again.")
+        elif not self.fresh(page, action):
             raise StalePage("Page changed since this decision. Observe again.")
         if action["kind"] == "wait":
             time.sleep(0.1)
@@ -347,6 +360,7 @@ class Browser:
             session = self.frame_sessions.get(action["route"])
             if not session:
                 raise StalePage("Frame is gone. Observe again.")
+        self._ready_after_act = False
         result = browser_operation({
             "operation": "act",
             "session": session,
@@ -354,7 +368,12 @@ class Browser:
             "text": text,
             "files": (getattr(self, "config", None) or {}).get("files") or {},
             "keyboard": (getattr(self, "config", None) or {}).get("keyboard", True),
+            "probe": probe,
+            "verify_active": cloud_mode,
+            "verify_wait": cloud_mode,
         })
+        if result.get("ready"):
+            self._ready_after_act = True
         self.after_input = action if action["kind"] != "wait" else None
         return result
 
@@ -547,27 +566,74 @@ def bind_keys(state, enabled):
     return updated
 
 
-def field_value_expression(action):
-    locator = {k: action[k] for k in ("node", "frame") if k in action}
+def _field_value_reader(fallback=False):
+    active = ""
+    if fallback:
+        # A click can make the page replace the focused control. Read the live
+        # replacement instead of the disconnected observed node.
+        active = (
+            "if (e && !e.isConnected && document.activeElement) { const a=document.activeElement; "
+            "if (a.isContentEditable || a.tagName==='INPUT' || a.tagName==='TEXTAREA') e=a; } "
+        )
     return (
         "(action => { const fast=window.__jevFast; "
-        "const e=fast?.resolve ? fast.resolve(action) : fast?.nodes.get(action.node); "
-        "if (!e) return null; "
-        "return e.isContentEditable ? e.innerText : ('value' in e ? String(e.value) : ''); })("
+        "let e=fast?.resolve ? fast.resolve(action) : fast?.nodes.get(action.node); "
+        + active
+        + "if (!e) return null; "
+        "return e.isContentEditable ? e.innerText : ('value' in e ? String(e.value) : ''); })"
+    )
+
+
+def field_value_expression(action, fallback=False):
+    locator = {k: action[k] for k in ("node", "frame") if k in action}
+    return _field_value_reader(fallback) + "(" + json.dumps(locator) + ")"
+
+
+def ready_value_expression(action, fallback=False):
+    """One read for the post-input value and readyState, so a ready page skips another call."""
+    locator = {k: action[k] for k in ("node", "frame") if k in action}
+    return (
+        "(action => { const read=" + _field_value_reader(fallback) + "; "
+        "return {ready: document.readyState === 'complete', value: read(action)}; })("
         + json.dumps(locator)
         + ")"
     )
 
 
-def verify_typed_text(call, evaluate, action, expected, previous=None):
+def verify_typed_text(
+    call,
+    evaluate,
+    action,
+    expected,
+    previous=None,
+    *,
+    fallback=False,
+    wait_ready=False,
+):
     """Read the field after insertText. Retype once only if the value did not change.
 
     Comboboxes rewrite the inserted text (autocomplete, accents). Clearing that
     result drops the suggestion list. Keyboard-only fields leave the value
     untouched, and those are the ones that need key events.
     """
-    expression = field_value_expression(action)
-    actual = evaluate(expression)
+    expression = field_value_expression(action, fallback)
+    ready = None
+    if wait_ready:
+        combined = evaluate(ready_value_expression(action, fallback))
+        if isinstance(combined, dict):
+            actual, ready = combined.get("value"), bool(combined.get("ready"))
+        else:
+            actual = combined
+    else:
+        actual = evaluate(expression)
+    result = _verify_value(call, evaluate, action, expected, previous, actual, fallback)
+    if ready is not None:
+        result["ready"] = ready
+    return result
+
+
+def _verify_value(call, evaluate, action, expected, previous, actual, fallback):
+    expression = field_value_expression(action, fallback)
     if actual == expected:
         return {"text_verified": True, "typed": actual}
     if actual not in (None, "") and actual != previous:
@@ -699,6 +765,63 @@ def match_iframe_targets(frames, target_infos):
     return matched
 
 
+def action_freshness(page, action):
+    """The guard pair a cloud probe compares against the live page."""
+    node = action.get("node")
+    if type(node) is not int:
+        return None
+    frame = action.get("frame") or "f0"
+    if action.get("route"):
+        return [
+            page.get("frame_keys", {}).get(action["route"]),
+            page.get("guards", {}).get(f"{action['route']}:{frame}:{node}"),
+        ]
+    return [page.get("page_key"), page.get("guards", {}).get(f"{frame}:{node}")]
+
+
+def action_probe_expression(action, expected):
+    """Guard, geometry, and the previous value in one call. Select still mutates here."""
+    payload = json.dumps({
+        "action": {key: action[key] for key in ("node", "frame", "kind", "value") if key in action},
+        "expected": expected,
+    })
+    return """(payload => {
+      const action=payload.action, expected=payload.expected;
+      const c=window.__jevFast;
+      if (!c || !c.guard) return {fresh:false};
+      const win=(c.frameWins&&c.frameWins[action.frame])||window;
+      const local=win.__jevFast;
+      if (!local || !local.guard) return {fresh:false};
+      const e=local.nodes.get(action.node);
+      const current=[c.pageKey ? c.pageKey() : null, local.guard(e)];
+      if (JSON.stringify(current)!==JSON.stringify(expected)) return {fresh:false};
+      if (!e?.isConnected || e.matches(':disabled') || e.closest('[aria-disabled="true"],[inert]') ||
+          !e.checkVisibility({checkOpacity:true,checkVisibilityCSS:true})) return {fresh:true,target:null};
+      if (action.kind==='fill' && (e.readOnly || e.getAttribute('aria-readonly')==='true')) {
+        return {fresh:true,target:null};
+      }
+      const point=window.__jevFast?.toTop ? window.__jevFast.toTop(e) : null;
+      const r=e.getBoundingClientRect(), x=point?point.x:r.x+r.width/2, y=point?point.y:r.y+r.height/2;
+      if (!r.width || !r.height || x<0 || y<0 || x>=innerWidth || y>=innerHeight) {
+        return {fresh:true,target:null};
+      }
+      const hit=window.__jevFast?.hit ? window.__jevFast.hit(x,y) : document.elementFromPoint(x,y);
+      const covered=window.__jevFast?.owns ? !window.__jevFast.owns(e,hit) : !e.contains(hit);
+      if (covered) return {fresh:true,target:null};
+      if (action.kind==='select') {
+        if (e.tagName!=='SELECT' || ![...e.options].some(o=>o.value===action.value &&
+            !o.disabled && !o.closest('optgroup[disabled]'))) return {fresh:true,target:null};
+        e.value=action.value;
+        e.dispatchEvent(new Event('input',{bubbles:true}));
+        e.dispatchEvent(new Event('change',{bubbles:true}));
+      }
+      const previous = action.kind==='fill'
+        ? (e.isContentEditable ? e.innerText : ('value' in e ? String(e.value) : ''))
+        : null;
+      return {fresh:true,target:{x,y},previous};
+    })(""" + payload + ")"
+
+
 def browser_operation(request):
     operation = request["operation"]
     session = request["session"]
@@ -706,8 +829,13 @@ def browser_operation(request):
     def call(method, **params):
         return cdp(method, session_id=session, **params)
 
-    def evaluate(expression):
-        result = call("Runtime.evaluate", expression=expression, returnByValue=True)
+    def evaluate(expression, await_promise=False):
+        result = call(
+            "Runtime.evaluate",
+            expression=expression,
+            returnByValue=True,
+            awaitPromise=await_promise,
+        )
         if result.get("exceptionDetails"):
             if operation == "act" and request["action"]["kind"] == "select":
                 raise RuntimeError("Dropdown execution was interrupted; inspect before retrying.")
@@ -786,28 +914,38 @@ def browser_operation(request):
         elif kind != "wait":
             if type(action["node"]) is not int:
                 raise ValueError("Invalid observed node")
-            # Code-owned node IDs refer to actual observed elements, never model-generated selectors.
-            target = evaluate("""(action => {
-              const fast=window.__jevFast;
-              const e=fast?.resolve ? fast.resolve(action) : fast?.nodes.get(action.node);
-              if (!e?.isConnected || e.matches(':disabled') || e.closest('[aria-disabled="true"],[inert]') ||
-                  !e.checkVisibility({checkOpacity:true,checkVisibilityCSS:true})) return null;
-              if (action.kind==='fill' && (e.readOnly || e.getAttribute('aria-readonly')==='true')) return null;
-              const point=window.__jevFast?.toTop ? window.__jevFast.toTop(e) : null;
-              const r=e.getBoundingClientRect(), x=point?point.x:r.x+r.width/2, y=point?point.y:r.y+r.height/2;
-              if (!r.width || !r.height || x<0 || y<0 || x>=innerWidth || y>=innerHeight) return null;
-              const hit=window.__jevFast?.hit ? window.__jevFast.hit(x,y) : document.elementFromPoint(x,y);
-              const covered=window.__jevFast?.owns ? !window.__jevFast.owns(e,hit) : !e.contains(hit);
-              if (covered) return null;
-              if (action.kind==='select') {
-                if (e.tagName!=='SELECT' || ![...e.options].some(o=>o.value===action.value &&
-                    !o.disabled && !o.closest('optgroup[disabled]'))) return null;
-                e.value=action.value;
-                e.dispatchEvent(new Event('input',{bubbles:true}));
-                e.dispatchEvent(new Event('change',{bubbles:true}));
-              }
-              return {x,y};
-            })(""" + json.dumps(action) + ")")
+            previous = None
+            probe = request.get("probe") if kind in {"click", "fill", "select"} else None
+            if probe:
+                probed = evaluate(action_probe_expression(action, probe))
+                if not probed or not probed.get("fresh"):
+                    raise StalePage("Page changed since this decision. Observe again.")
+                target = probed.get("target")
+                if kind == "fill":
+                    previous = probed.get("previous")
+            else:
+                # Code-owned node IDs refer to actual observed elements, never model-generated selectors.
+                target = evaluate("""(action => {
+                  const fast=window.__jevFast;
+                  const e=fast?.resolve ? fast.resolve(action) : fast?.nodes.get(action.node);
+                  if (!e?.isConnected || e.matches(':disabled') || e.closest('[aria-disabled="true"],[inert]') ||
+                      !e.checkVisibility({checkOpacity:true,checkVisibilityCSS:true})) return null;
+                  if (action.kind==='fill' && (e.readOnly || e.getAttribute('aria-readonly')==='true')) return null;
+                  const point=window.__jevFast?.toTop ? window.__jevFast.toTop(e) : null;
+                  const r=e.getBoundingClientRect(), x=point?point.x:r.x+r.width/2, y=point?point.y:r.y+r.height/2;
+                  if (!r.width || !r.height || x<0 || y<0 || x>=innerWidth || y>=innerHeight) return null;
+                  const hit=window.__jevFast?.hit ? window.__jevFast.hit(x,y) : document.elementFromPoint(x,y);
+                  const covered=window.__jevFast?.owns ? !window.__jevFast.owns(e,hit) : !e.contains(hit);
+                  if (covered) return null;
+                  if (action.kind==='select') {
+                    if (e.tagName!=='SELECT' || ![...e.options].some(o=>o.value===action.value &&
+                        !o.disabled && !o.closest('optgroup[disabled]'))) return null;
+                    e.value=action.value;
+                    e.dispatchEvent(new Event('input',{bubbles:true}));
+                    e.dispatchEvent(new Event('change',{bubbles:true}));
+                  }
+                  return {x,y};
+                })(""" + json.dumps(action) + ")")
             if target is None:
                 if kind == "select":
                     raise RuntimeError("Dropdown execution was not confirmed; inspect before retrying.")
@@ -817,11 +955,12 @@ def browser_operation(request):
                 for event in ("mousePressed", "mouseReleased"):
                     call("Input.dispatchMouseEvent", type=event, x=x, y=y, button="left", clickCount=1)
                 if kind == "fill":
-                    previous = (
-                        evaluate(field_value_expression(action))
-                        if request.get("keyboard", True)
-                        else None
-                    )
+                    if probe is None:
+                        previous = (
+                            evaluate(field_value_expression(action))
+                            if request.get("keyboard", True)
+                            else None
+                        )
                     call(
                         "Input.dispatchKeyEvent",
                         type="keyDown",
@@ -841,7 +980,13 @@ def browser_operation(request):
                     if request.get("keyboard", True):
                         extra.update(
                             verify_typed_text(
-                                call, evaluate, action, request.get("text") or "", previous
+                                call,
+                                evaluate,
+                                action,
+                                request.get("text") or "",
+                                previous,
+                                fallback=bool(request.get("verify_active")),
+                                wait_ready=bool(request.get("verify_wait")),
                             )
                         )
         return {"executed": action["id"], **extra}

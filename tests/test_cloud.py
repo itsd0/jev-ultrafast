@@ -1,13 +1,20 @@
 """Cloud browser mode is opt-in, offline-testable, and never prints the key."""
 
 import json
+from unittest.mock import Mock
 
 import pytest
 
 import jev_ultrafast.browser as browser_module
 import jev_ultrafast.cloud as cloud
 from jev_ultrafast import Agent
-from jev_ultrafast.browser import Browser
+from jev_ultrafast.browser import (
+    Browser,
+    StalePage,
+    action_freshness,
+    browser_operation,
+    field_value_expression,
+)
 from jev_ultrafast.config import resolve_config
 
 FAKE_KEY = "bu_test_SECRET"
@@ -216,3 +223,107 @@ def test_secrets_never_reach_output(monkeypatch, fake_cloud, capsys):
         cloud.stop(handle)
     captured = capsys.readouterr()
     assert FAKE_KEY not in captured.out + captured.err
+
+
+def test_action_freshness_uses_the_frame_pair():
+    page = {
+        "page_key": "parent",
+        "guards": {"f0:1": "guard-1", "f1:f0:2": "guard-2"},
+        "frame_keys": {"f1": "child"},
+    }
+    assert action_freshness(page, {"node": 1, "frame": "f0"}) == ["parent", "guard-1"]
+    assert action_freshness(page, {"node": 2, "frame": "f0", "route": "f1"}) == ["child", "guard-2"]
+
+
+def test_active_element_fallback_is_cloud_only():
+    action = {"node": 1, "frame": "f0"}
+    assert "document.activeElement" in field_value_expression(action, fallback=True)
+    assert "document.activeElement" not in field_value_expression(action)
+
+
+def test_cloud_probe_merges_guard_locate_and_previous(monkeypatch):
+    calls = []
+
+    def cdp(method, **params):
+        calls.append((method, params))
+        if method != "Runtime.evaluate":
+            return {}
+        expression = params["expression"]
+        if "fresh:false" in expression:
+            return {"result": {"value": {"fresh": True, "target": {"x": 4, "y": 5}, "previous": "old"}}}
+        if "document.readyState === 'complete'" in expression:
+            return {"result": {"value": {"ready": True, "value": "new"}}}
+        return {"result": {"value": None}}
+
+    monkeypatch.setattr(browser_module, "cdp", cdp)
+    result = browser_operation({
+        "operation": "act",
+        "session": "s",
+        "text": "new",
+        "action": {"id": "e1", "kind": "fill", "node": 1, "frame": "f0"},
+        "probe": ["parent", "guard-1"],
+        "keyboard": True,
+        "verify_active": True,
+        "verify_wait": True,
+    })
+    evaluates = [params["expression"] for method, params in calls if method == "Runtime.evaluate"]
+    assert len(evaluates) == 2
+    assert "expected" in evaluates[0]
+    assert "document.readyState" in evaluates[1]
+    assert result == {"executed": "e1", "text_verified": True, "typed": "new", "ready": True}
+    assert sum(method == "Input.insertText" for method, _ in calls) == 1
+    assert sum(method == "Input.dispatchKeyEvent" for method, _ in calls) == 2  # select-all only
+    assert sum(method == "Input.dispatchMouseEvent" for method, _ in calls) == 2
+
+
+def test_cloud_probe_stale_page_dispatches_no_input(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        browser_module,
+        "cdp",
+        lambda method, **params: calls.append((method, params)) or {"result": {"value": {"fresh": False}}},
+    )
+    with pytest.raises(StalePage, match="Page changed"):
+        browser_operation({
+            "operation": "act",
+            "session": "s",
+            "text": "new",
+            "action": {"id": "e1", "kind": "fill", "node": 1, "frame": "f0"},
+            "probe": ["parent", "guard-1"],
+            "keyboard": True,
+        })
+    assert [method for method, _ in calls] == ["Runtime.evaluate"]
+
+
+def test_local_act_never_sends_a_probe(monkeypatch):
+    seen = []
+    monkeypatch.setattr(
+        browser_module,
+        "browser_operation",
+        lambda request: seen.append(request) or {"executed": "e1"},
+    )
+    tab = Browser.__new__(Browser)
+    tab.config = {"browser": "cloud"}
+    tab.fresh = Mock(return_value=True)
+    tab.session = "s"
+    tab.frame_sessions = {}
+    tab.after_input = None
+    tab._ready_after_act = False
+    page = {"page_key": "parent", "guards": {"f0:1": "guard-1"}}
+    action = {"id": "e1", "kind": "click", "node": 1, "frame": "f0"}
+    tab.act(action, page)
+    assert seen[-1]["probe"] == ["parent", "guard-1"]
+    assert seen[-1]["verify_active"] is True
+    tab.config = {"browser": "local"}
+    tab.act(action, page)
+    assert seen[-1]["probe"] is None
+    assert seen[-1]["verify_active"] is False
+
+
+def test_ready_after_the_verify_skips_the_extra_ready_call():
+    tab = Browser.__new__(Browser)
+    tab._ready_after_act = True
+    tab.evaluate = Mock()
+    assert tab.wait_until_ready() is True
+    tab.evaluate.assert_not_called()
+    assert tab.wait_until_ready(timeout=0) is False

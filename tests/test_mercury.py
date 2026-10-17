@@ -1,5 +1,7 @@
 """Offline Mercury Decide adapter and Mercury text requests. No network."""
 
+import json
+
 import pytest
 
 from jev_ultrafast import model
@@ -13,6 +15,7 @@ class Response:
         self.headers = {}
         if retry_after is not None:
             self.headers["retry-after"] = retry_after
+        self.text = json.dumps(self._payload)
 
     def json(self):
         return self._payload
@@ -145,3 +148,80 @@ def test_default_provider_is_typesafe(monkeypatch):
     assert model.decision_provider() == "typesafe"
     monkeypatch.setenv("DECISION_PROVIDER", "mercury")
     assert model.decision_provider() == "mercury"
+
+
+def _text_env(monkeypatch):
+    monkeypatch.setenv("INCEPTION_API_KEY", "test-key")
+    monkeypatch.delenv("TEXT_MODEL_API_KEY", raising=False)
+    monkeypatch.setenv("TEXT_MODEL", "mercury-2.5")
+    monkeypatch.setenv("TEXT_MODEL_BASE_URL", "https://api.inceptionlabs.ai/v1")
+    monkeypatch.setenv("TEXT_MODEL_REASONING", "instant")
+
+
+def test_http_error_logs_a_redacted_body(monkeypatch, capsys):
+    monkeypatch.setenv("INCEPTION_API_KEY", "offline-key")
+    body = {"error": {"message": "rejected offline-key", "code": "content_filter"}}
+    monkeypatch.setattr(model.CLIENT, "post", lambda *args, **kwargs: Response(400, body))
+    with pytest.raises(model.ModelHTTPError) as error:
+        model.post_json("https://api.inceptionlabs.ai/v1/chat/completions", "offline-key", {})
+    assert error.value.status_code == 400
+    assert error.value.code == "content_filter"
+    err = capsys.readouterr().err
+    assert "content_filter" in err
+    assert "[redacted]" in err
+    assert "offline-key" not in err
+
+
+def test_content_filter_retries_without_page_text(monkeypatch):
+    _text_env(monkeypatch)
+    calls = []
+
+    def post(_url, _key, body):
+        calls.append(body)
+        if len(calls) == 1:
+            raise model.ModelHTTPError(400, json.dumps({"error": {"code": "content_filter"}}))
+        return {"choices": [{"message": {"content": '{"text":"Gödel\\u2019s incompleteness theorems"}'}}]}
+
+    monkeypatch.setattr(model, "post_json", post)
+    context = {
+        "goal": "Find the article",
+        "field": {"label": "Search Wikipedia", "role": "searchbox", "value": ""},
+        "page": {"title": "Wikipedia", "text": "live news that trips the filter"},
+        "recent_actions": [],
+    }
+    value, _meta = model.field_text(context)
+    assert value == "Gödel’s incompleteness theorems"
+    assert len(calls) == 2
+    retried = json.loads(calls[1]["messages"][1]["content"])
+    assert retried["goal"] == context["goal"]
+    assert retried["page"] == {"title": "Wikipedia"}
+    assert "trips the filter" not in calls[1]["messages"][1]["content"]
+
+
+def test_non_filter_http_error_still_stops(monkeypatch):
+    _text_env(monkeypatch)
+    calls = []
+
+    def post(_url, _key, body):
+        calls.append(body)
+        raise model.ModelHTTPError(400, json.dumps({"error": {"code": "invalid_request_error"}}))
+
+    monkeypatch.setattr(model, "post_json", post)
+    with pytest.raises(model.ModelHTTPError, match="HTTP 400"):
+        model.field_text({"goal": "Find a flight"})
+    assert len(calls) == 1
+
+
+def test_persistent_content_filter_skips_the_step(monkeypatch, capsys):
+    _text_env(monkeypatch)
+    calls = []
+
+    def post(_url, _key, body):
+        calls.append(body)
+        raise model.ModelHTTPError(400, json.dumps({"error": {"code": "content_filter"}}))
+
+    monkeypatch.setattr(model, "post_json", post)
+    with pytest.raises(ValueError, match="content-filtered"):
+        model.field_text({"goal": "Find the article", "page": {"title": "Wikipedia", "text": "news"}})
+    assert len(calls) == 2
+    assert "[redacted]" not in capsys.readouterr().err

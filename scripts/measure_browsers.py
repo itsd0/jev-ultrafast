@@ -297,6 +297,7 @@ def main():
     parser.add_argument("--output", default=str(ROOT / "artifacts" / "browser-measurement.json"))
     parser.add_argument("--browsers", nargs="+", choices=("local", "cloud"), default=["local", "cloud"])
     parser.add_argument("--runs", type=int, default=RUNS)
+    parser.add_argument("--tasks", nargs="+", choices=TASKS, default=list(TASKS))
     parser.add_argument("--region", default=os.environ.get("JEV_REGION", "unspecified"))
     args = parser.parse_args()
     load_environment()
@@ -312,6 +313,7 @@ def main():
         "text_model": "mercury-2.5",
         "text_reasoning": "instant",
         "runs_per_cell": args.runs,
+        "tasks": args.tasks,
         "cloud_proxy": {"wiki": "none", "hotel": "none", "flights": "us"},
         "arms": {},
         "cdp_failures": {},
@@ -320,7 +322,7 @@ def main():
     }
     rows = []
     for browser in args.browsers:
-        for task in TASKS:
+        for task in args.tasks:
             for run in range(1, args.runs + 1):
                 rows.append(run_one(browser, task, run))
                 arm_rows = [row for row in rows if row["browser"] == browser]
