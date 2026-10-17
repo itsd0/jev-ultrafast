@@ -91,6 +91,10 @@ uv run --env-file .env python examples/run.py \
 
 `uv run --env-file .env python examples/flights.py --keep-open` performs the flight search, checks the actual route/date/results, and saves its trace. It does not select or book a flight.
 
+## Hosted task API
+
+`uv run --env-file .env jev-server` serves a task queue on **http://127.0.0.1:8770** (loopback only). `POST /api/tasks` takes a goal, a start URL, a browser (`local` or `cloud`), and an optional `max_decisions`; each task runs its own agent and its own browser, and steps land in `jev_runs.db`. The page shows a run form, live steps, and history. `JEV_MAX_CONCURRENT` (default 2) caps running tasks, `JEV_SERVER_TOKEN` adds an optional bearer token, and `JEV_COST_PER_1K_TOKENS` enables the cost estimate. The agent core is unchanged; `verified_by_agent` means the agent chose DONE, not that the outcome was independently checked.
+
 ## Why it moves
 
 - **One request per decision cycle.** Operation and target heads share the same observed state.

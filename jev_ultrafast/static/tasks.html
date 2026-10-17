@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Jev tasks</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 880px; margin: 2rem auto; padding: 0 1rem; color: #1a1a1a; }
+  h1 { font-size: 1.4rem; }
+  form, section { margin-bottom: 1.5rem; }
+  label { display: block; margin: 0.5rem 0; }
+  input, select, textarea { width: 100%; box-sizing: border-box; padding: 0.4rem; font: inherit; }
+  textarea { height: 4.5rem; }
+  .row { display: flex; gap: 0.75rem; }
+  .row label { flex: 1; }
+  button { padding: 0.45rem 1rem; font: inherit; cursor: pointer; }
+  button:disabled { cursor: default; opacity: 0.5; }
+  #error { color: #a00; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
+  th, td { text-align: left; padding: 0.3rem 0.5rem; border-bottom: 1px solid #ddd; }
+  .muted { color: #555; font-size: 0.85rem; }
+  #history li { margin: 0.25rem 0; }
+  #history a { cursor: pointer; text-decoration: underline; }
+</style>
+</head>
+<body>
+<h1>Jev tasks</h1>
+<p id="error" hidden></p>
+<form id="task-form">
+  <label>Goal
+    <textarea id="goal" required maxlength="2000" placeholder="One natural-language goal"></textarea>
+  </label>
+  <label>Start URL
+    <input id="url" type="url" required placeholder="https://…">
+  </label>
+  <div class="row">
+    <label>Browser
+      <select id="browser">
+        <option value="local">local</option>
+        <option value="cloud">cloud</option>
+      </select>
+    </label>
+    <label>Max decisions (optional)
+      <input id="max-decisions" type="number" min="1" max="10000" placeholder="80">
+    </label>
+    <label>API token (if set)
+      <input id="token" type="password" autocomplete="off" placeholder="optional">
+    </label>
+  </div>
+  <button id="run" type="submit">Run</button>
+</form>
+<section>
+  <h2>Current task</h2>
+  <p id="current-meta" class="muted">None selected.</p>
+  <p><button id="stop" disabled>Stop</button> <span id="live"></span></p>
+  <table>
+    <thead><tr><th>#</th><th>Operation</th><th>Target</th><th>URL</th><th>ms</th></tr></thead>
+    <tbody id="steps"></tbody>
+  </table>
+</section>
+<section>
+  <h2>History</h2>
+  <ul id="history"></ul>
+</section>
+<script src="/tasks.js"></script>
+</body>
+</html>
