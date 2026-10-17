@@ -50,6 +50,16 @@ A six-call helper probe used the two real flight-field contexts with Gemini 2.5 
 
 The previous 11.387-second recording and post-recording 12.898-second policy regression are described in the [original performance report](https://github.com/browser-use/jev-ultrafast/blob/68c077bf79caca4e817b8e8a5854b2efa0c81ff6/docs/performance.md). The older prepared-step prototype remains in [performance-prepared.md](performance-prepared.md). Raw attempts and original-timestamp frames remain in ignored local artifacts.
 
+## Feature flags
+
+`scripts/measure_features.py` loads the local fixtures (shadow, iframe, scroll, keyboard, select, upload) three times with every flag off and three times with the defaults. It records median wall time, CDP call count, and snapshot time. It does not call TypeSafe or the text model.
+
+A run on this machine did not collect those numbers. Browser Harness failed before the first navigation:
+
+`RuntimeError: daemon default didn't come up — remote debugging is turned off for this browser instance.`
+
+Sample size for the new comparison is therefore 0. The published Wikipedia (2.798 s), hotel (1.896 s), and flights (median 7.092 s) figures above were not re-run, so this change set does not show that default flags stay within 10% of that baseline. `JEV_FRAMES=all` is not the default. It adds `Page.getFrameTree`, `Target.getTargets`, and one snapshot evaluation per visible cross-origin frame, so it can be slower than `JEV_FRAMES=same` and should be measured separately.
+
 ## Limits
 
-This DOM reader supports common HTML and ARIA controls; it does not implement the full accessible-name algorithm or traverse shadow roots/frames. Scoped click guards deliberately allow unrelated visible updates. Canvas, uploads, new tabs, nested scrolling, and arbitrary keyboard widgets remain unsupported. A valid operation can still be wrong, and DONE is never independent evidence of success.
+The DOM reader still does not implement the full accessible-name algorithm. Open shadow roots are walked when `JEV_SHADOW_DOM` is on. Closed shadow roots are not entered; a no-progress click on a custom-element host is reported as `possible closed shadow root`. Same-origin frames are inlined by default. Cross-origin frames need `JEV_FRAMES=all` and a CDP target whose URL matches the iframe. File uploads require an allowlist. Popup tabs are capped at five and only when this task opened them. Nested scroll keeps eight containers. `PRESS_KEY` is a fixed enum. Canvas clicks exist only with `JEV_VISION=1` and are coordinate-based. A valid operation can still be wrong, and DONE is never independent evidence of success.
