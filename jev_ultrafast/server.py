@@ -9,6 +9,7 @@ import hmac
 import json
 import os
 import sqlite3
+import sys
 import threading
 import time
 import uuid
@@ -16,6 +17,9 @@ from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
+
+from browser_harness import admin as harness_admin
+from browser_harness import helpers as harness_helpers
 
 from .agent import Agent
 from .config import env_bool
@@ -151,6 +155,189 @@ def live_url_for(agent):
     if isinstance(handle, dict):
         return handle.get("live_url")
     return None
+
+
+def reclaim_daemon(name):
+    """Stop our own daemon when its browser link is dead. Never touches others'.
+
+    A live socket with a dead CDP link (e.g. Chrome restarted underneath it)
+    answers ping but fails a real Target call. restart_daemon only stops; the
+    next local task respawns a fresh daemon through ensure_daemon().
+    """
+    if not harness_admin.daemon_alive(name):
+        return
+    try:
+        harness_helpers.cdp("Target.getTargets")
+        return
+    except Exception:
+        pass
+    print(f"[jev:server] daemon {name} is stale; stopping it", file=sys.stderr, flush=True)
+    try:
+        harness_admin.restart_daemon(name)
+    except Exception as error:
+        print(f"[jev:server] daemon stop failed: {error}", file=sys.stderr, flush=True)
+
+
+class Viewer:
+    """One local task's frame source. Screencast primary, screenshot fallback.
+
+    Frames arrive through the shared FramePump; the fallback captures directly.
+    Quiet-restarting the screencast heals ack stalls (a drain elsewhere eats a
+    frame) and is a no-op on a static page, which simply keeps its last frame.
+    """
+
+    QUIET_RESTART_S = 3.0
+    SHOT_EVERY_S = 1.0
+
+    def __init__(self, pump, call, session):
+        self.pump = pump
+        self.call = call
+        self.session = session
+        self.lock = threading.Lock()
+        self.cond = threading.Condition(self.lock)
+        self.viewers = 0
+        self.seq = 0
+        self.latest = None
+        self.mode = None
+        self.last_frame_at = 0.0
+        self._stop = threading.Event()
+
+    def offer(self, image_b64):
+        with self.cond:
+            self.latest = image_b64
+            self.seq += 1
+            self.last_frame_at = time.monotonic()
+            self.cond.notify_all()
+
+    def add_viewer(self):
+        with self.lock:
+            self.viewers += 1
+            if self.viewers == 1:
+                self._start_source()
+
+    def remove_viewer(self):
+        with self.lock:
+            self.viewers = max(0, self.viewers - 1)
+            if self.viewers == 0:
+                self._stop_source()
+
+    def shutdown(self):
+        with self.lock:
+            self._stop.set()
+        self.pump.unregister(self)
+        try:
+            self.call("Page.stopScreencast")
+        except Exception:
+            pass
+
+    def _start_screencast(self):
+        self.call("Page.startScreencast", format="jpeg", quality=60, maxWidth=1120, everyNthFrame=2)
+
+    def _start_source(self):
+        self._stop.clear()
+        try:
+            self._start_screencast()
+            self.mode = "screencast"
+            self.last_frame_at = time.monotonic()
+            self.pump.register(self)
+        except Exception:
+            self.mode = "screenshot"
+        worker = threading.Thread(target=self._maintain, daemon=True)
+        worker.start()
+
+    def _maintain(self):
+        while not self._stop.is_set():
+            if self.mode == "screenshot":
+                try:
+                    shot = self.call("Page.captureScreenshot", format="jpeg", quality=60)
+                    if isinstance(shot, dict) and shot.get("data"):
+                        self.offer(shot["data"])
+                except Exception:
+                    pass
+                self._stop.wait(self.SHOT_EVERY_S)
+            else:
+                if time.monotonic() - self.last_frame_at > self.QUIET_RESTART_S:
+                    try:
+                        self.call("Page.stopScreencast")
+                        self._start_screencast()
+                        self.last_frame_at = time.monotonic()
+                    except Exception:
+                        self.mode = "screenshot"
+                self._stop.wait(0.5)
+
+    def _stop_source(self):
+        self._stop.set()
+        self.pump.unregister(self)
+        if self.mode == "screencast":
+            try:
+                self.call("Page.stopScreencast")
+            except Exception:
+                pass
+        self.mode = None
+
+
+class FramePump:
+    """One global drain routing screencast frames to task viewers by session.
+
+    drain_events is destructive and daemon-wide, so exactly one pump runs, only
+    while at least one viewer is connected. Every screencast frame is acked,
+    even for unknown sessions, so the browser never stalls. Non-frame events
+    consumed here are unavailable to tab/network watchers until viewing ends.
+    """
+
+    def __init__(self, daemon_name):
+        self.daemon_name = daemon_name
+        self.lock = threading.Lock()
+        self.cond = threading.Condition(self.lock)
+        self.sessions = {}
+        worker = threading.Thread(target=self._loop, daemon=True)
+        worker.start()
+
+    def register(self, viewer):
+        with self.cond:
+            self.sessions[viewer.session] = viewer
+            self.cond.notify()
+
+    def unregister(self, viewer):
+        with self.lock:
+            if self.sessions.get(viewer.session) is viewer:
+                del self.sessions[viewer.session]
+
+    def step(self):
+        if harness_helpers.NAME != self.daemon_name:
+            return 0
+        try:
+            events = harness_helpers.drain_events()
+        except Exception:
+            return 0
+        routed = 0
+        for event in events or []:
+            if event.get("method") != "Page.screencastFrame":
+                continue
+            params = event.get("params") or {}
+            cdp_session = event.get("session_id")
+            if params.get("sessionId"):
+                try:
+                    harness_helpers.cdp(
+                        "Page.screencastFrameAck", session_id=cdp_session,
+                        sessionId=params["sessionId"],
+                    )
+                except Exception:
+                    pass
+            with self.lock:
+                viewer = self.sessions.get(cdp_session)
+            if viewer is not None and params.get("data"):
+                viewer.offer(params["data"])
+                routed += 1
+        return routed
+
+    def _loop(self):
+        while True:
+            with self.cond:
+                while not self.sessions:
+                    self.cond.wait()
+            self.step()
+            time.sleep(0.03)
 
 
 class Runner:
@@ -388,6 +575,12 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     load_environment()
+    # Local tasks drive one pinned Chrome through our own daemon, in visible
+    # tabs. BU_CDP_URL selects the Chrome (e.g. http://127.0.0.1:9222).
+    os.environ.setdefault("BU_NAME", "jev-server")
+    harness_helpers.NAME = harness_admin.NAME = os.environ["BU_NAME"]
+    os.environ.setdefault("JEV_VISIBLE_TAB", "1")
+    reclaim_daemon(os.environ["BU_NAME"])
     host = os.environ.get("JEV_SERVER_HOST", "127.0.0.1")
     port = int(os.environ.get("JEV_SERVER_PORT", "8770"))
     db_path = os.environ.get("JEV_RUNS_DB", str(Path.cwd() / "jev_runs.db"))

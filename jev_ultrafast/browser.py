@@ -52,9 +52,12 @@ class Browser:
                 visible = cloud_mode
             else:
                 visible = visible_env.strip().lower() in {"1", "true", "yes", "on"}
-            self.target = cdp("Target.createTarget", url="about:blank", background=not visible)["targetId"]
+            self.target = cdp(
+                "Target.createTarget", url="about:blank", background=not visible, newWindow=False
+            )["targetId"]
             self.session = cdp("Target.attachToTarget", targetId=self.target, flatten=True)["sessionId"]
             if visible:
+                cdp("Target.activateTarget", targetId=self.target)
                 self.call("Page.bringToFront")
             self.call("Emulation.setDeviceMetricsOverride", width=1120, height=780, deviceScaleFactor=1, mobile=False)
             # Keep rAF/menus rendering in an owned background tab, without activating the user's Chrome tab.
