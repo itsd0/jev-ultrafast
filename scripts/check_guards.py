@@ -1,5 +1,6 @@
 """Local-browser freshness/execution regressions. No model calls or external websites."""
 
+import json
 from pathlib import Path
 from urllib.parse import quote
 
@@ -148,7 +149,7 @@ def main():
         page = browser.observe(screenshot=False)
         inner = next(a for a in page["actions"] if a["label"] == "Inside frame")
         assert inner.get("frame") not in {None, "f0"}
-        assert str(inner["id"]).startswith(inner["frame"] + ":")
+        assert str(inner["id"]).startswith(str(inner["frame"]) + ":")
         browser.evaluate(
             "document.querySelector('#child').contentDocument.querySelector('button').onclick="
             "()=>{window.frameClicks=(window.frameClicks||0)+1}"
@@ -158,6 +159,20 @@ def main():
         browser.act(inner, page)
         assert browser.evaluate("window.frameClicks") == 1
         passed.append("same-origin iframe control keeps a frame id and receives the click")
+
+        upload_path = Path("/tmp/jev-ultrafast-upload.txt")
+        upload_path.write_text("resume")
+        browser.config["files"] = {"resume": str(upload_path)}
+        browser.call("Page.navigate", url="data:text/html," + quote((FIXTURES / "upload.html").read_text()))
+        browser.wait_until_ready()
+        page = browser.observe(screenshot=False)
+        encoded = json.dumps(page["actions"])
+        assert "resume" in encoded and str(upload_path) not in encoded
+        assert not any(a.get("value") == "never expose this" for a in page["actions"])
+        upload = next(a for a in page["actions"] if a.get("upload_key") == "resume")
+        browser.act(upload, page)
+        assert browser.evaluate("document.querySelector('#resume').files.length") == 1
+        passed.append("file input accepts only the allowlisted key")
     finally:
         browser.close()
     print("\n".join(passed))

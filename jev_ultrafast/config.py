@@ -18,7 +18,24 @@ def env_choice(name, default, allowed):
     return value if value in allowed else default
 
 
-def resolve_config(*, shadow_dom=None, frames=None):
+def parse_files(override=None):
+    files = {}
+    for part in os.environ.get("JEV_UPLOAD_FILES", "").split(","):
+        if "=" not in part:
+            continue
+        key, path = part.split("=", 1)
+        key, path = key.strip(), path.strip()
+        if key and path and "/" not in key and "\\" not in key and ".." not in key:
+            files[key] = path
+    if override:
+        for key, path in override.items():
+            key, path = str(key), str(path)
+            if key and path and "/" not in key and "\\" not in key and ".." not in key:
+                files[key] = path
+    return files
+
+
+def resolve_config(*, shadow_dom=None, frames=None, files=None):
     if frames is None:
         chosen = env_choice("JEV_FRAMES", "same", {"same", "all", "off"})
     else:
@@ -29,6 +46,7 @@ def resolve_config(*, shadow_dom=None, frames=None):
         "shadow_dom": env_bool("JEV_SHADOW_DOM", True) if shadow_dom is None else bool(shadow_dom),
         "frames": chosen,
         "frame_id": "f0",
+        "files": parse_files(files),
     }
 
 

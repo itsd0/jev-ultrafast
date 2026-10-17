@@ -114,9 +114,12 @@ class Browser:
         raise StalePage("Page did not settle")
 
     def _finish_observation(self, state):
+        if self.config.get("frames") == "all" and state.get("cross_frames"):
+            state = self._attach_oopif(state)
+        return bind_uploads(state, self.config.get("files") or {})
+
+    def _attach_oopif(self, state):
         """Attach each visible cross-origin frame once per observation. Same-origin frames are already inlined."""
-        if self.config.get("frames") != "all" or not state.get("cross_frames"):
-            return state
         try:
             self._frame_tree = self.call("Page.getFrameTree")
             targets = cdp("Target.getTargets").get("targetInfos", [])
@@ -235,7 +238,13 @@ class Browser:
             session = self.frame_sessions.get(action["route"])
             if not session:
                 raise StalePage("Frame is gone. Observe again.")
-        result = browser_operation({"operation": "act", "session": session, "action": action, "text": text})
+        result = browser_operation({
+            "operation": "act",
+            "session": session,
+            "action": action,
+            "text": text,
+            "files": (getattr(self, "config", None) or {}).get("files") or {},
+        })
         self.after_input = action if action["kind"] != "wait" else None
         return result
 
@@ -250,6 +259,47 @@ def fingerprint(state):
     if state.get("frame_keys"):
         content["frame_keys"] = state["frame_keys"]
     return hashlib.sha256(json.dumps(content, sort_keys=True).encode()).hexdigest()
+
+
+def _upload_key_ok(key):
+    return isinstance(key, str) and bool(key) and "/" not in key and "\\" not in key and ".." not in key
+
+
+def bind_uploads(state, files):
+    """Offer one target per allowlist key. Paths stay out of the action list."""
+    actions = state.get("actions") or []
+    if not any(action.get("kind") == "upload" for action in actions):
+        return state
+    allowed = {key: path for key, path in (files or {}).items() if _upload_key_ok(key)}
+    bound = []
+    for action in actions:
+        if action.get("kind") != "upload":
+            bound.append(action)
+            continue
+        for key in allowed:
+            bound.append({
+                **{k: v for k, v in action.items() if k not in {"path", "filename"}},
+                "id": f"{action['id']}:{key}",
+                "upload_key": key,
+                "label": f"{action.get('label') or 'Choose file'} → {key}",
+                "value": "",
+            })
+    updated = {**state, "actions": bound}
+    updated["fingerprint"] = fingerprint(updated)
+    return updated
+
+
+def real_upload_path(files, key):
+    """Resolve an allowlisted key to a real file. The model never supplies this path."""
+    if not _upload_key_ok(key) or not isinstance(files, dict) or key not in files:
+        raise ValueError("Upload key is not allowlisted; no file was set.")
+    raw = files[key]
+    if not isinstance(raw, str) or not os.path.isabs(raw):
+        raise ValueError("Allowlisted upload is not an absolute path; no file was set.")
+    path = os.path.realpath(raw)
+    if not os.path.isfile(path):
+        raise ValueError("Allowlisted upload is not a file; no file was set.")
+    return path
 
 
 def merge_oopif_state(parent, children):
@@ -345,6 +395,32 @@ def browser_operation(request):
         kind = action["kind"]
         if kind == "scroll":
             call("Input.dispatchMouseEvent", type="mouseWheel", x=550, y=650, deltaX=0, deltaY=action["delta"])
+        elif kind == "upload":
+            if type(action.get("node")) is not int:
+                raise ValueError("Invalid observed node")
+            # The path comes only from the allowlist. Action fields cannot change it.
+            path = real_upload_path(request.get("files") or {}, action.get("upload_key"))
+            locator = {k: action[k] for k in ("node", "frame", "kind") if k in action}
+            located = call(
+                "Runtime.evaluate",
+                expression="""(action => {
+                  const fast=window.__jevFast;
+                  const e=fast?.resolve ? fast.resolve(action) : fast?.nodes.get(action.node);
+                  if (!e || e.tagName!=='INPUT' || e.type!=='file' || !e.isConnected) return null;
+                  return e;
+                })(""" + json.dumps(locator) + ")",
+                returnByValue=False,
+            )
+            object_id = (located.get("result") or {}).get("objectId")
+            if not object_id:
+                raise StalePage("File input changed. Observe again.")
+            try:
+                call("DOM.setFileInputFiles", files=[path], objectId=object_id)
+            finally:
+                try:
+                    call("Runtime.releaseObject", objectId=object_id)
+                except RuntimeError:
+                    pass
         elif kind != "wait":
             if type(action["node"]) is not int:
                 raise ValueError("Invalid observed node")

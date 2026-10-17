@@ -103,12 +103,16 @@ def validate_choice(answer, ids):
 def action_space(actions):
     """One index per observed element; each operation has its own valid target choices."""
     elements, indices, targets, controls = [], {}, {}, {}
-    operations = {"click": "CLICK", "fill": "TYPE_TEXT", "select": "SELECT"}
+    operations = {"click": "CLICK", "fill": "TYPE_TEXT", "select": "SELECT", "upload": "UPLOAD_FILE"}
     for action in actions:
         kind = action["kind"]
         if kind not in operations:
             controls[action["id"].upper()] = action
             continue
+        if kind == "upload":
+            key = action.get("upload_key")
+            if not isinstance(key, str) or not key or "/" in key or "\\" in key or ".." in key:
+                continue
         node = action["node"]
         if node not in indices:
             index = str(len(elements) + 1)
@@ -126,6 +130,11 @@ def action_space(actions):
         if operation not in element["operations"]:
             element["operations"].append(operation)
         target = index
+        if kind == "upload":
+            key = action.get("upload_key")
+            if not isinstance(key, str) or not key or "/" in key or "\\" in key:
+                continue
+            target = f"{index}:{key}"
         if kind == "select":
             target = f"{index}:{len(element['options']) + 1}"
             element["options"].append({"index": target, "label": action["label"], "value": action["value"]})
@@ -139,6 +148,7 @@ def choose(state, goal, history):
         "CLICK": "Click an element, button, menu option, autocomplete suggestion, or calendar day.",
         "TYPE_TEXT": "Enter or replace text in an editable field. A small LLM will supply the value from the goal.",
         "SELECT": "Select an observed dropdown value.",
+        "UPLOAD_FILE": "Upload an allowlisted file. Choose the offered key. A key is not a filesystem path.",
     }
     operations = {key: labels[key] for key in targets}
     operations.update({key: value["label"] for key, value in controls.items()})

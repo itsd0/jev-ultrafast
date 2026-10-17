@@ -143,7 +143,7 @@
     }
     return {x, y};
   };
-  const safe = e => !['password','file','hidden'].includes(e.type);
+  const safe = e => !['password','hidden'].includes(e.type);
   const visible = e => !e.closest('[aria-hidden="true"],[inert]') &&
     e.checkVisibility({checkOpacity:true,checkVisibilityCSS:true});
   const name = (e,seen=new Set()) => {
@@ -172,6 +172,7 @@
     if (e.tagName==='TEXTAREA' || e.isContentEditable) return 'textbox';
     if (e.tagName==='INPUT') {
       if (['checkbox','radio'].includes(e.type)) return e.type;
+      if (e.type==='file') return 'button';
       if (['button','submit','reset','image'].includes(e.type)) return 'button';
       if (e.type==='search') return 'searchbox';
       if (e.type==='number') return 'spinbutton';
@@ -224,6 +225,10 @@
       if (value!==null) base[key]=value;
     }
     if (['checkbox','radio'].includes(e.type)) base.checked=String(e.checked);
+    if (e.tagName==='INPUT' && e.type==='file') {
+      actions.push({...base, kind:'upload', value:''});
+      return;
+    }
     if (e.tagName==='SELECT') {
       for (const o of e.options) if (!o.selected && !o.disabled && !o.closest('optgroup[disabled]'))
         actions.push({...base,kind:'select',value:o.value,
