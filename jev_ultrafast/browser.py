@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -20,8 +21,11 @@ class StalePage(ValueError):
 class Browser:
     def __init__(self, url):
         ensure_daemon()
-        self.target = cdp("Target.createTarget", url="about:blank", background=True)["targetId"]
+        visible = os.environ.get("JEV_VISIBLE_TAB", "").strip().lower() in {"1", "true", "yes", "on"}
+        self.target = cdp("Target.createTarget", url="about:blank", background=not visible)["targetId"]
         self.session = cdp("Target.attachToTarget", targetId=self.target, flatten=True)["sessionId"]
+        if visible:
+            self.call("Page.bringToFront")
         self.call("Emulation.setDeviceMetricsOverride", width=1120, height=780, deviceScaleFactor=1, mobile=False)
         # Keep rAF/menus rendering in an owned background tab, without activating the user's Chrome tab.
         self.call("Emulation.setFocusEmulationEnabled", enabled=True)
@@ -96,6 +100,40 @@ class Browser:
             )
             return current == [page["page_key"], page["guards"].get(str(node))]
         return self.evaluate(MARKER) == page["marker"]
+
+    def wait_until_ready(self, timeout=10):
+        """Bounded wait for document completion. Returns immediately if already ready."""
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                if self.evaluate("document.readyState") == "complete":
+                    return True
+            except StalePage:
+                pass
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.25)
+
+    def settled(self, page, timeout=10):
+        """True once the document is complete and two consecutive snapshots match."""
+        deadline = time.monotonic() + timeout
+        last, quiet = page.get("fingerprint"), 0
+        while time.monotonic() < deadline:
+            try:
+                if self.evaluate("document.readyState") != "complete":
+                    quiet = 0
+                else:
+                    current = self.observe(screenshot=False)["fingerprint"]
+                    if current == last:
+                        quiet += 1
+                        if quiet >= 2:
+                            return True
+                    else:
+                        quiet, last = 0, current
+            except StalePage:
+                quiet = 0
+            time.sleep(0.25)
+        return False
 
     def act(self, action, page, text=None):
         if not self.fresh(page, action):

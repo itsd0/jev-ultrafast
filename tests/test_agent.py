@@ -162,6 +162,7 @@ def runner():
     a = loop.Agent.__new__(loop.Agent)
     a.screenshots = False
     a.pending_text = None
+    a.blocked_streak = 0
     p = page()
     a.state = {
         "browser": Mock(fresh=Mock(return_value=True), observe=Mock(return_value=p)),
@@ -225,6 +226,59 @@ def test_stale_observation_preserves_executed_action(runner):
         runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
     assert runner.state["history"][-1]["action"] == "Go"
     runner.state["browser"].act.assert_called_once()
+
+
+def test_blocked_choice_reobserves_instead_of_stopping(runner):
+    runner.state["decision"] = {**decision("BLOCKED"), "operation": "BLOCKED"}
+    runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    assert runner.state["status"] == "ready"
+    assert runner.state["decision"] is None
+    assert runner.blocked_streak == 1
+    runner.state["browser"].settled.assert_called_once()
+
+
+def test_blocked_stops_after_three_retries(runner):
+    runner.blocked_streak = 3
+    runner.state["decision"] = {**decision("BLOCKED"), "operation": "BLOCKED"}
+    runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    assert runner.state["status"] == "blocked"
+    runner.state["browser"].settled.assert_not_called()
+
+
+def test_executed_action_resets_blocked_streak(runner):
+    runner.blocked_streak = 2
+    runner.state["decision"] = {**decision("e3"), "operation": "CLICK"}
+    runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    assert runner.blocked_streak == 0
+    runner.state["browser"].wait_until_ready.assert_called_once()
+
+
+def test_wait_until_ready_returns_immediately_when_complete():
+    import jev_ultrafast.browser as browser
+
+    tab = browser.Browser.__new__(browser.Browser)
+    tab.evaluate = Mock(return_value="complete")
+    assert tab.wait_until_ready() is True
+    tab.evaluate.assert_called_once()
+
+
+def test_wait_until_ready_gives_up_after_timeout():
+    import jev_ultrafast.browser as browser
+
+    tab = browser.Browser.__new__(browser.Browser)
+    tab.evaluate = Mock(return_value="loading")
+    assert tab.wait_until_ready(timeout=0) is False
+
+
+def test_settled_requires_two_matching_snapshots(monkeypatch):
+    import jev_ultrafast.browser as browser
+
+    tab = browser.Browser.__new__(browser.Browser)
+    tab.evaluate = Mock(return_value="complete")
+    tab.observe = Mock(side_effect=[{"fingerprint": "b"}, {"fingerprint": "b"}, {"fingerprint": "b"}])
+    monkeypatch.setattr(browser.time, "sleep", lambda *_a: None)
+    assert tab.settled({"fingerprint": "a"}) is True
+    assert tab.observe.call_count == 3
 
 
 def test_observation_is_one_atomic_browser_read(monkeypatch):
@@ -318,3 +372,119 @@ def test_navigation_during_prediction_reobserves_without_action(runner):
     assert runner.state["status"] == "ready"
     assert runner.state["decision"] is None
     runner.state["browser"].act.assert_not_called()
+
+
+def test_debug_log_reports_tokens_per_second(monkeypatch, capsys):
+    def post(_url, _key, body):
+        return {
+            "model": "test",
+            "usage": {"prompt_tokens": 100, "completion_tokens": 50},
+            "answers": {
+                "operation": choice(body["questions"]["operation"]["criteria"], "TYPE_TEXT"),
+                "type_text_target": choice(["1"], "1"),
+            },
+        }
+
+    monkeypatch.setenv("TYPESAFE_API_KEY", "SECRETKEY123")
+    monkeypatch.setenv("JEV_DEBUG", "2")
+    monkeypatch.setattr(model, "post_json", post)
+    model.choose(page(), "Find a book", [])
+    err = capsys.readouterr().err
+    assert "[jev:typesafe]" in err
+    assert "prompt=100 completion=50 tok/s=" in err
+    assert "operation=TYPE_TEXT target=1 choice=e1" in err
+    assert "SECRETKEY123" not in err
+
+
+def test_debug_log_parses_gateway_usage_keys(monkeypatch, capsys):
+    monkeypatch.setenv("TEXT_MODEL_API_KEY", "test")
+    monkeypatch.setenv("JEV_DEBUG", "1")
+    monkeypatch.setattr(
+        model,
+        "post_json",
+        Mock(
+            return_value={
+                "choices": [{"message": {"content": '{"text":"Zurich"}'}}],
+                "usage": {"inputTokens": 200, "outputTokens": 25},
+            }
+        ),
+    )
+    model.field_text({"goal": "Find a flight"})
+    err = capsys.readouterr().err
+    assert "[jev:text]" in err
+    assert "prompt=200 completion=25 tok/s=" in err
+    assert "value='Zurich'" in err
+
+
+def test_debug_log_quiet_by_default(monkeypatch, capsys):
+    monkeypatch.setenv("TYPESAFE_API_KEY", "test")
+    monkeypatch.delenv("JEV_DEBUG", raising=False)
+    monkeypatch.setattr(
+        model,
+        "post_json",
+        Mock(return_value={"model": "test", "answers": {"operation": choice(["DONE", "BLOCKED"], "DONE")}}),
+    )
+    model.choose({"url": "", "title": "", "text": "", "actions": []}, "Done", [])
+    assert capsys.readouterr().err == ""
+
+
+def test_debug_verbose_dumps_request_and_response(monkeypatch, capsys):
+    monkeypatch.setenv("TEXT_MODEL_API_KEY", "test")
+    monkeypatch.setenv("JEV_DEBUG", "2")
+    monkeypatch.setattr(
+        model, "post_json", Mock(return_value={"choices": [{"message": {"content": '{"text":"Zurich"}'}}]})
+    )
+    model.field_text({"goal": "Find a flight"})
+    err = capsys.readouterr().err
+    assert "[jev:text] request:" in err
+    assert "[jev:text] response:" in err
+    assert "sk-" not in err and "Bearer" not in err
+
+
+def test_debug_log_covers_rejected_values(monkeypatch, capsys):
+    monkeypatch.setenv("TEXT_MODEL_API_KEY", "test")
+    monkeypatch.setenv("JEV_DEBUG", "1")
+    monkeypatch.setattr(
+        model, "post_json", Mock(return_value={"choices": [{"message": {"content": '{"text":null}'}}]})
+    )
+    with pytest.raises(ValueError, match="nothing typed"):
+        model.field_text({"goal": "Find a flight"})
+    assert "error=no valid field value" in capsys.readouterr().err
+
+
+def test_text_max_tokens_override(monkeypatch):
+    monkeypatch.setenv("TEXT_MODEL_API_KEY", "test")
+    monkeypatch.setenv("TEXT_MODEL_MAX_TOKENS", "4096")
+    post = Mock(return_value={"choices": [{"message": {"content": '{"text":"Zurich"}'}}]})
+    monkeypatch.setattr(model, "post_json", post)
+    model.field_text({"goal": "Find a flight"})
+    assert post.call_args.args[2]["max_tokens"] == 4096
+
+
+@pytest.mark.parametrize("flag,background,front", [("1", False, True), ("", True, False)])
+def test_visible_tab_flag_controls_foreground(monkeypatch, flag, background, front):
+    import jev_ultrafast.browser as browser
+
+    calls = []
+
+    def cdp(method, **params):
+        calls.append((method, params))
+        if method == "Target.createTarget":
+            return {"targetId": "t1"}
+        if method == "Target.attachToTarget":
+            return {"sessionId": "s1"}
+        if method == "Runtime.evaluate":
+            return {"result": {"value": "complete"}}
+        return {}
+
+    monkeypatch.setattr(browser, "cdp", cdp)
+    monkeypatch.setattr(browser, "ensure_daemon", lambda: None)
+    if flag:
+        monkeypatch.setenv("JEV_VISIBLE_TAB", flag)
+    else:
+        monkeypatch.delenv("JEV_VISIBLE_TAB", raising=False)
+    tab = browser.Browser("https://example.test/")
+    tab.close()
+    create = next(params for method, params in calls if method == "Target.createTarget")
+    assert create["background"] is background
+    assert ("Page.bringToFront" in [method for method, _ in calls]) is front

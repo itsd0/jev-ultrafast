@@ -16,6 +16,7 @@ class Agent:
             raise ValueError("Supply a task")
         plan = [task]
         self.pending_text = None
+        self.blocked_streak = 0
         self.browser = Browser(url)
         self.record_dir = Path(record_dir) if record_dir else None
         self.screenshots = screenshots or bool(record_dir)
@@ -94,6 +95,15 @@ class Agent:
                 if not state["browser"].fresh(page):
                     state["status"] = "ready"
                     raise StalePage("Page changed since the decision. Choose again.")
+                if selected == "BLOCKED" and self.blocked_streak < 3:
+                    # A loading page looks identical to a dead end. Only trust
+                    # BLOCKED once the page has settled; otherwise look again.
+                    self.blocked_streak += 1
+                    state["browser"].settled(page)
+                    state["decision"] = None
+                    state["page"] = state["browser"].observe(screenshot=self.screenshots)
+                    state["status"] = "ready"
+                    return self.snapshot()
                 state["status"] = "done" if selected == "DONE" else "blocked"
                 state["plan_index"] = int(selected == "DONE")
                 state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
@@ -116,6 +126,8 @@ class Agent:
             # Browser.act checks freshness immediately before input, including after text generation.
             state["browser"].act(action, page, text=text)
             self.pending_text = None
+            self.blocked_streak = 0
+            state["browser"].wait_until_ready()
             state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
             # Record execution before observing. A stale post-action observation must not erase the action.
             state["history"].append(
