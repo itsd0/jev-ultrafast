@@ -10,16 +10,27 @@ from pathlib import Path
 from browser_harness.admin import ensure_daemon
 from browser_harness.helpers import cdp
 
+from .config import resolve_config, snapshot_config
+
 # Atomically read visible content and controls, preserving actual DOM node identity.
 READ_STATE = Path(__file__).with_name("snapshot.js").read_text()
-MARKER = f"(() => {{ const state={READ_STATE}; return state?.marker ?? null; }})()"
+
+
+def snapshot_expression(config=None):
+    payload = json.dumps(snapshot_config(config or resolve_config()))
+    return f"(()=>{{globalThis.__jevCfg={payload};return ({READ_STATE});}})()"
+
+
+def marker_expression(config=None):
+    return f"(() => {{ const state={snapshot_expression(config)}; return state?.marker ?? null; }})()"
 
 class StalePage(ValueError):
     """A decision no longer refers to the observed page."""
 
 
 class Browser:
-    def __init__(self, url):
+    def __init__(self, url, config=None):
+        self.config = config or resolve_config()
         ensure_daemon()
         visible = os.environ.get("JEV_VISIBLE_TAB", "").strip().lower() in {"1", "true", "yes", "on"}
         self.target = cdp("Target.createTarget", url="about:blank", background=not visible)["targetId"]
@@ -81,7 +92,12 @@ class Browser:
         for attempt in range(10):
             try:
                 return browser_operation(
-                    {"operation": "observe", "session": self.session, "screenshot": screenshot}
+                    {
+                        "operation": "observe",
+                        "session": self.session,
+                        "screenshot": screenshot,
+                        "config": self.config,
+                    }
                 )
             except StalePage:
                 if attempt == 9:
@@ -99,7 +115,7 @@ class Browser:
                 f"return c ? [c.pageKey(),c.guard(c.nodes.get({node}))] : null; }})()"
             )
             return current == [page["page_key"], page["guards"].get(str(node))]
-        return self.evaluate(MARKER) == page["marker"]
+        return self.evaluate(marker_expression(self.config)) == page["marker"]
 
     def wait_until_ready(self, timeout=10):
         """Bounded wait for document completion. Returns immediately if already ready."""
@@ -186,7 +202,9 @@ def browser_operation(request):
               if (action.kind==='fill' && (e.readOnly || e.getAttribute('aria-readonly')==='true')) return null;
               const r=e.getBoundingClientRect(), x=r.x+r.width/2, y=r.y+r.height/2;
               if (!r.width || !r.height || x<0 || y<0 || x>=innerWidth || y>=innerHeight) return null;
-              if (!e.contains(document.elementFromPoint(x,y))) return null;
+              const hit=window.__jevFast?.hit ? window.__jevFast.hit(x,y) : document.elementFromPoint(x,y);
+              const covered=window.__jevFast?.owns ? !window.__jevFast.owns(e,hit) : !e.contains(hit);
+              if (covered) return null;
               if (action.kind==='select') {
                 if (e.tagName!=='SELECT' || ![...e.options].some(o=>o.value===action.value &&
                     !o.disabled && !o.closest('optgroup[disabled]'))) return null;
@@ -223,7 +241,7 @@ def browser_operation(request):
                     call("Input.insertText", text=request["text"])
         return {"executed": action["id"]}
 
-    info = evaluate(READ_STATE)
+    info = evaluate(snapshot_expression(request.get("config")))
     if info is None:
         raise StalePage("Document is navigating")
     info["fingerprint"] = fingerprint(info)

@@ -1,8 +1,11 @@
 """Local-browser freshness/execution regressions. No model calls or external websites."""
 
+from pathlib import Path
 from urllib.parse import quote
 
 from jev_ultrafast.browser import Browser, StalePage
+
+FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures"
 
 HTML = """<!doctype html><title>Guard checks</title>
 <style>body{margin:30px}button{width:180px;height:50px}#outside{position:absolute;top:3000px}</style>
@@ -127,6 +130,18 @@ def main():
         browser.call("Page.navigate", url="about:blank")
         assert not browser.fresh(page, field)
         passed.append("navigation invalidates the old document")
+
+        browser.call("Page.navigate", url="data:text/html," + quote((FIXTURES / "shadow.html").read_text()))
+        browser.wait_until_ready()
+        page = browser.observe(screenshot=False)
+        labels = [a["label"] for a in page["actions"]]
+        assert "Inside shadow" in labels, labels
+        assert "Hidden control" not in labels, labels
+        assert any(a.get("possible_closed_shadow") and a["label"] == "Closed host" for a in page["actions"])
+        shadow = next(a for a in page["actions"] if a["label"] == "Inside shadow")
+        browser.act(shadow, page)
+        assert browser.evaluate("window.shadowClicks") == 1
+        passed.append("open shadow button is hit-tested and clicked")
     finally:
         browser.close()
     print("\n".join(passed))

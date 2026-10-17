@@ -1,0 +1,15 @@
+<!doctype html><title>Shadow fixture</title>
+<style>body{margin:30px}button{width:180px;height:40px}</style>
+<button id="light">Light button</button>
+<div id="host"></div>
+<closed-panel id="closed">Closed host</closed-panel>
+<script>
+const host = document.getElementById("host");
+const root = host.attachShadow({mode: "open"});
+const button = document.createElement("button");
+button.textContent = "Inside shadow";
+button.onclick = () => { window.shadowClicks = (window.shadowClicks || 0) + 1; };
+root.append(button);
+document.getElementById("closed").attachShadow({mode: "closed"}).innerHTML =
+  "<button>Hidden control</button>";
+</script>

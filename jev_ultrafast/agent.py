@@ -5,19 +5,21 @@ import time
 from pathlib import Path
 
 from .browser import Browser, StalePage
+from .config import resolve_config
 from .model import action_space, choose, field_context, field_text
 from .questions import MAX_STEPS
 
 
 class Agent:
-    def __init__(self, url, goals, *, record_dir=None, screenshots=False):
+    def __init__(self, url, goals, *, record_dir=None, screenshots=False, shadow_dom=None):
         task = goals.strip() if isinstance(goals, str) else "\n".join(goals).strip()
         if not task:
             raise ValueError("Supply a task")
         plan = [task]
         self.pending_text = None
         self.blocked_streak = 0
-        self.browser = Browser(url)
+        self.config = resolve_config(shadow_dom=shadow_dom)
+        self.browser = Browser(url, config=self.config)
         self.record_dir = Path(record_dir) if record_dir else None
         self.screenshots = screenshots or bool(record_dir)
         try:
@@ -144,6 +146,7 @@ class Agent:
                     "text_latency_ms": helper["latency_ms"] if helper else 0,
                     "operation": decision["operation"],
                     "target": decision["target"],
+                    "possible_closed_shadow": bool(action.get("possible_closed_shadow")),
                     "page_changed": None,
                     "url": page["url"],
                     "usage": decision["usage"],
@@ -163,11 +166,12 @@ class Agent:
                     base64.b64decode(state["page"]["screenshot"])
                 )
             repeated = state["history"][-3:]
-            state["status"] = (
-                "blocked"
-                if len(repeated) == 3 and all(h["page_changed"] is False and h["kind"] != "wait" for h in repeated)
-                else "ready"
+            stalled = len(repeated) == 3 and all(
+                h["page_changed"] is False and h["kind"] != "wait" for h in repeated
             )
+            state["status"] = "blocked" if stalled else "ready"
+            if stalled and any(h.get("possible_closed_shadow") for h in repeated):
+                state["blocked_reason"] = "possible closed shadow root"
         else:
             raise ValueError("Unknown command")
         return self.snapshot()

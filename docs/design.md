@@ -31,3 +31,9 @@ The audit also found that treating every INPUT as editable misclassified checkbo
 Sixty browser actions and 120 decision requests bound a run. Up to 250 action candidates are retained; truncated candidates cannot be selected. The service stays loopback-only, serializes inspector actions, and checks Host, Origin, and a local request token. Credentials remain server-side. Tabs share the existing Chrome profile.
 
 The policy is generic, but two websites do not establish broad reliability. Name resolution covers common labels, ARIA references, and text; it is not the browser's full accessibility algorithm. Shadow roots, frames, canvas, uploads, nested scrolling, pop-ups, and complex keyboard interactions can block progress. A valid action can still be wrong. Independent checks, rather than the model's DONE choice, determine whether the demonstrated task succeeded.
+
+## Open shadow DOM
+
+`JEV_SHADOW_DOM` defaults on (`Agent(..., shadow_dom=True)`). `snapshot.js` keeps one evaluation. After the light-DOM `querySelectorAll`, it walks each open `shadowRoot` and stores those nodes in the same `WeakMap` / `Map`. Ids stay code-owned integers. `elementFromPoint` stops at a shadow host, so the executor calls `shadowRoot.elementFromPoint` until the hit settles, then accepts the observed node or a descendant across open roots.
+
+Closed roots have no `shadowRoot` to enter. A visible custom element with no open root and no light-DOM control is offered as a click. If that click is one of three actions that leave the page unchanged, the run stops with `blocked_reason` `possible closed shadow root`. Turning the flag off restores the light-DOM-only snapshot and the original `contains` / `elementFromPoint` check.

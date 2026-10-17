@@ -245,6 +245,25 @@ def test_blocked_stops_after_three_retries(runner):
     runner.state["browser"].settled.assert_not_called()
 
 
+def test_closed_shadow_strike_explains_blocked(runner):
+    action = next(item for item in runner.state["page"]["actions"] if item["id"] == "e3")
+    action["possible_closed_shadow"] = True
+    for _ in range(3):
+        runner.state["decision"] = {**decision("e3"), "operation": "CLICK"}
+        runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    assert runner.state["status"] == "blocked"
+    assert runner.state["blocked_reason"] == "possible closed shadow root"
+    assert runner.state["history"][-1]["possible_closed_shadow"] is True
+
+
+def test_no_progress_stop_has_no_shadow_reason(runner):
+    for _ in range(3):
+        runner.state["decision"] = {**decision("e3"), "operation": "CLICK"}
+        runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    assert runner.state["status"] == "blocked"
+    assert "blocked_reason" not in runner.state
+
+
 def test_executed_action_resets_blocked_streak(runner):
     runner.blocked_streak = 2
     runner.state["decision"] = {**decision("e3"), "operation": "CLICK"}
