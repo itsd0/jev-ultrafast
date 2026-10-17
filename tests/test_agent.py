@@ -153,6 +153,7 @@ def test_quoted_task_text_still_uses_the_llm(monkeypatch):
 
 def test_missing_text_credential_stops_before_guessing(monkeypatch):
     monkeypatch.delenv("TEXT_MODEL_API_KEY", raising=False)
+    monkeypatch.delenv("INCEPTION_API_KEY", raising=False)
     with pytest.raises(ValueError, match="TEXT_MODEL_API_KEY"):
         model.field_text({"goal": 'Enter "Zurich"'})
 
@@ -398,25 +399,25 @@ def test_fingerprint_tracks_values_and_identity_not_screenshots():
 
 @pytest.mark.parametrize("changed", ["Departure", "Where from?", "Where to?", "year"])
 def test_flight_verification_rejects_wrong_trip(changed):
-    from examples.flights import verify
+    from examples.flights import TRIP_ISO, TRIP_LONG, TRIP_SHORT, verify
 
     actual = {
         "url": "https://www.google.com/travel/flights/search?tfs=example",
-        "text": "Track prices from Zürich to London departing 2026-09-20",
+        "text": f"Track prices from Zürich to London departing {TRIP_ISO}",
         "actions": [
             {"label": k, "value": v}
             for k, v in [
                 ("Change ticket type. One way", "One way"),
                 ("Where from?", "Zürich"),
                 ("Where to?", "London"),
-                ("Departure", "Sun, Sep 20"),
-                ("Nonstop flight on Sunday, September 20. Select flight", ""),
+                ("Departure", TRIP_SHORT),
+                (f"Nonstop flight on {TRIP_LONG}. Select flight", ""),
             ]
         ],
     }
     assert verify(actual)["passed"]
     if changed == "year":
-        actual["text"] = actual["text"].replace("2026", "2027")
+        actual["text"] = actual["text"].replace(TRIP_ISO[:4], "1999")
     else:
         next(a for a in actual["actions"] if a["label"] == changed)["value"] = "wrong"
     assert not verify(actual)["passed"]
@@ -554,3 +555,269 @@ def test_visible_tab_flag_controls_foreground(monkeypatch, flag, background, fro
     create = next(params for method, params in calls if method == "Target.createTarget")
     assert create["background"] is background
     assert ("Page.bringToFront" in [method for method, _ in calls]) is front
+
+
+def _spread(ids, selected, mass=0.7):
+    others = [item for item in ids if item != selected]
+    probabilities = {selected: mass if others else 1.0}
+    if others:
+        share = (1 - mass) / len(others)
+        probabilities.update({item: share for item in others})
+    probabilities[selected] += 1 - sum(probabilities.values())
+    return probabilities
+
+
+def _mercury_decision(body, selected, noul=0.1):
+    criteria = body["questions"]["next_action"]["criteria"]
+    probabilities = _spread(criteria, selected)
+    answers = {
+        "next_action": {
+            "type": "choice",
+            "choice": selected,
+            "confidence": probabilities[selected],
+            "probabilities": probabilities,
+        }
+    }
+    for name in body["questions"]:
+        if name.startswith("req_"):
+            answers[name] = {"type": "noul", "noul": noul}
+    return {"model": "mercury-decide", "answers": answers, "usage": {"input_tokens": 11, "output_tokens": 4}}
+
+
+def _checker(page_state):
+    return {
+        "id": "e9",
+        "kind": "click",
+        "label": "Refundable",
+        "role": "checkbox",
+        "checked": "false",
+        "value": "on",
+        "node": 7,
+        **page_state,
+    }
+
+
+def test_invalid_text_retries_once_at_low_effort_then_succeeds(monkeypatch):
+    monkeypatch.setenv("TEXT_MODEL_API_KEY", "test")
+    monkeypatch.setenv("TEXT_MODEL", "mercury-2.5")
+    monkeypatch.setenv("TEXT_MODEL_REASONING", "instant")
+    efforts = []
+    contents = iter(["not json", '{"text":"Zurich"}'])
+
+    def post(_url, _key, body):
+        efforts.append(body["reasoning_effort"])
+        return {"choices": [{"message": {"content": next(contents)}}], "usage": {}}
+
+    monkeypatch.setattr(model, "post_json", post)
+    assert model.field_text({"goal": "Find a flight"})[0] == "Zurich"
+    assert efforts == ["instant", "low"]
+
+
+def test_invalid_text_twice_fails_cleanly(monkeypatch, capsys, runner):
+    monkeypatch.setenv("TEXT_MODEL_API_KEY", "test")
+    monkeypatch.setenv("TEXT_MODEL", "mercury-2.5")
+    monkeypatch.setenv("TEXT_MODEL_REASONING", "instant")
+    efforts = []
+
+    def post(_url, _key, body):
+        efforts.append(body["reasoning_effort"])
+        return {"choices": [{"message": {"content": "still not json"}}], "usage": {}}
+
+    monkeypatch.setattr(model, "post_json", post)
+    with pytest.raises(ValueError, match="nothing typed"):
+        model.field_text({"goal": "Find a flight"})
+    assert efforts == ["instant", "low"]
+    assert "error=no valid field value; step skipped" in capsys.readouterr().err
+    runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    runner.state["browser"].act.assert_not_called()
+    assert runner.state["status"] == "ready"
+    assert runner.state["history"][-1]["note"] == "text helper failed"
+    assert runner.state["history"][-1]["page_changed"] is False
+
+
+def test_unset_provider_keeps_the_typesafe_request(monkeypatch):
+    monkeypatch.delenv("DECISION_PROVIDER", raising=False)
+    monkeypatch.setenv("TYPESAFE_API_KEY", "typesafe-secret-value")
+    seen = {}
+
+    def post(url, key, body):
+        seen["url"] = url
+        seen["body"] = body
+        return {
+            "model": "jev-latest",
+            "answers": {
+                "operation": choice(body["questions"]["operation"]["criteria"], "CLICK"),
+                "click_target": choice(body["questions"]["click_target"]["criteria"], "2"),
+            },
+            "usage": {},
+        }
+
+    monkeypatch.setattr(model, "post_json", post)
+    decision = model.choose(page(), "Find a book", [])
+    assert seen["url"].endswith("/v1/systemone")
+    assert "next_action" not in seen["body"]["questions"]
+    sample = next(iter(seen["body"]["questions"]["click_target"]["criteria"].values()))
+    assert "current_value" in sample
+    assert decision["choice"] == "e3"
+    assert "provider" not in decision
+    assert "typesafe-secret-value" not in json.dumps(decision)
+
+
+def test_mercury_flat_criteria_keep_control_state_and_observed_ids(monkeypatch):
+    monkeypatch.setenv("DECISION_PROVIDER", "mercury")
+    monkeypatch.setenv("INCEPTION_API_KEY", "inception-secret-value")
+    observed = page()
+    observed["actions"].append({
+        "id": "e9", "kind": "click", "label": "Refundable", "role": "checkbox",
+        "checked": "false", "selected": False, "value": "on", "node": 7,
+    })
+    seen = {}
+
+    def post(url, key, body):
+        seen["url"] = url
+        seen["body"] = body
+        assert "inception-secret-value" not in json.dumps(body)
+        return _mercury_decision(body, "e9")
+
+    monkeypatch.setattr(model, "post_json", post)
+    decision = model.choose_mercury(observed, "Find a book", [], ["Find a book"], {})
+    criteria = seen["body"]["questions"]["next_action"]["criteria"]
+    assert seen["url"].endswith("/decisions")
+    assert len(criteria) <= 255
+    assert criteria["e9"]["current_value"] == "on"
+    assert criteria["e9"]["checked"] == "false"
+    assert criteria["e9"]["selected"] is False
+    ids = {action["id"] for action in observed["actions"]}
+    assert set(criteria) - {"DONE", "BLOCKED"} <= ids
+    assert decision["choice"] == "e9"
+    assert decision["operation"] == "CLICK"
+    assert "inception-secret-value" not in json.dumps(decision["request"])
+    assert "<goal>" in seen["body"]["questions"]["next_action"]["instructions"]
+    assert "<rules>" in seen["body"]["questions"]["next_action"]["instructions"]
+    assert "req_1" in seen["body"]["questions"]
+
+
+def test_mercury_choice_list_never_exceeds_255(monkeypatch):
+    monkeypatch.setenv("INCEPTION_API_KEY", "inception-secret-value")
+    actions = [
+        {"id": f"e{i}", "kind": "click", "label": f"Item {i}", "role": "button", "value": "", "node": i}
+        for i in range(1, 301)
+    ]
+    seen = {}
+
+    def post(url, key, body):
+        seen["criteria"] = body["questions"]["next_action"]["criteria"]
+        return _mercury_decision(body, "e1")
+
+    monkeypatch.setattr(model, "post_json", post)
+    model.choose_mercury(
+        {"url": "u", "title": "t", "text": "t", "actions": actions},
+        "Pick one",
+        [],
+        ["Pick one"],
+        {},
+    )
+    assert len(seen["criteria"]) == 255
+    assert {"DONE", "BLOCKED"} <= set(seen["criteria"])
+    assert "e1" in seen["criteria"]
+
+
+def test_done_is_blocked_when_a_requirement_is_below_the_bar(monkeypatch):
+    monkeypatch.setenv("INCEPTION_API_KEY", "inception-secret-value")
+    calls = []
+
+    def post(url, key, body):
+        calls.append(url)
+        return _mercury_decision(body, "DONE", noul=0.2)
+
+    monkeypatch.setattr(model, "post_json", post)
+    decision = model.choose_mercury(page(), "Find a book", [], ["The article is open"], {})
+    assert decision["choice"] != "DONE"
+    assert decision["done_gate"]["blocked"] is True
+    assert decision["done_gate"]["reqs"]["r1"] == 0.2
+    assert abs(sum(decision["probabilities"].values()) - 1) < 0.02
+    assert "DONE" not in decision["probabilities"]
+    assert calls == ["https://api.inceptionlabs.ai/v1/decisions"]
+
+
+def test_done_is_blocked_when_the_verifier_is_incomplete(monkeypatch):
+    monkeypatch.setenv("INCEPTION_API_KEY", "inception-secret-value")
+
+    def post(url, key, body):
+        if url.endswith("/decisions"):
+            return _mercury_decision(body, "DONE", noul=0.95)
+        return {
+            "choices": [{"message": {"content": json.dumps({
+                "complete": False,
+                "missing": ["destination was not applied"],
+            })}}],
+            "usage": {"input_tokens": 5, "output_tokens": 2},
+        }
+
+    monkeypatch.setattr(model, "post_json", post)
+    decision = model.choose_mercury(page(), "Find a book", [], ["The article is open"], {})
+    assert decision["choice"] != "DONE"
+    assert decision["done_gate"]["blocked"] is True
+    assert decision["done_gate"]["verifier"]["complete"] is False
+    assert decision["done_gate"]["verifier"]["missing"] == ["destination was not applied"]
+    assert decision["verifier_calls"] == 1
+
+
+def test_done_is_accepted_when_requirements_and_verifier_agree(monkeypatch):
+    monkeypatch.setenv("INCEPTION_API_KEY", "inception-secret-value")
+
+    def post(url, key, body):
+        if url.endswith("/decisions"):
+            return _mercury_decision(body, "DONE", noul=0.91)
+        return {
+            "choices": [{"message": {"content": json.dumps({"complete": True, "missing": []})}}],
+            "usage": {},
+        }
+
+    monkeypatch.setattr(model, "post_json", post)
+    decision = model.choose_mercury(page(), "Find a book", [], ["The article is open"], {})
+    assert decision["choice"] == "DONE"
+    assert decision["operation"] == "DONE"
+    assert "done_gate" not in decision
+    assert decision["requirements"][0]["probability"] == 0.91
+
+
+def test_decompose_falls_back_to_the_goal(monkeypatch):
+    monkeypatch.setenv("INCEPTION_API_KEY", "inception-secret-value")
+    monkeypatch.setattr(
+        model,
+        "post_json",
+        Mock(return_value={"choices": [{"message": {"content": "not json"}}]}),
+    )
+    assert model.decompose_goal("Find a book") == ["Find a book"]
+
+
+def test_requirement_probabilities_are_reused_on_the_next_step(monkeypatch, runner):
+    monkeypatch.setenv("DECISION_PROVIDER", "mercury")
+    seen = {"decompose": 0, "progress": []}
+
+    def decompose(goal):
+        seen["decompose"] += 1
+        return ["The article is open"]
+
+    def mercury(state, goal, history, requirements, progress):
+        seen["progress"].append(dict(progress))
+        return {
+            "choice": "e3",
+            "operation": "CLICK",
+            "target": "2",
+            "confidence": 1,
+            "probabilities": {"e3": 1},
+            "latency_ms": 1,
+            "usage": {},
+            "requirements": [{"id": "r1", "text": requirements[0], "probability": 0.4}],
+        }
+
+    monkeypatch.setattr(loop, "decompose_goal", decompose)
+    monkeypatch.setattr(loop, "choose_mercury", mercury)
+    runner.command("predict", {})
+    runner.state["status"] = "ready"
+    runner.state["decision"] = None
+    runner.command("predict", {})
+    assert seen["decompose"] == 1
+    assert seen["progress"] == [{}, {"r1": 0.4}]

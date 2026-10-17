@@ -7,7 +7,17 @@ from pathlib import Path
 
 from .browser import Browser, StalePage
 from .config import resolve_config
-from .model import action_space, choose, field_context, field_text, match_option, post_json
+from .model import (
+    action_space,
+    choose,
+    choose_mercury,
+    decision_provider,
+    decompose_goal,
+    field_context,
+    field_text,
+    match_option,
+    post_json,
+)
 from .questions import MAX_STEPS
 from .vision import confirm_point, needs_vision, propose
 
@@ -116,6 +126,30 @@ class Agent:
             "model": "vision",
         }
 
+    def _decide(self, state):
+        if decision_provider() != "mercury":
+            return choose(state["page"], state["goal"], state["history"])
+        fresh_requirements = state.get("requirements_goal") != state["goal"]
+        if fresh_requirements:
+            state["requirements"] = decompose_goal(state["goal"])
+            state["requirements_goal"] = state["goal"]
+            state["requirement_progress"] = {}
+        decision = choose_mercury(
+            state["page"],
+            state["goal"],
+            state["history"],
+            state["requirements"],
+            state.get("requirement_progress") or {},
+        )
+        if fresh_requirements:
+            decision["decompose_usage"] = getattr(decompose_goal, "last_usage", {}) or {}
+        progress = {}
+        for item in decision.get("requirements") or []:
+            if item.get("id"):
+                progress[item["id"]] = item.get("probability")
+        state["requirement_progress"] = progress
+        return decision
+
     def snapshot(self):
         return {
             **{k: v for k, v in self.state.items() if k != "browser"},
@@ -147,7 +181,7 @@ class Agent:
                 raise ValueError("This run has stopped. Start a fresh demo.")
             if len(state["decisions"]) >= MAX_STEPS * 2:
                 raise ValueError("Reached the demo's model-call budget")
-            state["decision"] = self._maybe_vision(state) or choose(state["page"], state["goal"], state["history"])
+            state["decision"] = self._maybe_vision(state) or self._decide(state)
             state["decisions"].append(
                 {
                     **state["decision"],
@@ -203,7 +237,10 @@ class Agent:
                 if self.pending_text and self.pending_text[0] == context:
                     _, text, helper = self.pending_text
                 else:
-                    text, helper = field_text(context)
+                    try:
+                        text, helper = field_text(context)
+                    except ValueError:
+                        return self._skip_text_step(state, page, action, decision, selected)
                     self.pending_text = (context, text, helper)
                     state["text_calls"].append({**helper, "field": action["label"], "value": text})
             result = {"executed": action["id"]}
@@ -284,6 +321,36 @@ class Agent:
                 state["blocked_reason"] = "possible closed shadow root"
         else:
             raise ValueError("Unknown command")
+        return self.snapshot()
+
+    def _skip_text_step(self, state, page, action, decision, selected):
+        """A bad text response skips this step. The run keeps going."""
+        self.pending_text = None
+        state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
+        state["history"].append(
+            {
+                "step": len(state["history"]) + 1,
+                "action": action["label"],
+                "kind": action["kind"],
+                "choice": selected,
+                "probability": decision["probabilities"].get(selected),
+                "confidence": decision["confidence"],
+                "latency_ms": decision["latency_ms"],
+                "text": None,
+                "text_helper": None,
+                "text_latency_ms": 0,
+                "operation": decision["operation"],
+                "target": decision["target"],
+                "possible_closed_shadow": False,
+                "note": "text helper failed",
+                "page_changed": False,
+                "url": page["url"],
+                "usage": decision.get("usage", {}),
+                "executed_ms": state["elapsed_ms"],
+                "elapsed_ms": state["elapsed_ms"],
+            }
+        )
+        state["status"] = "ready"
         return self.snapshot()
 
     def run(self):

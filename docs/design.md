@@ -2,7 +2,9 @@
 
 The input is a natural-language goal. Every page observation builds an indexed table of accessible elements and their current values. One node receives one index, even when it supports both clicking and typing.
 
-One TypeSafe request asks which operation to perform and which target would be appropriate for each available operation. The executor consumes only the target head corresponding to the selected operation. This avoids serial operation-then-target calls and rejects targets incompatible with the operation. Dropdown targets include a code-owned option index.
+One decision request asks which operation to perform and which target would be appropriate for each available operation. The executor consumes only the target head corresponding to the selected operation. This avoids serial operation-then-target calls and rejects targets incompatible with the operation. Dropdown targets include a code-owned option index.
+
+`DECISION_PROVIDER` defaults to TypeSafe: one request, an operation choice, and a target head per operation. `DECISION_PROVIDER=mercury` is opt-in. It posts one `mercury-decide` request to `POST /v1/decisions` whose `next_action` choices are the observed action ids. Each description carries the operation, label, role, current value, and checked/selected/expanded state when the snapshot has them. Separate noul questions score the task requirements. A DONE choice is replaced when any requirement is below 0.85 or the completion verifier says the page is incomplete. Neither provider's output is used as a selector, coordinate, or script. Text uses Mercury 2.5 `POST /v1/chat/completions` with `reasoning_effort` (`TEXT_MODEL_REASONING`, default `instant`), JSON object output, and `max_completion_tokens` of at least 1000. HTTP 429 and 503 retry up to three times, and Decide also retries 502 and 504, honoring `Retry-After` when it is a number of seconds.
 
 Operation and target questions receive the same next-step rules. Target criteria include current values and checked/selected state. The questions run independently: a target cannot read the operation answer, so its premise explicitly names the operation it assumes.
 

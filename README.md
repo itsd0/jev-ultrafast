@@ -81,7 +81,7 @@ with Agent(
         print(state["elapsed_ms"], state["status"])
 ```
 
-Run with `uv run --env-file .env python your_script.py`. The same policy can run a different task:
+Run with `uv run --env-file .env python your_script.py`. Decisions stay on TypeSafe unless `DECISION_PROVIDER=mercury`. That Mercury path is experimental; the comparison is in [docs/mercury.md](docs/mercury.md). Field text uses Mercury 2.5 with `reasoning_effort=instant` unless `TEXT_MODEL_REASONING` is `low`, `medium`, or `high`. The same policy can run a different task:
 
 ```bash
 uv run --env-file .env python examples/run.py \

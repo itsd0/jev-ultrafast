@@ -1,4 +1,4 @@
-"""TypeSafe makes choices; an optional small OpenAI-compatible model writes field values."""
+"""Decision providers choose an operation and a target. A text model writes field values."""
 
 import json
 import math
@@ -8,9 +8,23 @@ import time
 
 import httpx
 
-from .questions import NEXT_ACTION, TARGET, TEXT_VALUE
+from .questions import (
+    DECOMPOSE_SYSTEM,
+    MERCURY_BLOCKED,
+    MERCURY_DONE,
+    NEXT_ACTION,
+    TARGET,
+    TEXT_VALUE,
+    VERIFY_SYSTEM,
+    mercury_next_instructions,
+    mercury_requirement_instructions,
+)
 
 CLIENT = httpx.Client(http2=True, timeout=25)
+RETRY_STATUSES = {429, 500, 502, 503, 504, 529}
+MAX_POSTS = 4  # first try plus three retries
+CHOICE_LIMIT = 255
+REASONING_EFFORTS = {"instant", "low", "medium", "high"}
 
 
 def debug_level():
@@ -41,6 +55,31 @@ def token_counts(usage):
     )
 
 
+def reasoning_tokens(usage):
+    if not isinstance(usage, dict):
+        return 0
+    details = usage.get("completion_tokens_details") or usage.get("output_tokens_details") or {}
+    if isinstance(details, dict):
+        value = details.get("reasoning_tokens")
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0:
+            return int(value)
+    value = usage.get("reasoning_tokens")
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0:
+        return int(value)
+    return 0
+
+
+def decision_provider():
+    """Unset and "typesafe" keep the original TypeSafe request. "mercury" is opt-in."""
+    value = os.environ.get("DECISION_PROVIDER", "typesafe").strip().lower()
+    return "mercury" if value == "mercury" else "typesafe"
+
+
+def reasoning_effort():
+    value = os.environ.get("TEXT_MODEL_REASONING", "instant").strip().lower()
+    return value if value in REASONING_EFFORTS else "instant"
+
+
 def log_model_call(kind, url, body, result, latency_ms, summary):
     """Server-side timing log. Credentials are never passed here, so they cannot leak."""
     level = debug_level()
@@ -48,38 +87,109 @@ def log_model_call(kind, url, body, result, latency_ms, summary):
         return
     usage = result.get("usage") if isinstance(result, dict) else None
     prompt, completion = token_counts(usage)
+    reasoning = reasoning_tokens(usage)
     seconds = max(latency_ms / 1000, 1e-6)
     rate = f"{completion / seconds:.1f}" if completion else "n/a"
     print(
         f"[jev:{kind}] model={body.get('model', '?')} latency_ms={latency_ms} "
-        f"prompt={prompt} completion={completion} tok/s={rate} {summary}",
+        f"prompt={prompt} completion={completion} tok/s={rate} reasoning={reasoning} {summary}",
         file=sys.stderr,
         flush=True,
     )
     if level >= 2:
         for label, payload in (("request", {"url": url, **body}), ("response", result)):
-            print(f"[jev:{kind}] {label}: {json.dumps(payload)[:4000]}", file=sys.stderr, flush=True)
+            dumped = json.dumps(redact_secrets(payload))
+            print(f"[jev:{kind}] {label}: {dumped[:4000]}", file=sys.stderr, flush=True)
+
+
+def retry_delay(response, attempt):
+    """Honor Retry-After seconds when present. Otherwise wait 0.5s, 1s, 2s."""
+    header = response.headers.get("retry-after") or response.headers.get("Retry-After")
+    if header:
+        try:
+            seconds = float(str(header).strip())
+        except ValueError:
+            seconds = None
+        if seconds is not None and math.isfinite(seconds) and seconds >= 0:
+            return min(seconds, 30)
+    return 0.5 * 2**attempt
+
+
+def retry_statuses(url):
+    statuses = {429, 503, 529}
+    if str(url).rstrip("/").endswith("/decisions"):
+        statuses |= {502, 504}
+    return statuses
+
+
+def redact_secrets(value):
+    if isinstance(value, dict):
+        cleaned = {}
+        for key, item in value.items():
+            if str(key).lower() == "authorization":
+                cleaned[key] = "[redacted]"
+            else:
+                cleaned[key] = redact_secrets(item)
+        return cleaned
+    if isinstance(value, list):
+        return [redact_secrets(item) for item in value]
+    if isinstance(value, str):
+        redacted = value
+        if redacted.lower().startswith("bearer "):
+            return "Bearer [redacted]"
+        for name in ("INCEPTION_API_KEY", "TYPESAFE_API_KEY", "TEXT_MODEL_API_KEY", "VISION_API_KEY"):
+            secret = os.environ.get(name) or ""
+            if len(secret) >= 8:
+                redacted = redacted.replace(secret, "[redacted]")
+        return redacted
+    return value
 
 
 def post_json(url, key, body):
-    for attempt in range(3):
+    for attempt in range(MAX_POSTS):
         try:
             response = CLIENT.post(url, json=body, headers={"Authorization": f"Bearer {key}"})
         except httpx.HTTPError:
             raise RuntimeError("Model connection failed; no action executed.") from None
-        if response.status_code in {429, 529, 503} and attempt < 2:
+        if response.status_code in retry_statuses(url) and attempt < MAX_POSTS - 1:
+            delay = retry_delay(response, attempt)
             if debug_level() >= 1:
                 print(
-                    f"[jev:http] retry url={url} status={response.status_code} attempt={attempt + 1}",
+                    f"[jev:http] retry url={url} status={response.status_code} "
+                    f"attempt={attempt + 1} wait_s={delay}",
                     file=sys.stderr,
                     flush=True,
                 )
-            time.sleep(0.5 * 2**attempt)
+            time.sleep(delay)
             continue
         if response.is_error:
             raise RuntimeError(f"Model provider returned HTTP {response.status_code}; no action executed.")
         return response.json()
     raise RuntimeError("Model unavailable")
+
+
+def prepare_choice_answer(answer):
+    """Renormalize a choice distribution that rounding pushed outside validate_choice's 0.02 band.
+
+    The chosen id is left untouched. validate_choice still rejects a choice that is not the argmax.
+    """
+    if not isinstance(answer, dict):
+        return answer
+    probabilities = answer.get("probabilities")
+    if not isinstance(probabilities, dict) or not probabilities:
+        return answer
+    numbers = list(probabilities.values())
+    if not all(type(n) in (int, float) and math.isfinite(n) for n in numbers):
+        return answer
+    total = sum(numbers)
+    if total <= 0 or abs(total - 1) < 0.02:
+        return answer
+    print(
+        f"[jev:decision] renormalized probabilities sum={total:.6f}",
+        file=sys.stderr,
+        flush=True,
+    )
+    return {**answer, "probabilities": {key: value / total for key, value in probabilities.items()}}
 
 
 def validate_choice(answer, ids):
@@ -174,8 +284,25 @@ def action_space(actions):
     return elements, targets, controls
 
 
-def choose(state, goal, history):
-    elements, targets, controls = action_space(state["actions"])
+def recent_actions(history, limit=10):
+    return [
+        {k: item.get(k) for k in ("action", "kind", "text", "page_changed")}
+        for item in history[-limit:]
+    ]
+
+
+def cap_criteria(criteria):
+    if len(criteria) <= CHOICE_LIMIT:
+        return criteria
+    print(
+        f"[jev:decision] capped choice options {len(criteria)} -> {CHOICE_LIMIT}",
+        file=sys.stderr,
+        flush=True,
+    )
+    return dict(list(criteria.items())[:CHOICE_LIMIT])
+
+
+def operation_catalog(targets, controls):
     labels = {
         "CLICK": "Click an element, button, menu option, autocomplete suggestion, or calendar day.",
         "TYPE_TEXT": "Enter or replace text in an editable field. A small LLM will supply the value from the goal.",
@@ -189,38 +316,22 @@ def choose(state, goal, history):
         "SCROLL_RIGHT": "Scroll an offered container right.",
         "PRESS_KEY": "Press one offered key on the focused control.",
     }
-    operations = {key: labels[key] for key in targets}
-    operations.update({key: value["label"] for key, value in controls.items()})
-    operations.update(DONE="Every requirement is visibly satisfied.", BLOCKED="No supported operation can progress.")
-    questions = {
-        "operation": {"type": "choice", "criteria": operations, "instructions": {"goal": goal, "rules": NEXT_ACTION}}
+    return {
+        **{key: labels[key] for key in targets},
+        **{key: value["label"] for key, value in controls.items()},
+        "DONE": "Every requirement is visibly satisfied.",
+        "BLOCKED": "No supported operation can progress.",
     }
-    for operation, candidates in targets.items():
-        questions[operation.lower() + "_target"] = {
-            "type": "choice",
-            "criteria": {
-                index: {
-                    "element": f"[{index}] {a['label']}",
-                    "current_value": a.get("current_value", a.get("value", "")),
-                    **{k: a[k] for k in ("role", "checked", "selected", "expanded") if k in a},
-                }
-                for index, a in candidates.items()
-            },
-            "instructions": {"goal": goal, "operation": operation, "rules": [NEXT_ACTION, TARGET]},
-        }
-    body = {
-        "model": os.environ.get("TYPESAFE_MODEL", "jev-latest"),
-        "state": {
-            "page": {k: state[k] for k in ("url", "title", "text")},
-            "elements": elements,
-            "recent_actions": [
-                {k: h.get(k) for k in ("action", "kind", "text", "page_changed")} for h in history[-10:]
-            ],
-        },
-        "questions": questions,
-    }
-    started = time.perf_counter()
+
+
+def choose(state, goal, history, requirements=None, progress=None):
+    if decision_provider() == "mercury":
+        return choose_mercury(state, goal, history, requirements or [goal], progress or {})
+    elements, targets, controls = action_space(state["actions"])
+    operations = operation_catalog(targets, controls)
+    body = typesafe_body(state, goal, history, elements, targets, operations)
     url = os.environ.get("TYPESAFE_URL", "https://api.typesafe.ai/v1/systemone")
+    started = time.perf_counter()
     result = post_json(url, os.environ["TYPESAFE_API_KEY"], body)
     try:
         operation_answer = validate_choice(result["answers"].get("operation", {}), operations)
@@ -236,7 +347,7 @@ def choose(state, goal, history):
             target = target_answer["choice"]
             choice = targets[operation][target]["id"]
             probabilities = {
-                a["id"]: target_answer["probabilities"][index] for index, a in targets[operation].items()
+                action["id"]: target_answer["probabilities"][index] for index, action in targets[operation].items()
             }
         else:
             choice = controls[operation]["id"] if operation in controls else operation
@@ -272,6 +383,431 @@ def choose(state, goal, history):
     }
 
 
+def inception_key():
+    key = os.environ.get("INCEPTION_API_KEY") or os.environ.get("TEXT_MODEL_API_KEY")
+    if not key:
+        raise ValueError("Mercury calls need INCEPTION_API_KEY; no action executed.")
+    return key
+
+
+def inception_base():
+    return os.environ.get("INCEPTION_API_BASE", "https://api.inceptionlabs.ai/v1").rstrip("/")
+
+
+def display_operation(operation, action):
+    kind = action.get("kind")
+    if kind == "fill" or operation == "TYPE_TEXT":
+        return "TYPE_TEXT"
+    if kind in {"select", "select_option"} or operation in {"SELECT", "SELECT_OPTION"}:
+        return "SELECT"
+    if kind == "scroll" or str(operation).startswith("SCROLL"):
+        return "SCROLL"
+    if kind == "wait" or operation == "WAIT":
+        return "WAIT"
+    if kind == "click" or operation == "CLICK":
+        return "CLICK"
+    return operation
+
+
+def effect_for(action, operation):
+    label = action.get("label") or ""
+    current = action.get("current_value", action.get("value", ""))
+    shown = display_operation(operation, action)
+    if shown == "TYPE_TEXT":
+        if current:
+            return "replace the current value in this field with a goal value"
+        return "type a goal value into this empty field"
+    if shown == "SELECT" and " → " in label:
+        base, option = label.split(" → ", 1)
+        if current:
+            return f"change {base.strip()} from {current} to {option.strip()}"
+        return f"change {base.strip()} to {option.strip()}"
+    if shown == "SELECT":
+        return "choose this offered option"
+    if shown == "SCROLL":
+        delta = action.get("delta") or 0
+        if action.get("axis") == "x":
+            direction = "right" if delta > 0 else "left"
+        else:
+            direction = "down" if delta > 0 else "up"
+        return f"scroll {direction}"
+    if shown == "WAIT":
+        return "wait for the page to update"
+    lowered = label.lower()
+    if lowered.startswith("view ") or lowered.startswith("open "):
+        return "open this result page"
+    if "checked" in action:
+        return "toggle this control"
+    return "activate this control"
+
+
+def action_description(action, operation, target_key):
+    label = action.get("label") or operation
+    description = {
+        "operation": display_operation(operation, action),
+        "element": f"[{target_key}] {label}",
+        "current_value": action.get("current_value", action.get("value", "")),
+        "effect": effect_for(action, operation),
+    }
+    if action.get("role"):
+        description["role"] = action["role"]
+    for key in ("checked", "selected", "expanded"):
+        if key in action:
+            description[key] = action[key]
+    return description
+
+
+def flat_catalog(state):
+    """One choice per observed action id, plus DONE and BLOCKED. Never more than 255."""
+    elements, targets, controls = action_space(state["actions"])
+    refs = {}
+    for operation, group in targets.items():
+        for target_key, action in group.items():
+            refs[action["id"]] = {"operation": operation, "target": target_key, "action": action}
+    for name, action in controls.items():
+        refs[action["id"]] = {"operation": name, "target": None, "action": action}
+    ordered = []
+    for action in state.get("actions") or []:
+        if action.get("id") in refs and action["id"] not in ordered:
+            ordered.append(action["id"])
+    room = CHOICE_LIMIT - 2
+    if len(ordered) > room:
+        print(
+            f"[jev:decision] capped choice options {len(ordered) + 2} -> {CHOICE_LIMIT}",
+            file=sys.stderr,
+            flush=True,
+        )
+        ordered = ordered[:room]
+    criteria = {}
+    for action_id in ordered:
+        ref = refs[action_id]
+        criteria[action_id] = action_description(ref["action"], ref["operation"], ref["target"] or action_id)
+    criteria["DONE"] = MERCURY_DONE
+    criteria["BLOCKED"] = MERCURY_BLOCKED
+    assert len(criteria) <= CHOICE_LIMIT
+    return elements, refs, criteria
+
+
+def requirement_rows(requirements, progress):
+    rows = []
+    for index, text in enumerate(requirements, start=1):
+        probability = (progress or {}).get(f"r{index}")
+        if probability is None and progress:
+            probability = progress.get(text)
+        try:
+            number = float(probability)
+        except (TypeError, ValueError):
+            number = None
+        if number is not None and not math.isfinite(number):
+            number = None
+        status = "satisfied" if number is not None and number >= 0.85 else "NOT yet satisfied"
+        rows.append({
+            "id": f"r{index}",
+            "text": text,
+            "last_probability": number,
+            "status": status,
+        })
+    return rows
+
+
+def mercury_body(state, goal, history, requirements, progress):
+    elements, refs, criteria = flat_catalog(state)
+    rows = requirement_rows(requirements, progress)
+    questions = {
+        "next_action": {
+            "type": "choice",
+            "criteria": criteria,
+            "instructions": mercury_next_instructions(
+                goal,
+                [f"{row['id']}: {row['status']} (p={row['last_probability']}) {row['text']}" for row in rows],
+            ),
+        }
+    }
+    for row in rows:
+        questions[f"req_{row['id'][1:]}"] = {
+            "type": "noul",
+            "instructions": mercury_requirement_instructions(row["text"]),
+            "criteria": {
+                "true": "Visibly proven by current controls or explicit confirmation text",
+                "false": "Not set, not applied, contradicted (e.g. text says 'anywhere'/'all'), or unknown",
+            },
+        }
+    body = {
+        "model": os.environ.get("DECISION_MODEL", "mercury-decide"),
+        "state": {
+            "goal": goal,
+            "requirements": rows,
+            "page": {k: state[k] for k in ("url", "title", "text")},
+            "elements": elements,
+            "recent_actions": recent_actions(history),
+        },
+        "questions": questions,
+    }
+    return body, refs
+
+
+def noul_probability(answer):
+    if not isinstance(answer, dict):
+        return 0.0
+    value = answer.get("noul")
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
+        return float(value)
+    return 0.0
+
+
+def chat_json(payload, kind):
+    endpoint = inception_base() + "/chat/completions"
+    started = time.perf_counter()
+    result = post_json(endpoint, inception_key(), payload)
+    latency_ms = round((time.perf_counter() - started) * 1000)
+    log_model_call(kind, endpoint, payload, result if isinstance(result, dict) else {}, latency_ms, kind)
+    return result, latency_ms
+
+
+def decompose_goal(goal):
+    """One Mercury chat call. Any invalid result falls back to the original goal."""
+    schema = {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "Requirements",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "requirements": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 8,
+                        "items": {"type": "string"},
+                    }
+                },
+                "required": ["requirements"],
+                "additionalProperties": False,
+            },
+        },
+    }
+    payload = {
+        "model": os.environ.get("TEXT_MODEL", "mercury-2.5"),
+        "reasoning_effort": "instant",
+        "temperature": 0.5,
+        "max_completion_tokens": 1000,
+        "response_format": schema,
+        "messages": [
+            {"role": "system", "content": DECOMPOSE_SYSTEM},
+            {"role": "user", "content": json.dumps({"goal": goal})},
+        ],
+    }
+    try:
+        result, _latency = chat_json(payload, "text")
+        output = json.loads(result["choices"][0]["message"]["content"])
+        requirements = output["requirements"]
+        if (
+            set(output) != {"requirements"}
+            or not isinstance(requirements, list)
+            or not 1 <= len(requirements) <= 8
+            or not all(isinstance(item, str) and item.strip() for item in requirements)
+        ):
+            raise ValueError("invalid requirements")
+        decompose_goal.last_usage = result.get("usage", {}) if isinstance(result, dict) else {}
+        return [item.strip() for item in requirements]
+    except (RuntimeError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+        decompose_goal.last_usage = {}
+        return [goal]
+
+
+def verify_done(goal, requirements, page, history):
+    schema = {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "Completion",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "complete": {"type": "boolean"},
+                    "missing": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["complete", "missing"],
+                "additionalProperties": False,
+            },
+        },
+    }
+    payload = {
+        "model": os.environ.get("TEXT_MODEL", "mercury-2.5"),
+        "reasoning_effort": "low",
+        "temperature": 0.5,
+        "max_completion_tokens": 1500,
+        "response_format": schema,
+        "messages": [
+            {"role": "system", "content": VERIFY_SYSTEM},
+            {
+                "role": "user",
+                "content": json.dumps({
+                    "goal": goal,
+                    "requirements": requirements,
+                    "page": {k: page.get(k) for k in ("url", "title", "text")},
+                    "recent_actions": recent_actions(history),
+                }),
+            },
+        ],
+    }
+    try:
+        result, latency_ms = chat_json(payload, "text")
+        output = json.loads(result["choices"][0]["message"]["content"])
+        missing = output.get("missing")
+        if not isinstance(output.get("complete"), bool) or not isinstance(missing, list):
+            raise ValueError("invalid verifier")
+        if not all(isinstance(item, str) for item in missing):
+            raise ValueError("invalid verifier")
+        return {
+            "complete": output["complete"],
+            "missing": missing,
+            "latency_ms": latency_ms,
+            "usage": result.get("usage", {}),
+        }
+    except (RuntimeError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+        return {"complete": False, "missing": ["verifier failed"], "latency_ms": 0, "usage": {}}
+
+
+def apply_done_gate(answer, reqs, verifier):
+    """Drop DONE when a requirement or the verifier disagrees, then validate the replacement."""
+    probabilities = dict(answer["probabilities"])
+    blocked = any(item["probability"] < 0.85 for item in reqs) or not verifier.get("complete", False)
+    if answer.get("choice") != "DONE" or not blocked:
+        return answer, None
+    remaining = {key: value for key, value in probabilities.items() if key != "DONE"}
+    if not remaining:
+        raise ValueError("Invalid TypeSafe response; no action executed.")
+    total = sum(value for value in remaining.values() if isinstance(value, (int, float)))
+    if total <= 0:
+        share = 1 / len(remaining)
+        remaining = {key: share for key in remaining}
+    else:
+        remaining = {key: value / total for key, value in remaining.items()}
+    choice = max(remaining, key=remaining.get)
+    rebuilt = {"choice": choice, "confidence": remaining[choice], "probabilities": remaining}
+    validate_choice(rebuilt, remaining)
+    return rebuilt, {
+        "blocked": True,
+        "reqs": {item["id"]: item["probability"] for item in reqs},
+        "verifier": {k: verifier.get(k) for k in ("complete", "missing")},
+    }
+
+
+def choose_mercury(state, goal, history, requirements, progress):
+    body, refs = mercury_body(state, goal, history, requirements, progress)
+    url = inception_base() + "/decisions"
+    started = time.perf_counter()
+    result = post_json(url, inception_key(), body)
+    verifier = {"complete": True, "missing": []}
+    verifier_calls = 0
+    try:
+        answers = result["answers"]
+        raw = answers.get("next_action", {})
+        answer = {
+            "choice": raw.get("choice"),
+            "confidence": raw.get("confidence"),
+            "probabilities": raw.get("probabilities"),
+        }
+        validate_choice(answer, body["questions"]["next_action"]["criteria"])
+        reqs = []
+        for index, text in enumerate(requirements, start=1):
+            probability = noul_probability(answers.get(f"req_{index}"))
+            reqs.append({"id": f"r{index}", "text": text, "probability": probability})
+        if answer["choice"] == "DONE":
+            if any(item["probability"] < 0.85 for item in reqs):
+                verifier = {"complete": False, "missing": [
+                    item["text"] for item in reqs if item["probability"] < 0.85
+                ]}
+            else:
+                verifier = verify_done(goal, requirements, state, history)
+                verifier_calls = 1
+            answer, gate = apply_done_gate(
+                answer,
+                reqs,
+                verifier if verifier_calls or any(item["probability"] < 0.85 for item in reqs) else {"complete": True},
+            )
+        else:
+            gate = None
+            validate_choice(answer, body["questions"]["next_action"]["criteria"])
+    except (ValueError, KeyError, TypeError) as error:
+        latency_ms = round((time.perf_counter() - started) * 1000)
+        log_model_call("decision", url, body, result if isinstance(result, dict) else {}, latency_ms, f"error={error}")
+        raise
+    choice = answer["choice"]
+    if choice in refs:
+        operation = refs[choice]["operation"]
+        target = refs[choice]["target"]
+    elif choice == "DONE":
+        operation, target = "DONE", None
+    elif choice == "BLOCKED":
+        operation, target = "BLOCKED", None
+    else:
+        operation, target = choice, None
+    latency_ms = round((time.perf_counter() - started) * 1000)
+    log_model_call(
+        "decision",
+        url,
+        body,
+        result,
+        latency_ms,
+        f"operation={operation} target={target} choice={choice} confidence={answer['confidence']}",
+    )
+    decision = {
+        "choice": choice,
+        "operation": operation,
+        "target": target,
+        "confidence": answer["confidence"],
+        "probabilities": answer["probabilities"],
+        "operation_probabilities": answer["probabilities"],
+        "target_probabilities": {},
+        "target_confidence": None,
+        "raw_answers": result.get("answers"),
+        "model": result.get("model", body["model"]),
+        "provider": "mercury",
+        "usage": result.get("usage", {}),
+        "latency_ms": latency_ms,
+        "request": redact_secrets(body),
+        "requirements": reqs,
+        "verifier_calls": verifier_calls,
+    }
+    if gate:
+        decision["done_gate"] = gate
+    if verifier_calls:
+        extra = verifier.get("usage") if isinstance(verifier.get("usage"), dict) else {}
+        decision["verifier_usage"] = extra
+        decision["verifier_latency_ms"] = verifier.get("latency_ms", 0)
+    return decision
+
+
+def typesafe_body(state, goal, history, elements, targets, operations):
+    questions = {
+        "operation": {"type": "choice", "criteria": operations, "instructions": {"goal": goal, "rules": NEXT_ACTION}}
+    }
+    for operation, candidates in targets.items():
+        questions[operation.lower() + "_target"] = {
+            "type": "choice",
+            "criteria": {
+                index: {
+                    "element": f"[{index}] {action['label']}",
+                    "current_value": action.get("current_value", action.get("value", "")),
+                    **{k: action[k] for k in ("role", "checked", "selected", "expanded") if k in action},
+                }
+                for index, action in candidates.items()
+            },
+            "instructions": {"goal": goal, "operation": operation, "rules": [NEXT_ACTION, TARGET]},
+        }
+    return {
+        "model": os.environ.get("TYPESAFE_MODEL", "jev-latest"),
+        "state": {
+            "page": {k: state[k] for k in ("url", "title", "text")},
+            "elements": elements,
+            "recent_actions": recent_actions(history),
+        },
+        "questions": questions,
+    }
+
+
 def match_option(label, options):
     """Exact, then case-insensitive, then a unique prefix, then a unique contains. Ambiguous is no match."""
     if not isinstance(label, str) or not label.strip():
@@ -299,6 +835,14 @@ def match_option(label, options):
     return unique(lambda option: folded in str(option.get("label", "")).casefold())
 
 
+def parse_field_text(result):
+    output = json.loads(result["choices"][0]["message"]["content"])
+    value = output["text"]
+    if set(output) != {"text"} or not isinstance(value, str) or not value.strip() or len(value) > 2000:
+        raise ValueError("invalid field text")
+    return value
+
+
 def field_context(goal, action, page, history):
     return {
         "goal": goal,
@@ -309,26 +853,53 @@ def field_context(goal, action, page, history):
 
 
 def field_text(context):
-    key = os.environ.get("TEXT_MODEL_API_KEY")
+    base = os.environ.get("TEXT_MODEL_BASE_URL", "https://api.inceptionlabs.ai/v1").rstrip("/")
+    model_name = os.environ.get("TEXT_MODEL", "mercury-2.5")
+    inception = "api.inceptionlabs.ai" in base or model_name.startswith("mercury")
+    if inception:
+        key = os.environ.get("INCEPTION_API_KEY") or os.environ.get("TEXT_MODEL_API_KEY")
+    else:
+        key = os.environ.get("TEXT_MODEL_API_KEY") or os.environ.get("INCEPTION_API_KEY")
     if not key:
-        raise ValueError("TYPE_TEXT needs TEXT_MODEL_API_KEY; no text is hardcoded or guessed by the executor.")
-    base = os.environ.get("TEXT_MODEL_BASE_URL", "https://api.deepseek.com/v1").rstrip("/")
-    model = os.environ.get("TEXT_MODEL", "deepseek-chat")
-    reasoning = {"thinking": {"type": "disabled"}} if "api.deepseek.com/" in base else {"reasoning": {"effort": "low"}}
-    if "api.meta.ai/" in base:
-        reasoning = {"reasoning_effort": "minimal"}
-    if os.environ.get("TEXT_MODEL_REASONING") == "none" and "api.meta.ai/" not in base:
-        reasoning = {"reasoning": {"enabled": False}}
+        raise ValueError(
+            "TYPE_TEXT needs TEXT_MODEL_API_KEY or INCEPTION_API_KEY; "
+            "no text is hardcoded or guessed by the executor."
+        )
+    if inception:
+        reasoning = {"reasoning_effort": reasoning_effort()}
+    else:
+        if "api.deepseek.com/" in base:
+            reasoning = {"thinking": {"type": "disabled"}}
+        else:
+            reasoning = {"reasoning": {"effort": "low"}}
+        if "api.meta.ai/" in base:
+            reasoning = {"reasoning_effort": "minimal"}
+        if os.environ.get("TEXT_MODEL_REASONING") == "none" and "api.meta.ai/" not in base:
+            reasoning = {"reasoning": {"enabled": False}}
     started = time.perf_counter()
     endpoint = base + "/chat/completions"
     try:
-        max_tokens = max(256, int(os.environ.get("TEXT_MODEL_MAX_TOKENS", "1024")))
+        max_tokens = max(1000, int(os.environ.get("TEXT_MODEL_MAX_TOKENS", "1024")))
     except ValueError:
         max_tokens = 1024
+    text_schema = {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "FieldText",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "properties": {"text": {"type": "string"}},
+                "required": ["text"],
+                "additionalProperties": False,
+            },
+        },
+    }
     payload = {
-        "model": model,
+        "model": model_name,
         "max_tokens": max_tokens,
-        "response_format": {"type": "json_object"},
+        "max_completion_tokens": max_tokens,
+        "response_format": text_schema,
         **reasoning,
         "messages": [
             {"role": "system", "content": TEXT_VALUE},
@@ -338,20 +909,28 @@ def field_text(context):
             },
         ],
     }
-    result = post_json(endpoint, key, payload)
-    try:
-        output = json.loads(result["choices"][0]["message"]["content"])
-        value = output["text"]
-        if set(output) != {"text"} or not isinstance(value, str) or not value.strip() or len(value) > 2000:
-            raise ValueError()
-    except (ValueError, KeyError, TypeError):
+    result = {}
+    for attempt in range(2):
+        if attempt:
+            payload = {**payload, "reasoning_effort": "low"}
+        result = post_json(endpoint, key, payload)
+        try:
+            value = parse_field_text(result)
+        except (ValueError, KeyError, TypeError, json.JSONDecodeError):
+            latency_ms = round((time.perf_counter() - started) * 1000)
+            logged = result if isinstance(result, dict) else {}
+            log_model_call(
+                "text", endpoint, payload, logged, latency_ms, "error=no valid field value"
+            )
+            if attempt:
+                print("[jev:text] error=no valid field value; step skipped", file=sys.stderr, flush=True)
+                raise ValueError("Text helper returned no valid field value; nothing typed.") from None
+            continue
         latency_ms = round((time.perf_counter() - started) * 1000)
-        log_model_call("text", endpoint, payload, result, latency_ms, "error=no valid field value")
-        raise ValueError("Text helper returned no valid field value; nothing typed.") from None
-    latency_ms = round((time.perf_counter() - started) * 1000)
-    log_model_call("text", endpoint, payload, result, latency_ms, f"value={value!r}")
-    return value, {
-        "model": model,
-        "latency_ms": latency_ms,
-        "usage": result.get("usage", {}),
-    }
+        log_model_call("text", endpoint, payload, result, latency_ms, f"value={value!r}")
+        return value, {
+            "model": model_name,
+            "latency_ms": latency_ms,
+            "usage": result.get("usage", {}) if isinstance(result, dict) else {},
+        }
+    raise ValueError("Text helper returned no valid field value; nothing typed.")
