@@ -459,8 +459,9 @@ def dispatch_key(call, name):
 
 
 def dispatch_char(call, character):
-    for event in ("keyDown", "char", "keyUp"):
-        call("Input.dispatchKeyEvent", type=event, key=character, text=character, code="")
+    # Text goes on keyDown only. A char event with the same text inserts a second copy.
+    call("Input.dispatchKeyEvent", type="keyDown", key=character, text=character, code="")
+    call("Input.dispatchKeyEvent", type="keyUp", key=character, code="")
 
 
 def bind_keys(state, enabled):
@@ -474,10 +475,9 @@ def bind_keys(state, enabled):
     return updated
 
 
-def verify_typed_text(call, evaluate, action, expected):
-    """Read the field after insertText. One key-event retype if it does not match."""
+def field_value_expression(action):
     locator = {k: action[k] for k in ("node", "frame") if k in action}
-    expression = (
+    return (
         "(action => { const fast=window.__jevFast; "
         "const e=fast?.resolve ? fast.resolve(action) : fast?.nodes.get(action.node); "
         "if (!e) return null; "
@@ -485,9 +485,21 @@ def verify_typed_text(call, evaluate, action, expected):
         + json.dumps(locator)
         + ")"
     )
+
+
+def verify_typed_text(call, evaluate, action, expected, previous=None):
+    """Read the field after insertText. Retype once only if the value did not change.
+
+    Comboboxes rewrite the inserted text (autocomplete, accents). Clearing that
+    result drops the suggestion list. Keyboard-only fields leave the value
+    untouched, and those are the ones that need key events.
+    """
+    expression = field_value_expression(action)
     actual = evaluate(expression)
     if actual == expected:
         return {"text_verified": True, "typed": actual}
+    if actual not in (None, "") and actual != previous:
+        return {"text_verified": True, "typed": actual, "rewritten": True}
     modifier = 4 if sys.platform == "darwin" else 2
     call(
         "Input.dispatchKeyEvent",
@@ -733,6 +745,11 @@ def browser_operation(request):
                 for event in ("mousePressed", "mouseReleased"):
                     call("Input.dispatchMouseEvent", type=event, x=x, y=y, button="left", clickCount=1)
                 if kind == "fill":
+                    previous = (
+                        evaluate(field_value_expression(action))
+                        if request.get("keyboard", True)
+                        else None
+                    )
                     call(
                         "Input.dispatchKeyEvent",
                         type="keyDown",
@@ -750,7 +767,11 @@ def browser_operation(request):
                     )
                     call("Input.insertText", text=request["text"])
                     if request.get("keyboard", True):
-                        extra.update(verify_typed_text(call, evaluate, action, request.get("text") or ""))
+                        extra.update(
+                            verify_typed_text(
+                                call, evaluate, action, request.get("text") or "", previous
+                            )
+                        )
         return {"executed": action["id"], **extra}
 
     info = evaluate(snapshot_expression(request.get("config")))

@@ -38,7 +38,8 @@ def test_insert_text_mismatch_retypes_once_and_reports_failure(monkeypatch):
             return {}
         if "isContentEditable" in params.get("expression", ""):
             reads["n"] += 1
-            return {"result": {"value": "" if reads["n"] == 1 else "Z"}}
+            # Previous value, post-insertText value, then the retype read.
+            return {"result": {"value": "" if reads["n"] < 3 else "Z"}}
         return {"result": {"value": {"x": 5, "y": 6}}}
 
     monkeypatch.setattr(browser, "cdp", cdp)
@@ -53,6 +54,38 @@ def test_insert_text_mismatch_retypes_once_and_reports_failure(monkeypatch):
     assert "a" in keys and "b" in keys
     assert result["text_verified"] is False
     assert result["typed"] == "Z"
+
+
+def test_rewritten_value_is_not_cleared(monkeypatch):
+    import jev_ultrafast.browser as browser
+
+    calls = []
+    reads = {"n": 0}
+
+    def cdp(method, **params):
+        calls.append((method, params))
+        if method == "Runtime.evaluate" and "isContentEditable" in params.get("expression", ""):
+            reads["n"] += 1
+            return {"result": {"value": "" if reads["n"] == 1 else "Zürich"}}
+        if method == "Runtime.evaluate":
+            return {"result": {"value": {"x": 1, "y": 2}}}
+        return {}
+
+    monkeypatch.setattr(browser, "cdp", cdp)
+    result = browser_operation({
+        "operation": "act",
+        "session": "s",
+        "keyboard": True,
+        "text": "Zurich",
+        "action": {"id": "e1", "kind": "fill", "node": 3, "frame": "f0"},
+    })
+    assert result["text_verified"] is True
+    assert result["rewritten"] is True
+    assert result["typed"] == "Zürich"
+    assert not any(
+        method == "Input.dispatchKeyEvent" and params.get("key") == "Backspace"
+        for method, params in calls
+    )
 
 
 def test_matching_insert_text_does_not_retype(monkeypatch):

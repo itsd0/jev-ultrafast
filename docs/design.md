@@ -58,7 +58,7 @@ Cross-origin frames are not readable from the parent. With `frames=all`, one `Pa
 
 ## Keyboard
 
-`JEV_KEYBOARD` defaults on (`Agent(..., keyboard=True)`). After `Input.insertText`, the executor reads the node's value (or `innerText` for a contenteditable). A match is done. A mismatch selects all, sends Backspace, then `keyDown` / `char` / `keyUp` per character, and reads once more. A second mismatch is stored as `text entry failed` and is not retried. `PRESS_KEY` targets are exactly Enter, Tab, Escape, ArrowDown, ArrowUp, ArrowLeft, ArrowRight, Space, and Backspace. Any other key is rejected before a CDP key event. The event goes to the focused node.
+`JEV_KEYBOARD` defaults on (`Agent(..., keyboard=True)`). After `Input.insertText`, the executor reads the node's value (or `innerText` for a contenteditable). A match is done. If the value is unchanged, the control ignored `insertText`: the executor selects all, sends Backspace, then `keyDown` / `keyUp` per character, and reads once more. The text is carried on `keyDown` only; a `char` event with the same text inserts a second copy. A second mismatch is stored as `text entry failed` and is not retried. If the value changed to something else, the site accepted the text (a combobox often rewrites it) and the executor leaves it in place. `PRESS_KEY` targets are exactly Enter, Tab, Escape, ArrowDown, ArrowUp, ArrowLeft, ArrowRight, Space, and Backspace. Any other key is rejected before a CDP key event. The event goes to the focused node.
 
 ## Large native selects
 
