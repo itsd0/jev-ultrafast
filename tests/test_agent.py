@@ -287,6 +287,14 @@ def test_new_tab_is_recorded_on_the_action(runner):
     assert runner.state["history"][-1]["note"] == "switched to new tab https://example.test/popup"
 
 
+def test_text_mismatch_is_recorded_without_another_attempt(runner, monkeypatch):
+    monkeypatch.setattr(loop, "field_text", Mock(return_value=("book", {"model": "t", "latency_ms": 1})))
+    runner.state["browser"].act.return_value = {"executed": "e1", "text_verified": False, "typed": "Z"}
+    runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    assert runner.state["history"][-1]["note"] == "text entry failed"
+    assert runner.state["browser"].act.call_count == 1
+
+
 def test_executed_action_resets_blocked_streak(runner):
     runner.blocked_streak = 2
     runner.state["decision"] = {**decision("e3"), "operation": "CLICK"}

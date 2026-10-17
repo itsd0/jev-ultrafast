@@ -202,6 +202,15 @@ def main():
         after = browser.evaluate("document.querySelector('#box').scrollTop")
         assert after > before, (before, after)
         passed.append("nested container scrolls from its own center")
+
+        browser.call("Page.navigate", url="data:text/html," + quote((FIXTURES / "keyboard.html").read_text()))
+        browser.wait_until_ready()
+        page = browser.observe(screenshot=False)
+        assert any(a.get("key") == "Enter" for a in page["actions"])
+        field = next(a for a in page["actions"] if a.get("kind") == "fill" and a.get("label") == "Code")
+        browser.act(field, page, text="ab")
+        assert browser.evaluate("document.querySelector('#typed').value") == "ab"
+        passed.append("keydown-only field receives a verified retype")
     finally:
         browser.close()
     print("\n".join(passed))

@@ -55,3 +55,7 @@ Cross-origin frames are not readable from the parent. With `frames=all`, one `Pa
 ## Nested scrolling
 
 `JEV_NESTED_SCROLL` defaults on (`Agent(..., nested_scroll=True)`). During the single snapshot, visible elements with `overflow` of `auto`, `scroll`, or `overlay` and a scroll range above 4 pixels are ranked by visible area. At most eight are kept. Each gets `SCROLL_DOWN` / `SCROLL_UP`, plus `SCROLL_LEFT` / `SCROLL_RIGHT` when the overflow is horizontal. Delta is `0.8 * clientHeight` (or width). Document `scroll_down` / `scroll_up` stay as they are. Container targets carry the code-owned node id. Execution wheels at the current center, reads `scrollTop` or `scrollLeft`, and calls `scrollBy` on that node only when the wheel did not move it. The container list is not rebuilt per action.
+
+## Keyboard
+
+`JEV_KEYBOARD` defaults on (`Agent(..., keyboard=True)`). After `Input.insertText`, the executor reads the node's value (or `innerText` for a contenteditable). A match is done. A mismatch selects all, sends Backspace, then `keyDown` / `char` / `keyUp` per character, and reads once more. A second mismatch is stored as `text entry failed` and is not retried. `PRESS_KEY` targets are exactly Enter, Tab, Escape, ArrowDown, ArrowUp, ArrowLeft, ArrowRight, Space, and Backspace. Any other key is rejected before a CDP key event. The event goes to the focused node.

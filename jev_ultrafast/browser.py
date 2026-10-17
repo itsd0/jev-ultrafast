@@ -126,7 +126,8 @@ class Browser:
         if self.config.get("frames") == "all" and state.get("cross_frames"):
             state = self._attach_oopif(state)
         state = bind_uploads(state, self.config.get("files") or {})
-        return bind_tabs(state, self)
+        state = bind_tabs(state, self)
+        return bind_keys(state, self.config.get("keyboard", True))
 
     def _attach_oopif(self, state):
         """Attach each visible cross-origin frame once per observation. Same-origin frames are already inlined."""
@@ -262,6 +263,7 @@ class Browser:
             "action": action,
             "text": text,
             "files": (getattr(self, "config", None) or {}).get("files") or {},
+            "keyboard": (getattr(self, "config", None) or {}).get("keyboard", True),
         })
         self.after_input = action if action["kind"] != "wait" else None
         return result
@@ -383,6 +385,92 @@ def bind_tabs(state, browser):
     updated = {**state, "actions": actions}
     updated["fingerprint"] = fingerprint(updated)
     return updated
+
+
+PRESS_KEYS = (
+    "Enter",
+    "Tab",
+    "Escape",
+    "ArrowDown",
+    "ArrowUp",
+    "ArrowLeft",
+    "ArrowRight",
+    "Space",
+    "Backspace",
+)
+
+_KEY_SPECS = {
+    "Enter": {"key": "Enter", "code": "Enter", "text": "\r", "windowsVirtualKeyCode": 13},
+    "Tab": {"key": "Tab", "code": "Tab", "windowsVirtualKeyCode": 9},
+    "Escape": {"key": "Escape", "code": "Escape", "windowsVirtualKeyCode": 27},
+    "ArrowDown": {"key": "ArrowDown", "code": "ArrowDown", "windowsVirtualKeyCode": 40},
+    "ArrowUp": {"key": "ArrowUp", "code": "ArrowUp", "windowsVirtualKeyCode": 38},
+    "ArrowLeft": {"key": "ArrowLeft", "code": "ArrowLeft", "windowsVirtualKeyCode": 37},
+    "ArrowRight": {"key": "ArrowRight", "code": "ArrowRight", "windowsVirtualKeyCode": 39},
+    "Space": {"key": " ", "code": "Space", "text": " ", "windowsVirtualKeyCode": 32},
+    "Backspace": {"key": "Backspace", "code": "Backspace", "windowsVirtualKeyCode": 8},
+}
+
+
+def dispatch_key(call, name):
+    if name not in _KEY_SPECS:
+        raise ValueError("Key is not in the PRESS_KEY enum; nothing was sent.")
+    spec = _KEY_SPECS[name]
+    for event in ("keyDown", "char", "keyUp"):
+        if event == "char" and "text" not in spec:
+            continue
+        params = {
+            "type": event,
+            "key": spec["key"],
+            "code": spec["code"],
+            "windowsVirtualKeyCode": spec["windowsVirtualKeyCode"],
+        }
+        if "text" in spec and event != "keyUp":
+            params["text"] = spec["text"]
+        call("Input.dispatchKeyEvent", **params)
+
+
+def dispatch_char(call, character):
+    for event in ("keyDown", "char", "keyUp"):
+        call("Input.dispatchKeyEvent", type=event, key=character, text=character, code="")
+
+
+def bind_keys(state, enabled):
+    if not enabled:
+        return state
+    actions = [action for action in state.get("actions", []) if action.get("kind") != "key"]
+    for name in PRESS_KEYS:
+        actions.append({"id": f"key:{name}", "kind": "key", "key": name, "label": f"Press {name}"})
+    updated = {**state, "actions": actions}
+    updated["fingerprint"] = fingerprint(updated)
+    return updated
+
+
+def verify_typed_text(call, evaluate, action, expected):
+    """Read the field after insertText. One key-event retype if it does not match."""
+    locator = {k: action[k] for k in ("node", "frame") if k in action}
+    expression = (
+        "(action => { const fast=window.__jevFast; "
+        "const e=fast?.resolve ? fast.resolve(action) : fast?.nodes.get(action.node); "
+        "if (!e) return null; "
+        "return e.isContentEditable ? e.innerText : ('value' in e ? String(e.value) : ''); })("
+        + json.dumps(locator)
+        + ")"
+    )
+    actual = evaluate(expression)
+    if actual == expected:
+        return {"text_verified": True, "typed": actual}
+    modifier = 4 if sys.platform == "darwin" else 2
+    call(
+        "Input.dispatchKeyEvent",
+        type="keyDown", key="a", code="KeyA", modifiers=modifier, commands=["selectAll"],
+    )
+    call("Input.dispatchKeyEvent", type="keyUp", key="a", code="KeyA", modifiers=modifier)
+    dispatch_key(call, "Backspace")
+    for character in expected:
+        dispatch_char(call, character)
+    actual = evaluate(expression)
+    return {"text_verified": actual == expected, "typed": actual}
 
 
 def _upload_key_ok(key):
@@ -517,6 +605,7 @@ def browser_operation(request):
     if operation == "act":
         action = request["action"]
         kind = action["kind"]
+        extra = {}
         if kind == "scroll" and type(action.get("node")) is int:
             axis = "x" if action.get("axis") == "x" else "y"
             delta = int(action.get("delta") or 0)
@@ -580,6 +669,8 @@ def browser_operation(request):
                     call("Runtime.releaseObject", objectId=object_id)
                 except RuntimeError:
                     pass
+        elif kind == "key":
+            dispatch_key(call, action.get("key"))
         elif kind != "wait":
             if type(action["node"]) is not int:
                 raise ValueError("Invalid observed node")
@@ -630,7 +721,9 @@ def browser_operation(request):
                         modifiers=4 if sys.platform == "darwin" else 2,
                     )
                     call("Input.insertText", text=request["text"])
-        return {"executed": action["id"]}
+                    if request.get("keyboard", True):
+                        extra.update(verify_typed_text(call, evaluate, action, request.get("text") or ""))
+        return {"executed": action["id"], **extra}
 
     info = evaluate(snapshot_expression(request.get("config")))
     if info is None:

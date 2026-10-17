@@ -1,0 +1,12 @@
+<!doctype html><title>Keyboard fixture</title>
+<style>body{margin:30px}input{width:240px;height:32px}</style>
+<label>Code <input id="typed" aria-label="Code"></label>
+<script>
+const field = document.querySelector("#typed");
+field.addEventListener("beforeinput", (event) => {
+  if (event.inputType === "insertText" || event.inputType === "insertReplacementText") event.preventDefault();
+});
+field.addEventListener("keydown", (event) => {
+  if (event.key && event.key.length === 1 && !event.metaKey && !event.ctrlKey) field.value += event.key;
+});
+</script>

@@ -35,7 +35,9 @@ def parse_files(override=None):
     return files
 
 
-def resolve_config(*, shadow_dom=None, frames=None, files=None, tabs=None, nested_scroll=None):
+def resolve_config(
+    *, shadow_dom=None, frames=None, files=None, tabs=None, nested_scroll=None, keyboard=None
+):
     if frames is None:
         chosen = env_choice("JEV_FRAMES", "same", {"same", "all", "off"})
     else:
@@ -49,6 +51,7 @@ def resolve_config(*, shadow_dom=None, frames=None, files=None, tabs=None, neste
         "files": parse_files(files),
         "tabs": env_bool("JEV_TABS", True) if tabs is None else bool(tabs),
         "nested_scroll": env_bool("JEV_NESTED_SCROLL", True) if nested_scroll is None else bool(nested_scroll),
+        "keyboard": env_bool("JEV_KEYBOARD", True) if keyboard is None else bool(keyboard),
     }
 
 

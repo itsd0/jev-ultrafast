@@ -23,6 +23,7 @@ class Agent:
         files=None,
         tabs=None,
         nested_scroll=None,
+        keyboard=None,
     ):
         task = goals.strip() if isinstance(goals, str) else "\n".join(goals).strip()
         if not task:
@@ -31,7 +32,12 @@ class Agent:
         self.pending_text = None
         self.blocked_streak = 0
         self.config = resolve_config(
-            shadow_dom=shadow_dom, frames=frames, files=files, tabs=tabs, nested_scroll=nested_scroll
+            shadow_dom=shadow_dom,
+            frames=frames,
+            files=files,
+            tabs=tabs,
+            nested_scroll=nested_scroll,
+            keyboard=keyboard,
         )
         self.browser = Browser(url, config=self.config)
         self.record_dir = Path(record_dir) if record_dir else None
@@ -140,9 +146,10 @@ class Agent:
                     self.pending_text = (context, text, helper)
                     state["text_calls"].append({**helper, "field": action["label"], "value": text})
             # Browser.act checks freshness immediately before input, including after text generation.
-            state["browser"].act(action, page, text=text)
+            result = state["browser"].act(action, page, text=text)
             self.pending_text = None
             self.blocked_streak = 0
+            text_failed = isinstance(result, dict) and result.get("text_verified") is False
             switched = None
             if getattr(type(state["browser"]), "collect_new_tabs", None):
                 opened = state["browser"].collect_new_tabs()
@@ -168,7 +175,9 @@ class Agent:
                     "operation": decision["operation"],
                     "target": decision["target"],
                     "possible_closed_shadow": bool(action.get("possible_closed_shadow")),
-                    "note": switched,
+                    "note": "; ".join(part for part in (
+                        switched, "text entry failed" if text_failed else None
+                    ) if part) or None,
                     "page_changed": None,
                     "url": page["url"],
                     "usage": decision["usage"],

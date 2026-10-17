@@ -106,6 +106,15 @@ def action_space(actions):
     operations = {"click": "CLICK", "fill": "TYPE_TEXT", "select": "SELECT", "upload": "UPLOAD_FILE"}
     for action in actions:
         kind = action["kind"]
+        if kind == "key":
+            key = action.get("key")
+            if key not in {
+                "Enter", "Tab", "Escape", "ArrowDown", "ArrowUp",
+                "ArrowLeft", "ArrowRight", "Space", "Backspace",
+            }:
+                continue
+            targets.setdefault("PRESS_KEY", {})[key] = action
+            continue
         if kind == "scroll":
             delta = action.get("delta") or 0
             if action.get("axis") == "x":
@@ -171,6 +180,7 @@ def choose(state, goal, history):
         "SCROLL_UP": "Scroll up the document or an offered container.",
         "SCROLL_LEFT": "Scroll an offered container left.",
         "SCROLL_RIGHT": "Scroll an offered container right.",
+        "PRESS_KEY": "Press one offered key on the focused control.",
     }
     operations = {key: labels[key] for key in targets}
     operations.update({key: value["label"] for key, value in controls.items()})
