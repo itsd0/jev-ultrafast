@@ -287,6 +287,22 @@ def test_new_tab_is_recorded_on_the_action(runner):
     assert runner.state["history"][-1]["note"] == "switched to new tab https://example.test/popup"
 
 
+def test_unmatched_option_does_not_mutate(runner, monkeypatch):
+    runner.state["page"]["actions"].append({
+        "id": "e9", "kind": "select_option", "node": 4, "label": "Country", "role": "combobox", "value": "",
+    })
+    runner.state["decision"] = {
+        "choice": "e9", "operation": "SELECT_OPTION", "target": "1", "confidence": 1,
+        "probabilities": {"e9": 1}, "latency_ms": 1, "usage": {},
+    }
+    monkeypatch.setattr(loop, "field_text", lambda _context: ("Nowhere", {"model": "t", "latency_ms": 1}))
+    runner.state["browser"].read_options.return_value = [{"label": "Canada", "value": "ca"}]
+    runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    runner.state["browser"].act.assert_not_called()
+    assert runner.state["history"][-1]["note"] == "no matching option"
+    assert runner.pending_text is not None
+
+
 def test_text_mismatch_is_recorded_without_another_attempt(runner, monkeypatch):
     monkeypatch.setattr(loop, "field_text", Mock(return_value=("book", {"model": "t", "latency_ms": 1})))
     runner.state["browser"].act.return_value = {"executed": "e1", "text_verified": False, "typed": "Z"}

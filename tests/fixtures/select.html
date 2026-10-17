@@ -1,0 +1,12 @@
+<!doctype html><title>Select fixture</title>
+<style>body{margin:30px}select{width:240px;height:32px}</style>
+<label>Country <select id="countries" aria-label="Country"></select></label>
+<script>
+const select = document.querySelector("#countries");
+for (let i = 1; i <= 200; i += 1) {
+  const option = document.createElement("option");
+  option.value = String(i);
+  option.textContent = i === 42 ? "Canada" : "Option " + String(i).padStart(3, "0");
+  select.append(option);
+}
+</script>

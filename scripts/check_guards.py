@@ -211,6 +211,18 @@ def main():
         browser.act(field, page, text="ab")
         assert browser.evaluate("document.querySelector('#typed').value") == "ab"
         passed.append("keydown-only field receives a verified retype")
+
+        browser.call("Page.navigate", url="data:text/html," + quote((FIXTURES / "select.html").read_text()))
+        browser.wait_until_ready()
+        page = browser.observe(screenshot=False)
+        large = [a for a in page["actions"] if a.get("kind") == "select_option"]
+        assert len(large) == 1, [a.get("kind") for a in page["actions"]]
+        assert large[0].get("option_count", 0) > 12
+        assert "Option 150" not in json.dumps(large)
+        chosen = {**large[0], "kind": "select", "value": "42"}
+        browser.act(chosen, page)
+        assert browser.evaluate("document.querySelector('#countries').value") == "42"
+        passed.append("long select is one target and selects an observed value")
     finally:
         browser.close()
     print("\n".join(passed))

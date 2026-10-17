@@ -103,7 +103,13 @@ def validate_choice(answer, ids):
 def action_space(actions):
     """One index per observed element; each operation has its own valid target choices."""
     elements, indices, targets, controls = [], {}, {}, {}
-    operations = {"click": "CLICK", "fill": "TYPE_TEXT", "select": "SELECT", "upload": "UPLOAD_FILE"}
+    operations = {
+        "click": "CLICK",
+        "fill": "TYPE_TEXT",
+        "select": "SELECT",
+        "select_option": "SELECT_OPTION",
+        "upload": "UPLOAD_FILE",
+    }
     for action in actions:
         kind = action["kind"]
         if kind == "key":
@@ -174,6 +180,7 @@ def choose(state, goal, history):
         "CLICK": "Click an element, button, menu option, autocomplete suggestion, or calendar day.",
         "TYPE_TEXT": "Enter or replace text in an editable field. A small LLM will supply the value from the goal.",
         "SELECT": "Select an observed dropdown value.",
+        "SELECT_OPTION": "Choose one option in a long dropdown. A small LLM will name the option.",
         "UPLOAD_FILE": "Upload an allowlisted file. Choose the offered key. A key is not a filesystem path.",
         "SWITCH_TAB": "Switch to another tab opened by this task. Choose an offered tab id.",
         "SCROLL_DOWN": "Scroll down the document or an offered container.",
@@ -263,6 +270,33 @@ def choose(state, goal, history):
         "latency_ms": latency_ms,
         "request": body,
     }
+
+
+def match_option(label, options):
+    """Exact, then case-insensitive, then a unique prefix, then a unique contains. Ambiguous is no match."""
+    if not isinstance(label, str) or not label.strip():
+        return None
+    enabled = [option for option in options or [] if not option.get("disabled")]
+
+    def unique(predicate):
+        found = [option for option in enabled if predicate(option)]
+        return found[0] if len(found) == 1 else None
+
+    exact = [option for option in enabled if option.get("label") == label]
+    if len(exact) == 1:
+        return exact[0]
+    if len(exact) > 1:
+        return None
+    folded = label.casefold()
+    insensitive = [option for option in enabled if str(option.get("label", "")).casefold() == folded]
+    if len(insensitive) == 1:
+        return insensitive[0]
+    if len(insensitive) > 1:
+        return None
+    prefix = unique(lambda option: str(option.get("label", "")).casefold().startswith(folded))
+    if prefix or sum(str(option.get("label", "")).casefold().startswith(folded) for option in enabled) > 1:
+        return prefix
+    return unique(lambda option: folded in str(option.get("label", "")).casefold())
 
 
 def field_context(goal, action, page, history):
