@@ -181,6 +181,8 @@ uv build
 
 Tests are offline. `uv run python scripts/check_guards.py` checks real controls in a local browser without model calls. `uv run python scripts/measure_features.py` times the local fixtures with flags off and with the defaults; it does not call a model. Live examples and recording scripts make paid API calls. `scripts/record_flights.py <new-folder>` captures original browser timestamps; `scripts/render_demo.py <recording-folder>` renders that verified run at 1× and crops out the Google account strip. Credentials and raw traces stay ignored.
 
+`bench/tasks.yaml` is the complexity benchmark: 13 public-site goals (forms, extraction, multi-site, pagination, recovery, long horizon) with independent URL/text/answer checks. With `jev-server` running on local Chrome, `uv run scripts/bench.py --server http://127.0.0.1:8770` submits each goal 3 times through the task API and prints a pass table with failure reasons; results land in `artifacts/`. The task result carries the agent's final answer (`answer_text`) alongside the final URL and page text, so extraction goals are verified, not trusted.
+
 ---
 
 [Browser Use](https://github.com/browser-use/browser-use) · [Browser Harness](https://github.com/browser-use/browser-harness) · [TypeSafe speculative fan-out](https://docs.typesafe.ai/patterns/fan-out)

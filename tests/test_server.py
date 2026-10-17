@@ -433,3 +433,38 @@ def test_task_validation(start_service):
         "goal": "x", "url": "https://example.test/", "max_decisions": 0,
     })[0] == 400
     assert api(base, "GET", "/api/tasks/nope")[0] == 404
+
+
+def test_finish_stores_bench_evidence(start_service):
+    def script(fake):
+        finished = snap("done", 2)
+        finished["page"] = {"url": "https://example.test/", "text": "Hello bench"}
+        finished["answer"] = "The answer is 42."
+        finished["blocked_reason"] = None
+        return finished
+
+    base, _ = start_service(script)
+    _, created = api(base, "POST", "/api/tasks", {"goal": "Bench", "url": "https://example.test/"})
+    done = wait_for(base, created["id"], {"done"})
+    assert done["final_text"] == "Hello bench"
+    assert done["answer_text"] == "The answer is 42."
+    assert done["decisions_count"] == 2
+    assert done["blocked_reason"] is None
+    _, listed = api(base, "GET", "/api/tasks")
+    assert "final_text" not in listed[0]
+
+
+def test_store_migrates_old_schema(tmp_path):
+    import sqlite3
+
+    db = tmp_path / "old.db"
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, goal TEXT NOT NULL)")
+    conn.execute("INSERT INTO tasks (id, goal) VALUES ('t1', 'Old')")
+    conn.commit()
+    conn.close()
+    store = hosted.Store(db)
+    row = store.get_task("t1")
+    assert row["goal"] == "Old"
+    assert row["answer_text"] is None
+    assert row["decisions_count"] is None

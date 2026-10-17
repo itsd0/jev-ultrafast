@@ -46,7 +46,11 @@ CREATE TABLE IF NOT EXISTS tasks (
     output_tokens INTEGER,
     cost_usd_estimate REAL,
     error TEXT,
-    live_url TEXT
+    live_url TEXT,
+    final_text TEXT,
+    answer_text TEXT,
+    decisions_count INTEGER,
+    blocked_reason TEXT
 );
 CREATE TABLE IF NOT EXISTS steps (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -71,6 +75,16 @@ class Store:
         self.lock = threading.Lock()
         with self.lock:
             self.conn.executescript(SCHEMA)
+            have = {r[1] for r in self.conn.execute("PRAGMA table_info(tasks)")}
+            for column, ctype in (
+                ("final_text", "TEXT"),
+                ("answer_text", "TEXT"),
+                ("decisions_count", "INTEGER"),
+                ("blocked_reason", "TEXT"),
+            ):
+                if column not in have:
+                    self.conn.execute(f"ALTER TABLE tasks ADD COLUMN {column} {ctype}")
+            self.conn.commit()
 
     def create_task(self, goal, url, browser, max_decisions):
         task_id = uuid.uuid4().hex
@@ -103,7 +117,12 @@ class Store:
                 " FROM tasks t ORDER BY created_at DESC LIMIT ?",
                 (limit,),
             ).fetchall()
-        return [dict(row) for row in rows]
+        tasks = []
+        for row in rows:
+            task = dict(row)
+            task.pop("final_text", None)  # Detail endpoint only; keeps history lists light.
+            tasks.append(task)
+        return tasks
 
     def update_task(self, task_id, **fields):
         if not fields:
@@ -440,6 +459,10 @@ class Runner:
             status=status,
             ended_at=time.time(),
             final_url=page.get("url"),
+            final_text=(page.get("text") or "")[:20000],
+            answer_text=snapshot.get("answer"),
+            decisions_count=len(snapshot.get("decisions") or []),
+            blocked_reason=snapshot.get("blocked_reason"),
             verified_by_agent=int(status == "done"),
             input_tokens=prompt,
             output_tokens=completion,

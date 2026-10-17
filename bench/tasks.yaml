@@ -1,0 +1,153 @@
+# jev complexity benchmark. Public sites only: no logins, no purchases,
+# no submits that create anything. Goals are the only input the agent sees;
+# urls/checks are the independent verification (a DONE choice proves nothing).
+runs: 3
+timeout_s: 900
+tasks:
+  - id: flights-roundtrip
+    kind: form
+    goal: >-
+      On Google Flights, search a round trip from Zurich to London, departing
+      June 12 2027 and returning June 19 2027, for 2 adults, and filter to
+      nonstop flights only.
+    url: https://www.google.com/travel/flights?hl=en
+    max_decisions: 80
+    expect_host: google.com
+    checks:
+      - {type: url_regex, pattern: /travel/flights/search}
+      - {type: text_contains, value: Nonstop}
+
+  - id: hotels-lisbon
+    kind: form
+    goal: >-
+      On Google Hotels, search hotels in Lisbon for June 12 to June 19 2027,
+      2 adults, set the maximum price to $150 per night, and sort by price
+      from low to high.
+    url: https://www.google.com/travel/hotels?hl=en
+    max_decisions: 80
+    expect_host: google.com
+    checks:
+      - {type: url_regex, pattern: travel/hotels}
+      - {type: text_contains, value: per night}
+
+  - id: hn-top5
+    kind: extraction
+    goal: >-
+      List the top 5 stories on the Hacker News front page right now, each
+      with its points score.
+    url: https://news.ycombinator.com
+    max_decisions: 40
+    expect_host: ycombinator.com
+    checks:
+      - {type: url_host, value: news.ycombinator.com}
+      - {type: answer_contains_all, values: [points]}
+      - {type: answer_min_length, value: 60}
+
+  - id: ebay-usb-hub
+    kind: extraction
+    goal: >-
+      Search eBay for 'usb-c hub' and report the price and the seller rating
+      of the first 3 results.
+    url: https://www.ebay.com/sch/i.html?_nkw=usb-c+hub
+    max_decisions: 40
+    expect_host: ebay.com
+    checks:
+      - {type: answer_regex, pattern: "(?i)(\\$|THB|฿|USD)"}
+      - {type: answer_min_length, value: 30}
+
+  - id: bangkok-pop-weather
+    kind: multi-site
+    goal: >-
+      Find the population of Bangkok on Wikipedia, then find Bangkok's current
+      weather. Report both the population and the current temperature.
+    max_decisions: 60
+    checks:
+      - {type: answer_contains_all, values: [million]}
+      - {type: answer_regex, pattern: "(?i)(°|celsius|fahrenheit|degrees)"}
+
+  - id: hn-page3
+    kind: pagination
+    goal: >-
+      On Hacker News, go to the 3rd page of stories (click More twice) and
+      report the title of the first story there.
+    url: https://news.ycombinator.com
+    max_decisions: 40
+    expect_host: ycombinator.com
+    checks:
+      - {type: url_regex, pattern: "[?&]p=3"}
+      - {type: answer_min_length, value: 10}
+
+  - id: quotes-page3
+    kind: pagination
+    goal: >-
+      On quotes.toscrape.com, go to page 3 and report the author of the first
+      quote on that page.
+    url: https://quotes.toscrape.com/
+    max_decisions: 40
+    expect_host: quotes.toscrape.com
+    checks:
+      - {type: url_regex, pattern: /page/3}
+      - {type: answer_min_length, value: 3}
+
+  - id: wiki-404-recovery
+    kind: recovery
+    goal: "Find the Wikipedia article on Marie Curie."
+    url: https://en.wikipedia.org/wiki/ThisPageDoesNotExistJevBench
+    max_decisions: 40
+    expect_host: wikipedia.org
+    checks:
+      - {type: url_regex, pattern: /wiki/Marie_Curie}
+
+  - id: w3schools-python
+    kind: recovery
+    goal: >-
+      On W3Schools, dismiss any cookie or popup dialogs and open the Python
+      tutorial page.
+    url: https://www.w3schools.com/
+    max_decisions: 40
+    expect_host: w3schools.com
+    checks:
+      - {type: url_regex, pattern: /python/}
+      - {type: text_contains, value: Python Tutorial}
+
+  - id: planets-moons
+    kind: long-horizon
+    goal: >-
+      On Wikipedia, visit the articles for Mercury, Venus, Earth, Mars,
+      Jupiter, Saturn, Uranus, Neptune, Pluto, and Ceres, and report how many
+      moons each one has.
+    max_decisions: 80
+    checks:
+      - {type: answer_contains_min, values: [Mercury, Venus, Earth, Mars, Jupiter, Saturn, Uranus, Neptune, Pluto, Ceres], min: 7}
+
+  - id: usd-thb
+    kind: extraction
+    goal: >-
+      Find how many Thai Baht 100 US dollars buys right now and report the
+      amount.
+    max_decisions: 40
+    checks:
+      - {type: answer_regex, pattern: "(?i)(THB|baht|฿)"}
+      - {type: answer_regex, pattern: "\\d[\\d,]*"}
+
+  - id: json-dumps-sig
+    kind: extraction
+    goal: >-
+      In the official Python documentation, find the json.dumps function and
+      report its full signature.
+    url: https://docs.python.org/3/
+    max_decisions: 40
+    expect_host: docs.python.org
+    checks:
+      - {type: answer_contains_all, values: [skipkeys, ensure_ascii]}
+
+  - id: mdn-flatmap
+    kind: extraction
+    goal: >-
+      On MDN Web Docs, find the Array.prototype.flatMap page and report its
+      syntax line.
+    url: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Array/flatMap
+    max_decisions: 40
+    expect_host: mozilla.org
+    checks:
+      - {type: answer_contains_all, values: [callbackFn]}
