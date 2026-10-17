@@ -35,7 +35,7 @@ def parse_files(override=None):
     return files
 
 
-def resolve_config(*, shadow_dom=None, frames=None, files=None):
+def resolve_config(*, shadow_dom=None, frames=None, files=None, tabs=None):
     if frames is None:
         chosen = env_choice("JEV_FRAMES", "same", {"same", "all", "off"})
     else:
@@ -47,6 +47,7 @@ def resolve_config(*, shadow_dom=None, frames=None, files=None):
         "frames": chosen,
         "frame_id": "f0",
         "files": parse_files(files),
+        "tabs": env_bool("JEV_TABS", True) if tabs is None else bool(tabs),
     }
 
 

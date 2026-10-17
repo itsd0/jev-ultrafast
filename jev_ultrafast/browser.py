@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 
 from browser_harness.admin import ensure_daemon
-from browser_harness.helpers import cdp
+from browser_harness.helpers import cdp, drain_events
 
 from .config import resolve_config, snapshot_config
 
@@ -33,6 +33,9 @@ class Browser:
         self.config = config or resolve_config()
         self.frame_sessions = {}
         self._target_sessions = {}
+        self.tabs = {}
+        self.active = None
+        self._tab_serial = 0
         ensure_daemon()
         visible = os.environ.get("JEV_VISIBLE_TAB", "").strip().lower() in {"1", "true", "yes", "on"}
         self.target = cdp("Target.createTarget", url="about:blank", background=not visible)["targetId"]
@@ -42,6 +45,12 @@ class Browser:
         self.call("Emulation.setDeviceMetricsOverride", width=1120, height=780, deviceScaleFactor=1, mobile=False)
         # Keep rAF/menus rendering in an owned background tab, without activating the user's Chrome tab.
         self.call("Emulation.setFocusEmulationEnabled", enabled=True)
+        self.active = self._register_tab(self.target, self.session, url)
+        if self.config.get("tabs", True):
+            try:
+                cdp("Target.setDiscoverTargets", discover=True)
+            except RuntimeError:
+                pass
         self.call("Page.navigate", url=url)
         deadline = time.monotonic() + 15
         while time.monotonic() < deadline:
@@ -116,7 +125,8 @@ class Browser:
     def _finish_observation(self, state):
         if self.config.get("frames") == "all" and state.get("cross_frames"):
             state = self._attach_oopif(state)
-        return bind_uploads(state, self.config.get("files") or {})
+        state = bind_uploads(state, self.config.get("files") or {})
+        return bind_tabs(state, self)
 
     def _attach_oopif(self, state):
         """Attach each visible cross-origin frame once per observation. Same-origin frames are already inlined."""
@@ -233,6 +243,14 @@ class Browser:
             raise StalePage("Page changed since this decision. Observe again.")
         if action["kind"] == "wait":
             time.sleep(0.1)
+        if action["kind"] == "switch_tab":
+            self.activate(action.get("tab"))
+            self.after_input = None
+            return {"executed": action["id"]}
+        if action["kind"] == "close_tab":
+            self.close_active()
+            self.after_input = None
+            return {"executed": action["id"]}
         session = self.session
         if action.get("route"):
             session = self.frame_sessions.get(action["route"])
@@ -249,9 +267,75 @@ class Browser:
         return result
 
     def close(self):
-        if self.target:
-            cdp("Target.closeTarget", targetId=self.target)
-            self.target = None
+        owned = [tab["target"] for tab in self.tabs.values()]
+        if not owned and getattr(self, "target", None):
+            owned = [self.target]
+        targets = owned
+        self.target = None
+        self.tabs = {}
+        for target in targets:
+            try:
+                cdp("Target.closeTarget", targetId=target)
+            except RuntimeError:
+                pass
+
+    def _register_tab(self, target_id, session, url, opener=None):
+        for key, tab in self.tabs.items():
+            if tab["target"] == target_id:
+                tab.update(session=session, url=url or tab.get("url") or "")
+                return key
+        if len(self.tabs) >= 5:
+            return None
+        self._tab_serial += 1
+        key = f"t{self._tab_serial}"
+        self.tabs[key] = {"target": target_id, "session": session, "url": url or "", "opener": opener}
+        return key
+
+    def activate(self, key):
+        tab = self.tabs.get(key)
+        if not tab:
+            raise StalePage("Tab is gone. Observe again.")
+        self.active = key
+        self.target = tab["target"]
+        self.session = tab["session"]
+        return tab
+
+    def close_active(self):
+        if len(self.tabs) <= 1:
+            raise ValueError("The last tab stays open")
+        key = self.active
+        tab = self.tabs.pop(key)
+        try:
+            cdp("Target.closeTarget", targetId=tab["target"])
+        except RuntimeError:
+            pass
+        self.activate(next(iter(self.tabs)))
+        return key
+
+    def collect_new_tabs(self):
+        """Attach pages opened by one of our tabs. Code-owned ids stay t1, t2, ..."""
+        if not self.config.get("tabs", True):
+            return []
+        try:
+            events = drain_events()
+        except RuntimeError:
+            return []
+        owned = {tab["target"] for tab in self.tabs.values()}
+        opened = []
+        for info in new_page_targets(events, owned):
+            if len(self.tabs) >= 5:
+                break
+            target_id = info["targetId"]
+            try:
+                session = cdp("Target.attachToTarget", targetId=target_id, flatten=True)["sessionId"]
+                cdp("Emulation.setFocusEmulationEnabled", session_id=session, enabled=True)
+            except (RuntimeError, KeyError, TypeError):
+                continue
+            key = self._register_tab(target_id, session, info.get("url") or "", info.get("openerId"))
+            if key:
+                opened.append(key)
+                owned.add(target_id)
+        return opened
 
 
 def fingerprint(state):
@@ -259,6 +343,46 @@ def fingerprint(state):
     if state.get("frame_keys"):
         content["frame_keys"] = state["frame_keys"]
     return hashlib.sha256(json.dumps(content, sort_keys=True).encode()).hexdigest()
+
+
+def new_page_targets(events, owned_ids):
+    """Pages whose opener is one of our targets. Unrelated Chrome tabs are ignored."""
+    found = []
+    seen = set(owned_ids)
+    for event in events or []:
+        if event.get("method") not in {"Target.targetCreated", "Target.attachedToTarget"}:
+            continue
+        info = (event.get("params") or {}).get("targetInfo") or {}
+        if info.get("type") != "page":
+            continue
+        target_id = info.get("targetId")
+        if info.get("openerId") not in owned_ids or not target_id or target_id in seen:
+            continue
+        seen.add(target_id)
+        found.append(info)
+    return found
+
+
+def bind_tabs(state, browser):
+    """Add SWITCH_TAB / CLOSE_TAB controls. Choice ids are t1, t2, not CDP target ids."""
+    tabs = getattr(browser, "tabs", {}) or {}
+    if not (getattr(browser, "config", None) or {}).get("tabs", True) or len(tabs) <= 1:
+        return state
+    actions = [action for action in state.get("actions", []) if action.get("kind") not in {"switch_tab", "close_tab"}]
+    active = getattr(browser, "active", None)
+    for key, tab in tabs.items():
+        if key == active:
+            continue
+        actions.append({
+            "id": f"switch:{key}",
+            "kind": "switch_tab",
+            "tab": key,
+            "label": f"Switch to tab {tab.get('url') or key}",
+        })
+    actions.append({"id": "close_tab", "kind": "close_tab", "label": "Close current tab"})
+    updated = {**state, "actions": actions}
+    updated["fingerprint"] = fingerprint(updated)
+    return updated
 
 
 def _upload_key_ok(key):

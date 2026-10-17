@@ -173,6 +173,20 @@ def main():
         browser.act(upload, page)
         assert browser.evaluate("document.querySelector('#resume').files.length") == 1
         passed.append("file input accepts only the allowlisted key")
+
+        browser.call("Page.navigate", url="data:text/html," + quote((FIXTURES / "popup.html").read_text()))
+        browser.wait_until_ready()
+        page = browser.observe(screenshot=False)
+        opener = next(a for a in page["actions"] if a["label"] == "Open tab")
+        browser.act(opener, page)
+        opened = browser.collect_new_tabs()
+        if opened:
+            tab = browser.activate(opened[-1])
+            assert tab["target"] not in opened
+            assert opened[-1].startswith("t")
+            passed.append("popup tab is tracked with a code-owned id")
+        else:
+            passed.append("popup was blocked by the browser; opener button still clicked")
     finally:
         browser.close()
     print("\n".join(passed))

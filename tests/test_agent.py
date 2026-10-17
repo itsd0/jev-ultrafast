@@ -264,6 +264,29 @@ def test_no_progress_stop_has_no_shadow_reason(runner):
     assert "blocked_reason" not in runner.state
 
 
+def test_new_tab_is_recorded_on_the_action(runner):
+    class Tabs:
+        def __init__(self):
+            browser = runner.state["browser"]
+            self.fresh = browser.fresh
+            self.act = browser.act
+            self.observe = browser.observe
+            self.wait_until_ready = browser.wait_until_ready
+            self.settled = browser.settled
+
+        def collect_new_tabs(self):
+            return ["t2"]
+
+        def activate(self, key):
+            assert key == "t2"
+            return {"url": "https://example.test/popup"}
+
+    runner.state["browser"] = Tabs()
+    runner.state["decision"] = {**decision("e3"), "operation": "CLICK"}
+    runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    assert runner.state["history"][-1]["note"] == "switched to new tab https://example.test/popup"
+
+
 def test_executed_action_resets_blocked_streak(runner):
     runner.blocked_streak = 2
     runner.state["decision"] = {**decision("e3"), "operation": "CLICK"}

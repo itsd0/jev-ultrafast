@@ -12,7 +12,16 @@ from .questions import MAX_STEPS
 
 class Agent:
     def __init__(
-        self, url, goals, *, record_dir=None, screenshots=False, shadow_dom=None, frames=None, files=None
+        self,
+        url,
+        goals,
+        *,
+        record_dir=None,
+        screenshots=False,
+        shadow_dom=None,
+        frames=None,
+        files=None,
+        tabs=None,
     ):
         task = goals.strip() if isinstance(goals, str) else "\n".join(goals).strip()
         if not task:
@@ -20,7 +29,7 @@ class Agent:
         plan = [task]
         self.pending_text = None
         self.blocked_streak = 0
-        self.config = resolve_config(shadow_dom=shadow_dom, frames=frames, files=files)
+        self.config = resolve_config(shadow_dom=shadow_dom, frames=frames, files=files, tabs=tabs)
         self.browser = Browser(url, config=self.config)
         self.record_dir = Path(record_dir) if record_dir else None
         self.screenshots = screenshots or bool(record_dir)
@@ -131,6 +140,13 @@ class Agent:
             state["browser"].act(action, page, text=text)
             self.pending_text = None
             self.blocked_streak = 0
+            switched = None
+            if getattr(type(state["browser"]), "collect_new_tabs", None):
+                opened = state["browser"].collect_new_tabs()
+                if opened:
+                    tab = state["browser"].activate(opened[-1])
+                    url = tab.get("url") if isinstance(tab, dict) else ""
+                    switched = f"switched to new tab {url or opened[-1]}"
             state["browser"].wait_until_ready()
             state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
             # Record execution before observing. A stale post-action observation must not erase the action.
@@ -149,6 +165,7 @@ class Agent:
                     "operation": decision["operation"],
                     "target": decision["target"],
                     "possible_closed_shadow": bool(action.get("possible_closed_shadow")),
+                    "note": switched,
                     "page_changed": None,
                     "url": page["url"],
                     "usage": decision["usage"],

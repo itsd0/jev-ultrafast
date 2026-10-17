@@ -47,3 +47,7 @@ Cross-origin frames are not readable from the parent. With `frames=all`, one `Pa
 ## File upload
 
 `input[type=file]` is collected as `UPLOAD_FILE`. With no allowlist the action is removed before the model sees the page, so the operation is not offered. `JEV_UPLOAD_FILES` or `Agent(..., files={"resume": "/absolute/resume.pdf"})` expands one target per key. Keys cannot contain a slash or `..`. The target id is `index:key`. The request sent to TypeSafe contains the key and the field label, not the path. Execution calls `DOM.setFileInputFiles` with `os.path.realpath` of the allowlisted entry. A path planted on the action is ignored. An unknown key raises before any CDP call.
+
+## Popup tabs
+
+`JEV_TABS` defaults on (`Agent(..., tabs=True)`). `Target.setDiscoverTargets` runs once at startup. After each action, `drain_events` keeps `Target.targetCreated` / `Target.attachedToTarget` pages whose `openerId` is one of our targets. Other Chrome tabs are ignored. Each accepted page gets a code-owned id `t1`…`t5`. The sixth page is not tracked. The agent activates the new tab and stores `switched to new tab <url>` on that history entry before the next observation. `SWITCH_TAB` targets are those ids. `CLOSE_TAB` closes the current tab and returns to a remaining one. The last tab cannot be closed. Input still uses the session stored for that id, never a model-supplied target id.

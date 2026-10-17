@@ -106,6 +106,15 @@ def action_space(actions):
     operations = {"click": "CLICK", "fill": "TYPE_TEXT", "select": "SELECT", "upload": "UPLOAD_FILE"}
     for action in actions:
         kind = action["kind"]
+        if kind == "switch_tab":
+            tab = action.get("tab")
+            if not isinstance(tab, str) or not tab.startswith("t") or not tab[1:].isdigit():
+                continue
+            targets.setdefault("SWITCH_TAB", {})[tab] = action
+            continue
+        if kind == "close_tab":
+            controls["CLOSE_TAB"] = action
+            continue
         if kind not in operations:
             controls[action["id"].upper()] = action
             continue
@@ -149,6 +158,7 @@ def choose(state, goal, history):
         "TYPE_TEXT": "Enter or replace text in an editable field. A small LLM will supply the value from the goal.",
         "SELECT": "Select an observed dropdown value.",
         "UPLOAD_FILE": "Upload an allowlisted file. Choose the offered key. A key is not a filesystem path.",
+        "SWITCH_TAB": "Switch to another tab opened by this task. Choose an offered tab id.",
     }
     operations = {key: labels[key] for key in targets}
     operations.update({key: value["label"] for key, value in controls.items()})
