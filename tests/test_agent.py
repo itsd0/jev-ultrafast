@@ -597,6 +597,50 @@ def _checker(page_state):
     }
 
 
+def test_unchanged_action_is_hidden_for_two_steps():
+    from jev_ultrafast.agent import decay_holds, note_no_progress, offered_actions, reload_like
+
+    actions = [
+        {"id": "e31", "kind": "click", "label": "Reload"},
+        {"id": "e22", "kind": "click", "label": "Search"},
+        {"id": "wait", "kind": "wait", "label": "Wait"},
+    ]
+    holds = note_no_progress({}, actions[0], page_changed=False)
+    assert [a["id"] for a in offered_actions(actions, holds)] == ["e22", "wait"]
+    holds = decay_holds(holds)
+    assert "e31" not in [a["id"] for a in offered_actions(actions, holds)]
+    holds = decay_holds(holds)
+    assert [a["id"] for a in offered_actions(actions, holds)] == ["e31", "e22", "wait"]
+    assert note_no_progress({}, actions[0], page_changed=True) == {}
+    assert note_no_progress({}, actions[2], page_changed=False) == {}
+    assert reload_like({"label": "Reload"})
+    assert reload_like({"label": "Refresh the list"})
+    assert not reload_like({"label": "Search"})
+    assert not reload_like({"label": "Preloaded content"})
+
+
+def test_reload_without_change_waits_before_the_next_decision(monkeypatch, runner):
+    runner.state["page"]["fingerprint"] = "fp1"
+    runner.state["page"]["actions"].append({"id": "e31", "kind": "click", "label": "Reload", "node": 9})
+    runner.state["decision"] = {
+        "choice": "e31",
+        "operation": "CLICK",
+        "target": "9",
+        "confidence": 1,
+        "probabilities": {"e31": 1},
+        "latency_ms": 1,
+        "usage": {},
+    }
+    same = {**runner.state["page"], "fingerprint": "fp1"}
+    runner.state["browser"].observe.return_value = same
+    runner.state["browser"].wait_for_refresh.return_value = same
+    runner.state["browser"].wait_until_ready.return_value = True
+    runner.command("act", {"fingerprint": "fp1"})
+    runner.state["browser"].wait_for_refresh.assert_called_once()
+    assert runner.state["history"][-1]["page_changed"] is False
+    assert runner.state["held_actions"]["e31"] == 2
+
+
 def test_invalid_text_retries_once_at_low_effort_then_succeeds(monkeypatch):
     monkeypatch.setenv("TEXT_MODEL_API_KEY", "test")
     monkeypatch.setenv("TEXT_MODEL", "mercury-2.5")

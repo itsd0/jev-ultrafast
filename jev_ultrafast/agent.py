@@ -2,6 +2,7 @@
 
 import base64
 import os
+import re
 import time
 from pathlib import Path
 
@@ -20,6 +21,40 @@ from .model import (
 )
 from .questions import MAX_STEPS
 from .vision import confirm_point, needs_vision, propose
+
+_RELOAD_WORDS = frozenset({"reload", "refresh"})
+
+
+def reload_like(action):
+    """A control whose name says it loads the page again. Not tied to one site."""
+    words = set(re.findall(r"[a-z]+", (action.get("label") or "").casefold()))
+    return bool(words & _RELOAD_WORDS)
+
+
+def note_no_progress(holds, action, page_changed):
+    """Hide an unchanged action for the next two decisions. A wait stays available."""
+    holds = dict(holds or {})
+    action_id = action.get("id")
+    if page_changed or not action_id or action.get("kind") == "wait":
+        return holds
+    holds[action_id] = 2
+    return holds
+
+
+def offered_actions(actions, holds):
+    held = holds or {}
+    return [action for action in actions if held.get(action.get("id"), 0) <= 0]
+
+
+def decay_holds(holds):
+    return {key: left - 1 for key, left in (holds or {}).items() if left - 1 > 0}
+
+
+def page_for_choice(state):
+    holds = state.get("held_actions") or {}
+    if not holds:
+        return state["page"]
+    return {**state["page"], "actions": offered_actions(state["page"]["actions"], holds)}
 
 
 class Agent:
@@ -126,16 +161,17 @@ class Agent:
             "model": "vision",
         }
 
-    def _decide(self, state):
+    def _decide(self, state, page=None):
+        page = page or state["page"]
         if decision_provider() != "mercury":
-            return choose(state["page"], state["goal"], state["history"])
+            return choose(page, state["goal"], state["history"])
         fresh_requirements = state.get("requirements_goal") != state["goal"]
         if fresh_requirements:
             state["requirements"] = decompose_goal(state["goal"])
             state["requirements_goal"] = state["goal"]
             state["requirement_progress"] = {}
         decision = choose_mercury(
-            state["page"],
+            page,
             state["goal"],
             state["history"],
             state["requirements"],
@@ -181,7 +217,8 @@ class Agent:
                 raise ValueError("This run has stopped. Start a fresh demo.")
             if len(state["decisions"]) >= MAX_STEPS * 2:
                 raise ValueError("Reached the demo's model-call budget")
-            state["decision"] = self._maybe_vision(state) or self._decide(state)
+            state["decision"] = self._maybe_vision(state) or self._decide(state, page_for_choice(state))
+            state["held_actions"] = decay_holds(state.get("held_actions"))
             state["decisions"].append(
                 {
                     **state["decision"],
@@ -302,11 +339,24 @@ class Agent:
                 }
             )
             state["page"] = state["browser"].observe(screenshot=self.screenshots)
+            changed = state["page"]["fingerprint"] != page["fingerprint"]
+            if not changed and reload_like(action) and getattr(state["browser"], "wait_for_refresh", None):
+                refreshed = state["browser"].wait_for_refresh(
+                    page["fingerprint"], timeout=3, screenshot=self.screenshots
+                )
+                if isinstance(refreshed, dict) and refreshed.get("fingerprint"):
+                    state["page"] = refreshed
+                    changed = refreshed["fingerprint"] != page["fingerprint"]
             state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
             state["history"][-1].update(
-                page_changed=state["page"]["fingerprint"] != page["fingerprint"],
+                page_changed=changed,
                 url=state["page"]["url"],
                 elapsed_ms=state["elapsed_ms"],
+            )
+            state["held_actions"] = note_no_progress(
+                state.get("held_actions"),
+                {"id": selected, "kind": action.get("kind")},
+                changed,
             )
             if state["record"]:
                 (self.record_dir / f"{state['elapsed_ms']:06d}.jpg").write_bytes(

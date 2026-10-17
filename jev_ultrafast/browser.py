@@ -233,6 +233,52 @@ class Browser:
             return current == [page["page_key"], page["guards"].get(guard_key)]
         return self.evaluate(marker_expression(self.config)) == page["marker"]
 
+    def wait_for_refresh(self, previous_fingerprint, timeout=3.0, screenshot=False):
+        """After a reload-like click, wait for a DOM change or for network traffic to finish.
+
+        Returns the latest observation. The wait stops at `timeout` seconds.
+        """
+        deadline = time.monotonic() + timeout
+        inflight = 0
+        saw_request = False
+        try:
+            self.call("Network.enable")
+        except (RuntimeError, TypeError):
+            pass
+        latest = None
+        while time.monotonic() < deadline:
+            try:
+                events = drain_events()
+            except RuntimeError:
+                events = []
+            for event in events or []:
+                method = event.get("method")
+                if method == "Network.requestWillBeSent":
+                    inflight += 1
+                    saw_request = True
+                elif method in {"Network.loadingFinished", "Network.loadingFailed"}:
+                    inflight = max(0, inflight - 1)
+            try:
+                latest = self.observe(screenshot=screenshot)
+            except StalePage:
+                time.sleep(0.1)
+                continue
+            if latest.get("fingerprint") != previous_fingerprint:
+                return latest
+            if saw_request and inflight == 0:
+                time.sleep(0.2)
+                try:
+                    return self.observe(screenshot=screenshot)
+                except StalePage:
+                    return latest
+            time.sleep(0.1)
+        if latest is None:
+            try:
+                return self.observe(screenshot=False)
+            except StalePage:
+                return None
+        return latest
+
     def wait_until_ready(self, timeout=10):
         """Bounded wait for document completion. Returns immediately if already ready."""
         deadline = time.monotonic() + timeout

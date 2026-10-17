@@ -48,3 +48,23 @@ The text helper now asks for `{"text": string}` with `json_schema` and `strict: 
 | typesafe | flights | 3 | False | 10.147 | 16 | 22 | 273.5 | 0 | 132152 | 10470 |
 
 Wikipedia and the hotel fixture passed 6/6, each ending on DONE. Flights for November 16, 2026 passed 2/3. Run 3 set one-way, Zürich, London, and the date, then clicked Reload until three no-progress actions stopped it. The results check failed. That was not a text-JSON failure.
+
+## TypeSafe re-run after the reload wait
+
+A reload or refresh click that does not change the page now waits up to 3 seconds for a DOM change or for network traffic to finish. An action that still leaves the page unchanged is hidden for the next two decisions. The same TypeSafe plus Mercury 2.5 `instant` setup, Chrome on port 9222, November 16 2026. Wikipedia and hotel n=3, flights n=5. No text step was skipped.
+
+| provider | task | run | verified | total s | actions | decision calls | median decision ms | verifier calls | input tokens | output tokens |
+| --- | --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| typesafe | wiki | 1 | True | 3.215 | 2 | 3 | 314 | 0 | 22752 | 1863 |
+| typesafe | wiki | 2 | True | 3.083 | 2 | 4 | 299.0 | 0 | 29643 | 2419 |
+| typesafe | wiki | 3 | True | 3.166 | 2 | 4 | 290.5 | 0 | 29643 | 2436 |
+| typesafe | hotel | 1 | True | 2.973 | 5 | 6 | 300.0 | 0 | 23144 | 1920 |
+| typesafe | hotel | 2 | True | 3.428 | 5 | 6 | 278.5 | 0 | 23140 | 1964 |
+| typesafe | hotel | 3 | True | 2.699 | 5 | 6 | 284.0 | 0 | 23133 | 1972 |
+| typesafe | flights | 1 | True | 9.082 | 11 | 17 | 302 | 0 | 107082 | 8437 |
+| typesafe | flights | 2 | True | 9.298 | 11 | 17 | 305 | 0 | 107076 | 8429 |
+| typesafe | flights | 3 | True | 8.069 | 11 | 17 | 294 | 0 | 107080 | 8397 |
+| typesafe | flights | 4 | True | 9.945 | 10 | 19 | 302 | 0 | 128728 | 9712 |
+| typesafe | flights | 5 | True | 8.871 | 11 | 17 | 318 | 0 | 107076 | 8436 |
+
+Wikipedia 3/3, hotel 3/3, and flights 5/5 all ended on DONE, and the independent checks passed 11/11. Flights walls were 8.069–9.945 s.

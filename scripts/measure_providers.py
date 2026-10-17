@@ -166,7 +166,8 @@ def main():
         report["arms"][arm] = {"provider": provider, "tasks": {}}
         for task in tasks:
             rows = []
-            for index in range(3):
+            repeats = {"wiki": 3, "hotel": 3, "flights": 5}.get(task, 3)
+            for index in range(repeats):
                 print(f"\n=== {arm} {task} run {index + 1} ===", flush=True)
                 if task == "wiki":
                     row = run_agent(WIKI, WIKI_GOAL, verify_wiki)
