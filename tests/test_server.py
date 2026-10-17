@@ -36,12 +36,29 @@ def snap(status, steps, url="https://example.test/"):
     }
 
 
+class FakeBrowser:
+    def __init__(self, fail_screencast=False):
+        self.session = "sess-1"
+        self.calls = []
+        self.fail_screencast = fail_screencast
+        self.cloud = None
+
+    def call(self, method, **params):
+        self.calls.append((method, params))
+        if method == "Page.startScreencast" and self.fail_screencast:
+            raise RuntimeError("no screencast")
+        if method == "Page.captureScreenshot":
+            return {"data": "shot-bytes"}
+        return {}
+
+
 class FakeAgent:
     def __init__(self, url, goal, script, screenshots=False):
         self.url = url
         self.goal = goal
         self.script = script
         self.config = {}
+        self.browser = None
         self.closed = False
         self.ticks = 0
         self.last = snap("running", 0)
@@ -65,11 +82,12 @@ def start_service(tmp_path, monkeypatch):
     monkeypatch.delenv("JEV_SERVER_TOKEN", raising=False)
     services = []
 
-    def start(script, max_concurrent=2, token=""):
+    def start(script, max_concurrent=2, token="", browser=None):
         fakes = []
 
         def factory(url, goal, screenshots=False):
             fake = FakeAgent(url, goal, script, screenshots=screenshots)
+            fake.browser = browser() if callable(browser) else browser
             fakes.append(fake)
             return fake
 
@@ -206,6 +224,196 @@ def test_bearer_token_gates_the_api(start_service):
     assert api(base, "GET", "/api/tasks", token="secret")[0] == 200
     status, _ = api(base, "POST", "/api/tasks", {"goal": "x", "url": "https://example.test/"})
     assert status == 401
+
+
+def read_sse_image(base, task_id, timeout=10):
+    import http.client
+    from urllib.parse import urlparse
+
+    parts = urlparse(base)
+    conn = http.client.HTTPConnection(parts.hostname, parts.port, timeout=timeout)
+    conn.request("GET", f"/api/tasks/{task_id}/live")
+    response = conn.getresponse()
+    assert response.status == 200
+    image = None
+    deadline = time.time() + timeout
+    while time.time() < deadline and image is None:
+        line = response.readline()
+        if line.startswith(b"data:"):
+            image = json.loads(line[len(b"data:"):]).get("image")
+    conn.close()
+    return image
+
+
+def wait_for_call(browser, method, timeout=10):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if method in [name for name, _ in browser.calls]:
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def test_live_screencast_streams_and_acks(start_service, monkeypatch):
+    gate = threading.Event()
+    frame = {
+        "method": "Page.screencastFrame",
+        "params": {"data": "frame-bytes", "sessionId": "frame-1"},
+        "session_id": "sess-1",
+    }
+    acks = []
+
+    def fake_cdp(method, session_id=None, **params):
+        acks.append((method, session_id, params))
+        return {}
+
+    monkeypatch.setattr(hosted.harness_helpers, "drain_events", lambda: [frame])
+    monkeypatch.setattr(hosted.harness_helpers, "cdp", fake_cdp)
+    browser = FakeBrowser()
+    base, _ = start_service(
+        lambda fake: snap("done", 1) if gate.wait(timeout=10) else snap("done", 1),
+        browser=browser,
+    )
+    _, created = api(base, "POST", "/api/tasks", {"goal": "Watch", "url": "https://example.test/"})
+    wait_for(base, created["id"], {"running"})
+    assert read_sse_image(base, created["id"]) == "frame-bytes"
+    assert ("Page.startScreencast", {"format": "jpeg", "quality": 60, "maxWidth": 1120,
+                                     "everyNthFrame": 2}) in browser.calls
+    assert ("Page.screencastFrameAck", "sess-1", {"sessionId": "frame-1"}) in acks
+    assert wait_for_call(browser, "Page.stopScreencast")
+    gate.set()
+    assert wait_for(base, created["id"], {"done"})["status"] == "done"
+
+
+def test_live_waits_for_browser_startup(monkeypatch):
+    from http.server import ThreadingHTTPServer
+
+    frame = {
+        "method": "Page.screencastFrame",
+        "params": {"data": "frame-bytes", "sessionId": "frame-1"},
+        "session_id": "sess-1",
+    }
+    monkeypatch.setattr(hosted.harness_helpers, "drain_events", lambda: [frame])
+    monkeypatch.setattr(hosted.harness_helpers, "cdp", lambda *a, **k: {})
+    gate = threading.Event()
+    run_gate = threading.Event()
+    browser = FakeBrowser()
+
+    def script(fake):
+        if fake.ticks == 1:
+            run_gate.wait(timeout=10)
+            return snap("running", 0)
+        return snap("done", 0)
+
+    def factory(url, goal, screenshots=False):
+        gate.wait(timeout=10)
+        fake = FakeAgent(url, goal, script, screenshots=screenshots)
+        fake.browser = browser
+        return fake
+
+    # A service whose factory blocks until the viewer is already waiting.
+    store = hosted.Store(":memory:")
+    runner = hosted.Runner(store, agent_factory=factory)
+    handler = type("Handler", (hosted.Handler,), {})
+    handler.STORE = store
+    handler.RUNNER = runner
+    handler.HOST = "127.0.0.1"
+    handler.TOKEN = ""
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    handler.PORT = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        base = f"http://127.0.0.1:{handler.PORT}"
+        _, created = api(base, "POST", "/api/tasks", {"goal": "Slow start", "url": "https://x.test/"})
+        seen = {}
+        reader = threading.Thread(
+            target=lambda: seen.setdefault("image", read_sse_image(base, created["id"])),
+            daemon=True,
+        )
+        reader.start()
+        time.sleep(0.5)
+        gate.set()
+        reader.join(timeout=10)
+        assert seen.get("image") == "frame-bytes"
+        run_gate.set()
+        assert wait_for(base, created["id"], {"done"})["status"] == "done"
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+def test_live_falls_back_to_screenshots(start_service):
+    gate = threading.Event()
+    browser = FakeBrowser(fail_screencast=True)
+    base, _ = start_service(
+        lambda fake: snap("done", 1) if gate.wait(timeout=15) else snap("done", 1),
+        browser=browser,
+    )
+    _, created = api(base, "POST", "/api/tasks", {"goal": "Watch", "url": "https://example.test/"})
+    wait_for(base, created["id"], {"running"})
+    assert read_sse_image(base, created["id"]) == "shot-bytes"
+    assert "Page.captureScreenshot" in [name for name, _ in browser.calls]
+    gate.set()
+    assert wait_for(base, created["id"], {"done"})["status"] == "done"
+
+
+def test_live_unavailable_states(start_service):
+    browser = FakeBrowser()
+    base, _ = start_service(lambda fake: snap("done", 0), browser=browser)
+    _, created = api(base, "POST", "/api/tasks", {"goal": "Quick", "url": "https://example.test/"})
+    wait_for(base, created["id"], {"done"})
+    import http.client
+    from urllib.parse import urlparse
+
+    def live_status(service_base, task_id):
+        parts = urlparse(service_base)
+        conn = http.client.HTTPConnection(parts.hostname, parts.port, timeout=5)
+        conn.request("GET", f"/api/tasks/{task_id}/live")
+        status = conn.getresponse().status
+        conn.close()
+        return status
+
+    assert live_status(base, "nope") == 404
+    assert live_status(base, created["id"]) == 409
+    gate = threading.Event()
+    base2, _ = start_service(
+        lambda fake: snap("done", 1) if gate.wait(timeout=10) else snap("done", 1),
+        browser=FakeBrowser(),
+    )
+    _, cloud = api(base2, "POST", "/api/tasks", {
+        "goal": "Cloud", "url": "https://example.test/", "browser": "cloud",
+    })
+    wait_for(base2, cloud["id"], {"running"})
+    assert live_status(base2, cloud["id"]) == 409
+    gate.set()
+    assert wait_for(base2, cloud["id"], {"done"})["status"] == "done"
+
+
+def test_live_url_is_transient_never_in_db(start_service, tmp_path, monkeypatch):
+    import sqlite3
+
+    monkeypatch.setenv("JEV_CLOUD_SHOW_LIVE_URL", "1")
+    gate = threading.Event()
+    browser = FakeBrowser()
+    browser.cloud = {"live_url": "https://example.invalid/live/1"}
+    base, _ = start_service(
+        lambda fake: snap("done", 1) if gate.wait(timeout=10) else snap("done", 1),
+        browser=browser,
+    )
+    _, created = api(base, "POST", "/api/tasks", {
+        "goal": "Cloud", "url": "https://example.test/", "browser": "cloud",
+    })
+    wait_for(base, created["id"], {"running"})
+    _, running = api(base, "GET", f"/api/tasks/{created['id']}")
+    assert running["live_url"] == "https://example.invalid/live/1"
+    gate.set()
+    done = wait_for(base, created["id"], {"done"})
+    assert done["live_url"] is None
+    conn = sqlite3.connect(tmp_path / "runs-0.db")
+    assert conn.execute("SELECT live_url FROM tasks WHERE id = ?", (created["id"],)).fetchone() == (None,)
+    conn.close()
 
 
 def test_task_validation(start_service):

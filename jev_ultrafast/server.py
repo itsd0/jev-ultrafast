@@ -343,10 +343,11 @@ class FramePump:
 class Runner:
     """In-process FIFO queue. Worker threads drive one Agent each, tick by tick."""
 
-    def __init__(self, store, max_concurrent=2, agent_factory=None):
+    def __init__(self, store, max_concurrent=2, agent_factory=None, daemon_name=None):
         self.store = store
         self.max_concurrent = max(1, int(max_concurrent))
         self.agent_factory = agent_factory or Agent
+        self.pump = FramePump(daemon_name or os.environ.get("BU_NAME", "default"))
         self._pending = deque()
         self._active = {}
         self._cond = threading.Condition()
@@ -449,6 +450,49 @@ class Runner:
             flush=True,
         )
 
+    def wait_for_viewer(self, task_id, timeout=20):
+        """Like get_viewer, but waits out queueing and browser startup."""
+        deadline = time.monotonic() + timeout
+        while True:
+            viewer, status = self.get_viewer(task_id)
+            if viewer is not None or status == 404:
+                return viewer, status
+            task = self.store.get_task(task_id)
+            if task is None or task["status"] in TERMINAL or task["browser"] != "local":
+                return None, status
+            if time.monotonic() >= deadline:
+                return None, status
+            time.sleep(0.2)
+
+    def get_viewer(self, task_id):
+        """A task's live frame source, or (None, status) when unavailable."""
+        with self._cond:
+            entry = self._active.get(task_id)
+        task = self.store.get_task(task_id)
+        if task is None:
+            return None, 404
+        if task["status"] != "running" or entry is None or task["browser"] != "local":
+            return None, 409
+        browser = getattr(entry.get("agent"), "browser", None)
+        session = getattr(browser, "session", None)
+        call = getattr(browser, "call", None)
+        if session is None or call is None:
+            return None, 409
+        with self._cond:
+            viewer = entry.get("viewer")
+            if viewer is None:
+                viewer = Viewer(self.pump, call, session)
+                entry["viewer"] = viewer
+        return viewer, 200
+
+    def live_url(self, task_id):
+        """A running cloud task's live view. In-memory only, never in the DB."""
+        with self._cond:
+            entry = self._active.get(task_id)
+        if entry is None:
+            return None
+        return entry.get("live_url")
+
     def _run_task(self, task_id):
         with self._cond:
             stopper = self._active[task_id]["stop"]
@@ -456,9 +500,9 @@ class Runner:
         agent = None
         try:
             agent = self._create_agent(self.store.get_task(task_id))
-            live_url = live_url_for(agent)
-            if live_url:
-                self.store.update_task(task_id, live_url=live_url)
+            with self._cond:
+                self._active[task_id]["agent"] = agent
+                self._active[task_id]["live_url"] = live_url_for(agent)
             recorded = 0
             while True:
                 snapshot = agent.command("tick")
@@ -483,11 +527,14 @@ class Runner:
                 except Exception:
                     pass
             with self._cond:
-                self._active.pop(task_id, None)
+                entry = self._active.pop(task_id, None)
                 self._cond.notify()
+            if entry is not None and entry.get("viewer") is not None:
+                entry["viewer"].shutdown()
 
 
 class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
     STORE = None
     RUNNER = None
     HOST = "127.0.0.1"
@@ -526,13 +573,53 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(401, json.dumps({"error": "Bearer token required"}))
         if path == "/api/tasks":
             return self.send(200, json.dumps(self.STORE.list_tasks()))
+        if path.startswith("/api/tasks/") and path.endswith("/live"):
+            return self.stream_live(path.removeprefix("/api/tasks/").removesuffix("/live"))
         task_id = path.removeprefix("/api/tasks/")
         if "/" in task_id or not task_id:
             return self.send(404, json.dumps({"error": "Not found"}))
         task = self.STORE.get_task(task_id)
         if task is None:
             return self.send(404, json.dumps({"error": "Unknown task"}))
+        task["live_url"] = self.RUNNER.live_url(task_id)
         return self.send(200, json.dumps(task))
+
+    def stream_live(self, task_id):
+        viewer, status = self.RUNNER.wait_for_viewer(task_id)
+        if viewer is None:
+            if status == 404:
+                return self.send(404, json.dumps({"error": "Unknown task"}))
+            return self.send(409, json.dumps({"error": "Live view needs a running local task"}))
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+        viewer.add_viewer()
+        try:
+            self.wfile.write(b": connected\n\n")
+            self.wfile.flush()
+            last_seq = 0
+            while True:
+                with viewer.cond:
+                    viewer.cond.wait_for(lambda: viewer.seq > last_seq, timeout=1.0)
+                task = self.STORE.get_task(task_id)
+                if task is None or task["status"] in TERMINAL:
+                    payload = {"ended": True, "status": (task or {}).get("status")}
+                    self.wfile.write(f"data: {json.dumps(payload)}\n\n".encode())
+                    self.wfile.flush()
+                    return
+                if viewer.seq > last_seq:
+                    last_seq = viewer.seq
+                    payload = {"seq": last_seq, "image": viewer.latest}
+                    self.wfile.write(f"data: {json.dumps(payload)}\n\n".encode())
+                else:
+                    self.wfile.write(b": ping\n\n")
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        finally:
+            viewer.remove_viewer()
 
     def do_POST(self):
         origin = f"http://{self.HOST}:{self.PORT}"

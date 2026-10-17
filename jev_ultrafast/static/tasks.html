@@ -4,63 +4,101 @@
 <meta charset="utf-8">
 <title>Jev tasks</title>
 <style>
-  body { font-family: system-ui, sans-serif; max-width: 880px; margin: 2rem auto; padding: 0 1rem; color: #1a1a1a; }
-  h1 { font-size: 1.4rem; }
-  form, section { margin-bottom: 1.5rem; }
-  label { display: block; margin: 0.5rem 0; }
-  input, select, textarea { width: 100%; box-sizing: border-box; padding: 0.4rem; font: inherit; }
-  textarea { height: 4.5rem; }
-  .row { display: flex; gap: 0.75rem; }
+  :root { --bg: #141414; --panel: #1e1e1e; --line: #333; --text: #e8e8e8; --dim: #9a9a9a; --accent: #4caf7d; }
+  * { box-sizing: border-box; }
+  body { font-family: system-ui, sans-serif; margin: 0; padding: 1rem 1.5rem; background: var(--bg); color: var(--text); }
+  h1 { font-size: 1.2rem; margin: 0 0 1rem; }
+  h2 { font-size: 0.95rem; margin: 0 0 0.5rem; color: var(--dim); font-weight: 600; }
+  .layout { display: grid; grid-template-columns: 430px 1fr; gap: 1rem; align-items: start; }
+  .panel { background: var(--panel); border: 1px solid var(--line); padding: 0.9rem; margin-bottom: 1rem; }
+  label { display: block; margin: 0.5rem 0; font-size: 0.85rem; }
+  input, select, textarea { width: 100%; margin-top: 0.2rem; padding: 0.4rem; font: inherit; font-size: 0.85rem;
+    background: #111; color: var(--text); border: 1px solid var(--line); }
+  textarea { height: 4rem; resize: vertical; }
+  .row { display: flex; gap: 0.6rem; }
   .row label { flex: 1; }
-  button { padding: 0.45rem 1rem; font: inherit; cursor: pointer; }
-  button:disabled { cursor: default; opacity: 0.5; }
-  #error { color: #a00; }
-  table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
-  th, td { text-align: left; padding: 0.3rem 0.5rem; border-bottom: 1px solid #ddd; }
-  .muted { color: #555; font-size: 0.85rem; }
-  #history li { margin: 0.25rem 0; }
-  #history a { cursor: pointer; text-decoration: underline; }
+  button { padding: 0.45rem 1.1rem; font: inherit; font-size: 0.85rem; cursor: pointer;
+    background: var(--accent); color: #0c0c0c; border: 0; font-weight: 600; }
+  button:disabled { opacity: 0.45; cursor: default; }
+  button.ghost { background: transparent; color: var(--text); border: 1px solid var(--line); }
+  #error { color: #e57373; font-size: 0.85rem; }
+  .badge { display: inline-block; padding: 0.15rem 0.6rem; font-size: 0.8rem; font-weight: 600; }
+  .badge.queued { background: #444; } .badge.running { background: #8a6d1c; }
+  .badge.done { background: #2e6b46; } .badge.blocked, .badge.failed { background: #7a2e2e; }
+  .meta { font-size: 0.82rem; color: var(--dim); margin: 0.4rem 0; }
+  .meta b { color: var(--text); font-weight: 600; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.8rem; }
+  th, td { text-align: left; padding: 0.25rem 0.4rem; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--dim); font-weight: 600; }
+  td.url { word-break: break-all; color: var(--dim); }
+  #history { list-style: none; margin: 0; padding: 0; font-size: 0.82rem; }
+  #history li { padding: 0.3rem 0; border-bottom: 1px solid var(--line); cursor: pointer; }
+  #history li:hover { background: #262626; }
+  #history li.current { border-left: 3px solid var(--accent); padding-left: 0.4rem; }
+  #urlbar { font-size: 0.82rem; color: var(--dim); word-break: break-all; margin-bottom: 0.5rem; min-height: 1.2em; }
+  #livewrap { position: relative; background: #0a0a0a; border: 1px solid var(--line); min-height: 320px;
+    display: flex; align-items: center; justify-content: center; }
+  #live { max-width: 100%; display: none; }
+  #liveframe { width: 100%; height: 560px; border: 0; display: none; }
+  #liveidle { color: var(--dim); font-size: 0.85rem; padding: 2rem; text-align: center; }
+  @media (max-width: 900px) { .layout { grid-template-columns: 1fr; } }
 </style>
 </head>
 <body>
 <h1>Jev tasks</h1>
 <p id="error" hidden></p>
-<form id="task-form">
-  <label>Goal
-    <textarea id="goal" required maxlength="2000" placeholder="One natural-language goal"></textarea>
-  </label>
-  <label>Start URL
-    <input id="url" type="url" required placeholder="https://…">
-  </label>
-  <div class="row">
-    <label>Browser
-      <select id="browser">
-        <option value="local">local</option>
-        <option value="cloud">cloud</option>
-      </select>
-    </label>
-    <label>Max decisions (optional)
-      <input id="max-decisions" type="number" min="1" max="10000" placeholder="80">
-    </label>
-    <label>API token (if set)
-      <input id="token" type="password" autocomplete="off" placeholder="optional">
-    </label>
+<div class="layout">
+  <div>
+    <div class="panel">
+      <h2>New task</h2>
+      <form id="task-form">
+        <label>Goal
+          <textarea id="goal" required maxlength="2000" placeholder="One natural-language goal"></textarea>
+        </label>
+        <label>Start URL (optional — blank page navigates from the goal)
+          <input id="url" type="url" placeholder="https://…">
+        </label>
+        <div class="row">
+          <label>Browser
+            <select id="browser"><option value="local">local</option><option value="cloud">cloud</option></select>
+          </label>
+          <label>Max decisions
+            <input id="max-decisions" type="number" min="1" max="10000" placeholder="80">
+          </label>
+          <label>API token
+            <input id="token" type="password" autocomplete="off" placeholder="if set">
+          </label>
+        </div>
+        <button id="run" type="submit">Run</button>
+      </form>
+    </div>
+    <div class="panel">
+      <h2>Current task</h2>
+      <p><span id="badge" class="badge queued">none</span></p>
+      <p class="meta" id="current-meta">No task selected.</p>
+      <p><button id="stop" class="ghost" disabled>Stop</button></p>
+      <table>
+        <thead><tr><th>#</th><th>Operation</th><th>Target</th><th>ms</th></tr></thead>
+        <tbody id="steps"></tbody>
+      </table>
+    </div>
+    <div class="panel">
+      <h2>History</h2>
+      <ul id="history"></ul>
+    </div>
   </div>
-  <button id="run" type="submit">Run</button>
-</form>
-<section>
-  <h2>Current task</h2>
-  <p id="current-meta" class="muted">None selected.</p>
-  <p><button id="stop" disabled>Stop</button> <span id="live"></span></p>
-  <table>
-    <thead><tr><th>#</th><th>Operation</th><th>Target</th><th>URL</th><th>ms</th></tr></thead>
-    <tbody id="steps"></tbody>
-  </table>
-</section>
-<section>
-  <h2>History</h2>
-  <ul id="history"></ul>
-</section>
+  <div>
+    <div class="panel">
+      <h2>Live browser</h2>
+      <div id="urlbar"></div>
+      <div id="livewrap">
+        <img id="live" alt="live browser frame">
+        <iframe id="liveframe" title="cloud live view"></iframe>
+        <span id="liveidle">Run a task to watch its browser.</span>
+      </div>
+    </div>
+  </div>
+</div>
 <script src="/tasks.js"></script>
 </body>
 </html>
