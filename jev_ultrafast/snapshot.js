@@ -346,6 +346,7 @@
     const base={node, frame:frameId, role:rname, label, rect};
     if (generic) base.generic=true;
     if (offscreen) base.offscreen=true;
+    if (isPager(e,rname)) base.pager=true;
     if (rname==='button') {
       const stepped=stepperValue(e,label);
       if (stepped!==null) base.value=stepped;

@@ -2075,13 +2075,117 @@ def test_done_gate_rejects_wrong_page_without_judge(runner, monkeypatch):
     assert any("page 3" in note["text"] for note in runner.state["event_notes"])
 
 
+def test_rewrite_page_number_rules():
+    from jev_ultrafast.agent import rewrite_page_number
+
+    assert rewrite_page_number("https://news.ycombinator.com/?p=4", 3) == (
+        "https://news.ycombinator.com/?p=3"
+    )
+    assert rewrite_page_number("https://example.test/s?q=x&page=2", 3) == (
+        "https://example.test/s?q=x&page=3"
+    )
+    assert rewrite_page_number("https://quotes.toscrape.com/page/2/", 3) == (
+        "https://quotes.toscrape.com/page/3/"
+    )
+    assert rewrite_page_number("https://example.test/", 3) is None
+    assert rewrite_page_number("", 3) is None
+    assert rewrite_page_number("https://example.test/?p=4", None) is None
+
+
+def _pager_page(url, text="Search"):
+    state = page()
+    state["url"] = url
+    state["text"] = text
+    state["actions"] = [
+        *state["actions"],
+        {"id": "e9", "kind": "click", "label": "More", "role": "link", "node": 90, "pager": True},
+    ]
+    state["fingerprint"] = fingerprint(state)
+    return state
+
+
+def test_target_page_reached_holds_pagers(runner):
+    runner.state["goal"] = "Report the first item on the 3rd page"
+    runner.state["page"] = _pager_page("https://example.test/news?p=3")
+    runner.state["page_target"] = 3
+    runner.state["page_current"] = 3
+    assert "Target page reached: read it." in loop.compose_guidance(runner.state)
+    runner._hold_pagers_at_target(runner.state, 1)
+    key = loop.noop_key({"kind": "click", "label": "More", "role": "link"})
+    assert runner.state["held_actions"][key] == loop.PAGER_HOLD_STEPS
+    assert runner.state["hold_reasons"][key] == "pager hold"
+    shown = loop.page_for_choice(runner.state)
+    assert "More" not in [action["label"] for action in shown["actions"]]
+    assert "Go" in [action["label"] for action in shown["actions"]]
+
+
+def test_overshoot_from_page_4_navigates_to_page_3(runner, monkeypatch):
+    monkeypatch.setattr(loop, "choose", lambda *_args, **kwargs: decision("e1"))
+    monkeypatch.setattr(loop, "judge_progress", lambda context, system: _judgment())
+    p3 = _pager_page("https://example.test/news?p=3")
+    runner.state["goal"] = "Report the first item on the 3rd page"
+    runner.state["page"] = _pager_page("https://example.test/news?p=4")
+    runner.state["subgoals"] = []
+    runner.state["memo"] = []
+    runner.state["browser"].navigate = Mock(
+        return_value={"executed": "navigate", "url": p3["url"]}
+    )
+    runner.state["browser"].observe = Mock(return_value=p3)
+    runner.command("predict", {})
+    runner.state["browser"].navigate.assert_called_once_with("https://example.test/news?p=3")
+    assert runner.state["page_current"] == 3
+    assert runner.state["status"] == "predicted"
+    key = loop.noop_key({"kind": "click", "label": "More", "role": "link"})
+    assert key in (runner.state["held_actions"] or {})
+    assert "Target page reached: read it." in loop.compose_guidance(runner.state)
+
+
+def test_overshoot_without_a_page_marker_goes_back(runner, monkeypatch):
+    monkeypatch.setattr(loop, "choose", lambda *_args, **kwargs: decision("e1"))
+    monkeypatch.setattr(loop, "judge_progress", lambda context, system: _judgment())
+    back = _pager_page("https://example.test/news", "Results Page 3 of 12")
+    runner.state["goal"] = "Report the first item on the 3rd page"
+    runner.state["page"] = _pager_page("https://example.test/news", "Results Page 4 of 12")
+    runner.state["subgoals"] = []
+    runner.state["memo"] = []
+    runner.state["browser"].observe = Mock(return_value=back)
+    runner.command("predict", {})
+    runner.state["browser"].navigate.assert_not_called()
+    assert runner.state["browser"].go_back.call_count == 1
+    assert runner.state["backs_used"] == 1
+    assert runner.state["page_current"] == 3
+
+
+def test_overshoot_recovery_runs_once_per_url(runner):
+    p4 = _pager_page("https://example.test/news?p=4")
+    runner.state["page"] = p4
+    runner.state["page_target"] = 3
+    runner.state["page_current"] = 4
+    runner._recover_overshoot(runner.state, 1)
+    runner.state["page"] = p4  # still overshooting from the same URL
+    runner._recover_overshoot(runner.state, 1)
+    assert runner.state["browser"].navigate.call_count == 1
+    assert runner.state["browser"].go_back.call_count == 0
+    runner.state["failed_urls"] = ["https://example.test/archive?p=3"]
+    runner.state["page"] = _pager_page("https://example.test/archive?p=4")
+    runner._recover_overshoot(runner.state, 1)
+    assert runner.state["browser"].navigate.call_count == 1  # failed rewrite skipped
+    assert runner.state["browser"].go_back.call_count == 1  # backs up instead
+    runner.state["backs_used"] = loop.MAX_BACKS
+    runner.state["page"] = _pager_page("https://example.test/other")
+    runner._recover_overshoot(runner.state, 1)
+    assert runner.state["browser"].go_back.call_count == 1  # back budget spent
+
+
 def test_page_counter_guidance():
     from jev_ultrafast.agent import compose_guidance
 
     state = {"history": [], "page_target": 3, "page_current": 1}
     assert compose_guidance(state) == ["On page 1 of 3: keep going to the next page."]
     state["page_current"] = 3
-    assert compose_guidance(state) == []
+    assert compose_guidance(state) == ["Target page reached: read it."]
+    state["page_current"] = 5
+    assert compose_guidance(state) == ["Overshot to page 5: go back to page 3."]
 
 
 def _link_page():

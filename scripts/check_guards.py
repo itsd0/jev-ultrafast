@@ -424,6 +424,7 @@ def main():
         off = [a for a in actions if a.get("offscreen")]
         assert len(off) == 5, [a.get("label") for a in off]
         assert any(a.get("label") == "Continue reading" for a in off)
+        assert all(a.get("pager") is True for a in off), [a.get("label") for a in off]
         passed.append("offscreen pagers are indexed, capped, and rel=next counts")
         more = next(a for a in actions if a.get("label") == "More" and a.get("offscreen"))
         browser.act(more, page)

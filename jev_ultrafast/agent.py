@@ -151,6 +151,7 @@ STALL_REPEATS = 3
 STALL_HOLD_STEPS = 5
 STALL_KINDS = {"click", "key", "select", "select_option", "navigate", "vision", "check"}
 MAX_BACKS = 3
+PAGER_HOLD_STEPS = 3
 
 _SCORE_STOPWORDS = frozenset(
     "the a an to of and for on in with or by from click open link page more next result results show all".split()
@@ -459,6 +460,17 @@ def current_page_number(url, text):
     return int(match.group(1)) if match else None
 
 
+def rewrite_page_number(url, target):
+    """The URL with its generic page marker set to the target. None when absent."""
+    if not url or not target:
+        return None
+    rewritten, count = re.subn(r"([?&](?:p|page)=)\d+", rf"\g<1>{target}", url, count=1)
+    if count:
+        return rewritten
+    rewritten, count = re.subn(r"(/page/)\d+", rf"\g<1>{target}", url, count=1)
+    return rewritten if count else None
+
+
 MEMO_CAP = 20
 
 
@@ -642,6 +654,10 @@ def compose_guidance(state):
     target, current = state.get("page_target"), state.get("page_current")
     if target and current and current < target:
         guidance.append(f"On page {current} of {target}: keep going to the next page.")
+    elif target and current == target:
+        guidance.append("Target page reached: read it.")
+    elif target and current and current > target:
+        guidance.append(f"Overshot to page {current}: go back to page {target}.")
     if state.get("force_navigate") and current_todo(state):
         guidance.append(f"Leave this site now: NAVIGATE for the next step ({current_todo(state)[:80]}).")
     elif state.get("subgoals") is not None and not target:
@@ -1501,6 +1517,12 @@ class Agent:
                 state["page_current"] = (
                     current_page_number(state["page"].get("url"), state["page"].get("text")) or 1
                 )
+                if state["page_current"] > state["page_target"]:
+                    self._recover_overshoot(state, step)
+                    state["page_current"] = (
+                        current_page_number(state["page"].get("url"), state["page"].get("text")) or 1
+                    )
+                self._hold_pagers_at_target(state, step)
             config = getattr(self, "config", None) or {}
             budget = config.get("max_decisions") or DEFAULT_MAX_DECISIONS
             # Only executed actions spend the budget; stale decisions, BLOCKED
@@ -2449,6 +2471,90 @@ class Agent:
         for keys in (state.get("noop_page") or {}).values():
             keys[:] = [key for key in keys if live(key)]
         state["noop_noted"] = [key for key in state.get("noop_noted") or [] if live(key)]
+
+    def _hold_pagers_at_target(self, state, step):
+        """At or past the target page, pager controls only lead away: hold them."""
+        target, current = state.get("page_target"), state.get("page_current")
+        if not target or not current or current < target:
+            return
+        keys = [
+            noop_key(action)
+            for action in (state.get("page") or {}).get("actions") or []
+            if action.get("pager")
+        ]
+        if not keys:
+            return
+        reasons = dict(state.get("hold_reasons") or {})
+        state["held_actions"] = hold_actions(
+            state.get("held_actions"), keys, PAGER_HOLD_STEPS, reasons, "pager hold"
+        )
+        state["hold_reasons"] = reasons
+        self.trace.emit(
+            "guard", step=step, type="pager_hold", target=target, current=current,
+            held=len(keys), evidence="at or past the target page; pagers lead away",
+        )
+
+    def _observe_after_recovery(self, state, step):
+        try:
+            started = time.perf_counter()
+            state["page"] = state["browser"].observe(screenshot=self.screenshots)
+        except StalePage:
+            return
+        indexer_ms = round((time.perf_counter() - started) * 1000)
+        self._emit_snapshot(state, step, indexer_ms, page_changed=True)
+        state["_prev_fp"] = state["page"].get("fingerprint")
+
+    def _recover_overshoot(self, state, step):
+        """Past the target page: rewrite-navigate to it, else one BACK.
+
+        Runs inside predict, before the decision: the recovered page is
+        observed and snapshotted so the choice below sees it. Bounded: one
+        recovery per URL, and backs share MAX_BACKS.
+        """
+        url = (state.get("page") or {}).get("url") or ""
+        if not url or state.get("overshoot_url") == url:
+            return
+        state["overshoot_url"] = url
+        target = state["page_target"]
+        rewrite = rewrite_page_number(url, target)
+        if (
+            rewrite
+            and rewrite not in (state.get("failed_urls") or [])
+            and not host_blocked(state, page_host(rewrite))
+        ):
+            try:
+                result = state["browser"].navigate(rewrite)
+            except (ValueError, RuntimeError, StalePage) as error:
+                self.log.info(f"[jev:overshoot] rewrite navigate failed ({error}); trying back")
+                result = {"navigated": False}
+            if not (isinstance(result, dict) and result.get("navigated") is False):
+                self.trace.emit(
+                    "guard", step=step, type="overshoot_navigate", target=target,
+                    back_from=url, back_to=rewrite,
+                    evidence="overshot the target page; rewrote the page marker",
+                )
+                self._observe_after_recovery(state, step)
+                return
+            note_failed_url(state, rewrite)
+        if (state.get("backs_used") or 0) >= MAX_BACKS:
+            return
+        try:
+            state["browser"].go_back()
+            state["browser"].wait_until_ready()
+        except (StalePage, RuntimeError) as error:
+            self.log.info(f"[jev:overshoot] could not go back ({error}); continuing")
+            self.trace.emit(
+                "error", step=step, type=type(error).__name__, message=str(error)[:200],
+                where="overshoot_back", retried=False,
+            )
+            return
+        state["backs_used"] = (state.get("backs_used") or 0) + 1
+        self.trace.emit(
+            "guard", step=step, type="overshoot_back", target=target, back_from=url,
+            backs_used=state["backs_used"],
+            evidence="overshot the target page with no rewritable marker; went back",
+        )
+        self._observe_after_recovery(state, step)
 
     def _maybe_go_back(self, state, url, gained, new_facts, step=None):
         """A click that lands nowhere new is a detour: go BACK once and mark it tried."""
