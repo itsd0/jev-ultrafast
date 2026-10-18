@@ -445,6 +445,49 @@ def test_local_wall_never_restarts(tmp_path):
     assert "restart" not in kinds
 
 
+def test_final_frame_captured_for_replay(tmp_path):
+    runner = _runner(tmp_path, agent_factory=FakeAgent)
+    sid = runner.create_session("local")
+    browser = FakeBrowser()
+    _inject(runner, sid, browser)
+
+    class Watcher:
+        latest = "aGk="
+
+    runner._sessions[sid]["viewer"] = Watcher()
+    mid = runner.submit_message(sid, "hi")
+    _wait_done(runner, sid, mid)
+    assert runner.final_frame(sid, mid) == "aGk="
+    assert (tmp_path / "files" / sid / "frames" / f"{mid}.jpg").read_bytes() == b"hi"
+    assert runner.final_frame(sid, "nope") is None
+
+
+def test_config_persists_and_reloads(tmp_path, monkeypatch):
+    monkeypatch.delenv("TEXT_MODEL", raising=False)
+    monkeypatch.delenv("DECISION_PROVIDER", raising=False)
+    path = tmp_path / "server.json"
+    runner = _runner(tmp_path, agent_factory=FakeAgent)
+    assert runner.load_config(path) == {}
+    runner.apply_config({"browser_default": "cloud", "max_decisions_default": 30})
+    runner.save_config({"browser_default": "cloud", "max_decisions_default": 30})
+    fresh = _runner(tmp_path, agent_factory=FakeAgent)
+    fresh.load_config(path)
+    assert fresh.default_browser == "cloud"
+    assert fresh.default_max_decisions == 30
+    assert fresh.config_view()["browser_default"] == "cloud"
+
+
+def test_default_max_decisions_reaches_agent(tmp_path):
+    FakeAgent.seen.clear()
+    runner = _runner(tmp_path, agent_factory=FakeAgent)
+    runner.apply_config({"max_decisions_default": 12})
+    sid = runner.create_session("local")
+    _inject(runner, sid, FakeBrowser())
+    mid = runner.submit_message(sid, "hi")
+    _wait_done(runner, sid, mid)
+    assert FakeAgent.seen[-1].config["max_decisions"] == 12
+
+
 def test_bus_replays_events(tmp_path):
     runner = _runner(tmp_path, agent_factory=FakeAgent)
     sid = runner.create_session("local")

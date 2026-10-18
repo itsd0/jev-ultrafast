@@ -583,3 +583,91 @@ def test_session_files_auth_and_validation(start_service):
     assert api(base, "POST", f"/api/sessions/{sid}/files", {**good, "name": "../x"}, token="secret")[0] == 400
     assert api(base, "POST", f"/api/sessions/{sid}/files", {**good, "content_b64": "!!"}, token="secret")[0] == 400
     assert api(base, "GET", f"/api/sessions/{sid}/files/../x", token="secret")[0] == 404
+
+
+def test_share_replay_is_public_but_token_guarded(start_service):
+    base, _ = start_service(lambda fake: snap("done", 1))
+    _, created = api(base, "POST", "/api/sessions", {"browser": "local"})
+    sid = created["id"]
+    _, posted = api(base, "POST", f"/api/sessions/{sid}/messages", {"text": "hi"})
+    assert posted["id"]
+    wait_session(base, sid)
+    assert api(base, "POST", "/api/sessions/nope/share", {})[0] == 404
+    status, shared = api(base, "POST", f"/api/sessions/{sid}/share", {})
+    assert status == 200
+    assert shared["url"] == f"/share/{shared['token']}"
+    status, again = api(base, "POST", f"/api/sessions/{sid}/share", {})
+    assert again["token"] == shared["token"]
+    request = urllib.request.Request(base + f"/api/share/{shared['token']}", method="GET")
+    with urllib.request.urlopen(request, timeout=10) as response:
+        assert response.status == 200
+        replay = json.loads(response.read())
+    assert replay["title"] == "hi"
+    assert len(replay["turns"]) == 1
+    assert replay["turns"][0]["steps"][0]["operation"] == "CLICK"
+    assert replay["turns"][0]["frame"] is None
+    assert "live_url" not in replay and "share_token" not in json.dumps(replay)
+    assert api(base, "GET", "/api/share/nope")[0] == 404
+
+
+def test_config_roundtrip_and_token_rotation(start_service, monkeypatch):
+    monkeypatch.delenv("TEXT_MODEL", raising=False)
+    monkeypatch.delenv("DECISION_PROVIDER", raising=False)
+    base, _ = start_service(lambda fake: snap("done", 0))
+    _, config = api(base, "GET", "/api/config")
+    assert config["browser_default"] == "local"
+    assert config["max_decisions_default"] is None
+    assert config["server_token_set"] is False
+    status, updated = api(base, "POST", "/api/config", {
+        "browser_default": "cloud",
+        "max_decisions_default": 25,
+        "text_model": "mercury-2.5",
+        "decision_provider": "mercury",
+    })
+    assert status == 200
+    assert updated["browser_default"] == "cloud"
+    assert updated["max_decisions_default"] == 25
+    assert api(base, "POST", "/api/config", {"max_decisions_default": 0})[0] == 400
+    _, created = api(base, "POST", "/api/sessions", {})
+    _, session = api(base, "GET", f"/api/sessions/{created['id']}")
+    assert session["browser"] == "cloud"
+    status, rotated = api(base, "POST", "/api/config", {"server_token": "rotated"})
+    assert status == 200 and rotated["server_token_set"] is True
+    assert "rotated" not in json.dumps(rotated)
+    assert api(base, "GET", "/api/sessions")[0] == 401
+    assert api(base, "GET", "/api/sessions", token="rotated")[0] == 200
+
+
+def test_takeover_modes(start_service):
+    import threading
+
+    gate = threading.Event()
+    browser = FakeBrowser()
+    base, _ = start_service(
+        lambda fake: snap("done", 1) if gate.wait(timeout=10) else snap("done", 1),
+        browser=browser,
+    )
+    _, created = api(base, "POST", "/api/sessions", {"browser": "local"})
+    assert api(base, "POST", f"/api/sessions/{created['id']}/takeover", {})[0] == 409
+    assert api(base, "POST", "/api/sessions/nope/takeover", {})[0] == 404
+    api(base, "POST", f"/api/sessions/{created['id']}/messages", {"text": "hi"})
+    wait_session(base, created["id"], {"running"})
+    status, taken = api(base, "POST", f"/api/sessions/{created['id']}/takeover", {})
+    assert status == 200 and taken == {"mode": "local", "ok": True}
+    assert "Page.bringToFront" in [name for name, _ in browser.calls]
+    gate.set()
+    wait_session(base, created["id"])
+    _, cloud = api(base, "POST", "/api/sessions", {"browser": "cloud"})
+    status, taken = api(base, "POST", f"/api/sessions/{cloud['id']}/takeover", {})
+    assert status == 200 and taken["mode"] == "cloud"
+
+
+def test_new_app_routes(start_service):
+    base, _ = start_service(lambda fake: snap("done", 0))
+    for path in ("/", "/session/abc", "/share/abc", "/sessions.js", "/sessions.css"):
+        request = urllib.request.Request(base + path, method="GET")
+        with urllib.request.urlopen(request, timeout=10) as response:
+            assert response.status == 200
+    request = urllib.request.Request(base + "/tasks.html", method="GET")
+    with urllib.request.urlopen(request, timeout=10) as response:
+        assert response.status == 200

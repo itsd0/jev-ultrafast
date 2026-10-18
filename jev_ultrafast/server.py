@@ -11,6 +11,7 @@ import hmac
 import json
 import mimetypes
 import os
+import secrets
 import sqlite3
 import threading
 import time
@@ -272,6 +273,18 @@ class Store:
             session.pop("last_tabs", None)
             sessions.append(session)
         return sessions
+
+    def get_session_by_share_token(self, token):
+        if not token:
+            return None
+        with self.lock:
+            row = self.conn.execute(
+                "SELECT * FROM sessions WHERE share_token = ?", (token,)
+            ).fetchone()
+            if row is None:
+                return None
+            session_id = row["id"]
+        return self.get_session(session_id)
 
     def update_session(self, session_id, **fields):
         if not fields:
@@ -757,15 +770,104 @@ class SessionRunner:
         self._cond = threading.Condition()
         self._running = 0
         self._create_lock = threading.Lock()
+        self.default_browser = "local"
+        self.default_max_decisions = None
+        self.config_path = None
         reaper = threading.Thread(target=self._reap_loop, daemon=True)
         reaper.start()
+
+    def load_config(self, path):
+        """Apply persisted UI config. Returns the stored values."""
+        self.config_path = str(path)
+        try:
+            values = json.loads(Path(path).read_text())
+        except (OSError, ValueError):
+            values = {}
+        if isinstance(values, dict):
+            self.apply_config(values)
+        return values if isinstance(values, dict) else {}
+
+    def apply_config(self, values):
+        """Validate and apply UI config values. Unknown keys are ignored."""
+        browser_default = values.get("browser_default")
+        if browser_default in {"local", "cloud"}:
+            self.default_browser = browser_default
+        if "max_decisions_default" in values:
+            max_decisions = values["max_decisions_default"]
+            if max_decisions is None:
+                self.default_max_decisions = None
+            elif isinstance(max_decisions, int) and 1 <= max_decisions <= 10000:
+                self.default_max_decisions = max_decisions
+            else:
+                raise ValueError("max_decisions_default must be 1-10,000")
+        text_model = values.get("text_model")
+        if isinstance(text_model, str) and text_model.strip() and len(text_model) <= 200:
+            os.environ["TEXT_MODEL"] = text_model.strip()
+        decision_provider = values.get("decision_provider")
+        if decision_provider in {"typesafe", "mercury"}:
+            os.environ["DECISION_PROVIDER"] = decision_provider
+        return self.config_view()
+
+    def save_config(self, values):
+        """Persist UI config values. Best-effort, owner-only file."""
+        if not self.config_path:
+            return
+        try:
+            current = json.loads(Path(self.config_path).read_text())
+            if not isinstance(current, dict):
+                current = {}
+        except (OSError, ValueError):
+            current = {}
+        current.update(values)
+        try:
+            Path(self.config_path).write_text(json.dumps(current, indent=2))
+            os.chmod(self.config_path, 0o600)
+        except OSError:
+            pass
+
+    def config_view(self):
+        return {
+            "browser_default": self.default_browser,
+            "max_decisions_default": self.default_max_decisions,
+            "text_model": os.environ.get("TEXT_MODEL", "mercury-2.5"),
+            "decision_provider": os.environ.get("DECISION_PROVIDER", "typesafe"),
+            "idle_min": self.idle_min,
+        }
 
     def session_files_dir(self, session_id):
         path = self.files_root / session_id / "files"
         path.mkdir(parents=True, exist_ok=True)
         return path
 
-    def create_session(self, browser="local", title=None):
+    def _capture_final_frame(self, session_id, message_id):
+        """Keep the last live frame for shared replays. Best-effort."""
+        entry = self._entry(session_id)
+        viewer = entry.get("viewer") if entry else None
+        latest = getattr(viewer, "latest", None)
+        if not latest:
+            return
+        try:
+            raw = base64.b64decode(latest)
+        except (binascii.Error, ValueError):
+            return
+        try:
+            frames_dir = self.files_root / session_id / "frames"
+            frames_dir.mkdir(parents=True, exist_ok=True)
+            (frames_dir / f"{message_id}.jpg").write_bytes(raw)
+        except OSError:
+            pass
+
+    def final_frame(self, session_id, message_id):
+        """Base64 final frame for a replay. None when no viewer watched."""
+        try:
+            raw = (self.files_root / session_id / "frames" / f"{message_id}.jpg").read_bytes()
+        except OSError:
+            return None
+        return base64.b64encode(raw).decode()
+
+    def create_session(self, browser=None, title=None):
+        if browser is None:
+            browser = self.default_browser
         if browser not in {"local", "cloud"}:
             raise ValueError("browser must be local or cloud")
         session_id = self.store.create_session(title or "New session", browser)
@@ -939,6 +1041,8 @@ class SessionRunner:
         text = (text or "").strip()
         if not text or len(text) > 4000:
             raise ValueError("Enter a message of 1-4,000 characters")
+        if max_decisions is None:
+            max_decisions = self.default_max_decisions
         if max_decisions is not None and not 1 <= int(max_decisions) <= 10000:
             raise ValueError("max_decisions must be 1-10,000")
         url = (url or "").strip() or None
@@ -1366,6 +1470,7 @@ class SessionRunner:
         duration_ms = round((time.monotonic() - started) * 1000)
         page = snapshot.get("page") or {}
         final_text = final_text_for(browser, page)
+        self._capture_final_frame(session_id, message_id)
         self.store.update_message(
             message_id,
             status=status,
@@ -1513,7 +1618,19 @@ class Handler(BaseHTTPRequestHandler):
         if not self.host_ok():
             return self.send(403, "Forbidden", "text/plain")
         path = urlparse(self.path).path
-        if path == "/":
+        if path == "/" or path.startswith("/session/") or path.startswith("/share/"):
+            return self.send(
+                200, (ROOT / "static" / "sessions.html").read_text(), "text/html; charset=utf-8"
+            )
+        if path == "/sessions.js":
+            return self.send(
+                200, (ROOT / "static" / "sessions.js").read_text(), "text/javascript; charset=utf-8"
+            )
+        if path == "/sessions.css":
+            return self.send(
+                200, (ROOT / "static" / "sessions.css").read_text(), "text/css; charset=utf-8"
+            )
+        if path == "/tasks.html":
             return self.send(200, (ROOT / "static" / "tasks.html").read_text(), "text/html; charset=utf-8")
         if path == "/tasks.js":
             return self.send(
@@ -1523,12 +1640,18 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(404, json.dumps({"error": "Not found"}))
         if path == "/api/health":
             return self.send(200, json.dumps({"status": "ok"}))
+        if path.startswith("/api/share/"):
+            return self.serve_shared_replay(path.removeprefix("/api/share/"))
         if not self.authorized():
             return self.send(401, json.dumps({"error": "Bearer token required"}))
         if path == "/api/sessions":
             return self.send(200, json.dumps(self.STORE.list_sessions()))
         if path == "/api/usage":
             return self.send(200, json.dumps(self.STORE.usage_by_day()))
+        if path == "/api/config":
+            view = self.RUNNER.config_view()
+            view["server_token_set"] = bool(self.TOKEN)
+            return self.send(200, json.dumps(view))
         if path.startswith("/api/sessions/") and path.endswith("/events"):
             session_id = path.removeprefix("/api/sessions/").removesuffix("/events")
             query = dict(
@@ -1636,6 +1759,83 @@ class Handler(BaseHTTPRequestHandler):
             session_id, {"type": "files", "files": session_files(files_dir)}
         )
         return self.send(201, json.dumps({"name": name, "bytes": len(raw)}))
+
+    def serve_shared_replay(self, token):
+        """Public read-only replay. The unguessable token is the auth."""
+        if "/" in token or not token:
+            return self.send(404, json.dumps({"error": "Not found"}))
+        session = self.STORE.get_session_by_share_token(token)
+        if session is None:
+            return self.send(404, json.dumps({"error": "Not found"}))
+        turns = []
+        for message in session.get("messages") or []:
+            turns.append({
+                "n": message.get("n"),
+                "user_text": message.get("user_text"),
+                "agent_reply": message.get("agent_reply"),
+                "status": message.get("status"),
+                "cost": message.get("cost_usd_estimate"),
+                "duration_ms": message.get("duration_ms"),
+                "final_url": message.get("final_url"),
+                "steps": message.get("steps") or [],
+                "frame": self.RUNNER.final_frame(session["id"], message.get("id")),
+            })
+        return self.send(200, json.dumps({
+            "title": session.get("title"),
+            "browser": session.get("browser"),
+            "created_at": session.get("created_at"),
+            "turns": turns,
+        }))
+
+    def serve_config_update(self, body):
+        try:
+            self.RUNNER.apply_config(body)
+        except ValueError as error:
+            return self.send(400, json.dumps({"error": str(error)}))
+        if "server_token" in body:
+            token = body["server_token"]
+            if token is None:
+                token = ""
+            if not isinstance(token, str) or len(token) > 200:
+                return self.send(400, json.dumps({"error": "server_token must be a short string"}))
+            type(self).TOKEN = token
+        self.RUNNER.save_config({
+            key: body[key]
+            for key in (
+                "browser_default", "max_decisions_default", "text_model",
+                "decision_provider", "server_token",
+            )
+            if key in body
+        })
+        view = self.RUNNER.config_view()
+        view["server_token_set"] = bool(self.TOKEN)
+        return self.send(200, json.dumps(view))
+
+    def serve_takeover(self, session_id):
+        session = self.STORE.get_session(session_id, with_steps=False)
+        if session is None:
+            return self.send(404, json.dumps({"error": "Unknown session"}))
+        if session["browser"] == "cloud":
+            return self.send(200, json.dumps({
+                "mode": "cloud", "live_url": self.RUNNER.live_url(session_id),
+            }))
+        entry = self.RUNNER._entry(session_id)
+        browser = entry.get("browser") if entry else None
+        if browser is None:
+            return self.send(409, json.dumps({"error": "No live browser for this session"}))
+        target = getattr(browser, "target", None)
+        if target:
+            try:
+                harness_helpers.cdp("Target.activateTarget", targetId=target)
+            except Exception:
+                pass
+        bring = getattr(browser, "call", None)
+        if callable(bring):
+            try:
+                bring("Page.bringToFront")
+            except Exception:
+                pass
+        return self.send(200, json.dumps({"mode": "local", "ok": True}))
 
     def _run_id_for(self, task_id):
         """A task id is a message id; its run id keys steps, events, and traces."""
@@ -1798,9 +1998,11 @@ class Handler(BaseHTTPRequestHandler):
             body = json.loads(self.rfile.read(length) or b"{}")
             if path == "/api/sessions":
                 session_id = self.RUNNER.create_session(
-                    body.get("browser", "local"), body.get("title")
+                    body.get("browser") or None, body.get("title")
                 )
                 return self.send(201, json.dumps({"id": session_id}))
+            if path == "/api/config":
+                return self.serve_config_update(body or {})
             if path.startswith("/api/sessions/") and path.endswith("/messages"):
                 session_id = path.removeprefix("/api/sessions/").removesuffix("/messages")
                 message_id = self.RUNNER.submit_message(
@@ -1818,6 +2020,18 @@ class Handler(BaseHTTPRequestHandler):
             if path.startswith("/api/sessions/") and path.endswith("/files"):
                 session_id = path.removeprefix("/api/sessions/").removesuffix("/files")
                 return self.serve_file_upload(session_id, body)
+            if path.startswith("/api/sessions/") and path.endswith("/takeover"):
+                session_id = path.removeprefix("/api/sessions/").removesuffix("/takeover")
+                return self.serve_takeover(session_id)
+            if path.startswith("/api/sessions/") and path.endswith("/share"):
+                session_id = path.removeprefix("/api/sessions/").removesuffix("/share")
+                session = self.STORE.get_session(session_id, with_steps=False)
+                if session is None:
+                    return self.send(404, json.dumps({"error": "Unknown session"}))
+                token = session.get("share_token") or secrets.token_urlsafe(24)
+                if not session.get("share_token"):
+                    self.STORE.update_session(session_id, share_token=token)
+                return self.send(200, json.dumps({"token": token, "url": f"/share/{token}"}))
             if path == "/api/tasks":
                 task_id = self.RUNNER.submit_task(
                     body.get("goal"),
@@ -1881,6 +2095,12 @@ def main():
     Handler.HOST = host
     Handler.PORT = port
     Handler.TOKEN = os.environ.get("JEV_SERVER_TOKEN", "")
+    config_path = os.environ.get(
+        "JEV_SERVER_CONFIG", str(Path(db_path).parent / "jev_server_config.json")
+    )
+    stored = Handler.RUNNER.load_config(config_path)
+    if not Handler.TOKEN and isinstance(stored.get("server_token"), str):
+        Handler.TOKEN = stored["server_token"]
     if host not in {"127.0.0.1", "localhost", "::1"} and not Handler.TOKEN:
         raise SystemExit(f"Refusing to bind {host} without JEV_SERVER_TOKEN")
     server = ThreadingHTTPServer((host, port), Handler)

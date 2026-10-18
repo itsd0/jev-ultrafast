@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Jev Sessions</title>
+    <link rel="stylesheet" href="/sessions.css" />
+  </head>
+  <body>
+    <div id="app">
+      <aside id="sidebar">
+        <div class="side-top">
+          <button id="home-btn" class="primary" title="New session">+ New session</button>
+        </div>
+        <nav id="side-views">
+          <button data-view="usage">Usage</button>
+          <button data-view="config">Configuration</button>
+          <button data-view="setup">Setup</button>
+        </nav>
+        <div class="side-label">History</div>
+        <ol id="session-list"></ol>
+      </aside>
+      <main id="center">
+        <section id="view-session">
+          <header id="session-header">
+            <div>
+              <h1 id="session-title">New session</h1>
+              <div id="session-meta"></div>
+            </div>
+            <div class="header-actions">
+              <button id="share-btn" title="Copy a read-only replay link">Share</button>
+              <button id="delete-btn" class="danger" title="Delete this session">Delete</button>
+            </div>
+          </header>
+          <div id="thread"></div>
+          <form id="composer">
+            <div class="composer-row">
+              <textarea id="message-box" rows="2" placeholder="Ask the browser to do something&hellip;"></textarea>
+            </div>
+            <div class="composer-row controls">
+              <label class="file-btn" title="Attach a file to this session">Attach
+                <input id="attach-input" type="file" hidden />
+              </label>
+              <select id="browser-picker" title="Browser for a new session">
+                <option value="local">local</option>
+                <option value="cloud">cloud</option>
+              </select>
+              <span id="composer-cost"></span>
+              <span class="spacer"></span>
+              <button id="send-btn" type="submit" class="primary">Send</button>
+              <button id="stop-btn" type="button" class="danger" hidden>Stop</button>
+            </div>
+          </form>
+        </section>
+        <section id="view-usage" hidden>
+          <h1>Usage</h1>
+          <div id="usage-body"></div>
+        </section>
+        <section id="view-config" hidden>
+          <h1>Configuration</h1>
+          <form id="config-form"></form>
+        </section>
+        <section id="view-setup" hidden>
+          <h1>Setup</h1>
+          <div class="prose">
+            <p>Start a local Chrome for the default browser once:</p>
+            <pre>google-chrome --remote-debugging-port=9222 --user-data-dir=/tmp/jev-chrome</pre>
+            <p>Then run the server:</p>
+            <pre>jev-server</pre>
+            <p>Environment knobs:</p>
+            <ul>
+              <li><code>JEV_BROWSER=cloud</code> with <code>BROWSER_USE_API_KEY</code> for cloud browsers.</li>
+              <li><code>JEV_SERVER_TOKEN</code> requires a bearer token on every API call.</li>
+              <li><code>JEV_SESSION_IDLE_MIN</code> (default 10) closes idle session browsers.</li>
+              <li><code>JEV_CLOUD_SHOW_LIVE_URL=1</code> embeds the cloud live view.</li>
+            </ul>
+            <p>Keys stay in <code>.env</code> on the server. They are never shown here.</p>
+          </div>
+        </section>
+        <section id="view-share" hidden>
+          <h1 id="share-title"></h1>
+          <div id="share-meta"></div>
+          <div id="share-thread"></div>
+        </section>
+        <section id="view-token" hidden>
+          <h1>Server token</h1>
+          <p>This server requires a bearer token.</p>
+          <form id="token-form">
+            <input id="token-input" type="password" autocomplete="off" placeholder="JEV_SERVER_TOKEN" />
+            <button type="submit" class="primary">Save</button>
+          </form>
+        </section>
+      </main>
+      <aside id="right">
+        <div class="tabs">
+          <button id="tab-browser" class="active">Browser</button>
+          <button id="tab-files">Files <span id="files-badge" hidden></span></button>
+        </div>
+        <div id="pane-browser">
+          <div id="tabstrip"></div>
+          <div id="addressbar" title="Active tab URL"></div>
+          <div id="live-wrap">
+            <img id="live-img" alt="Live browser view" hidden />
+            <iframe id="live-frame" title="Cloud live view" hidden></iframe>
+            <div id="live-idle">No live browser. Send a message to start one.</div>
+          </div>
+          <div class="live-controls">
+            <button id="fullscreen-btn" title="Fullscreen live view">Fullscreen</button>
+            <button id="takeover-btn" title="Bring the real tab forward (local) or open the live view (cloud)">Take over</button>
+          </div>
+        </div>
+        <div id="pane-files" hidden>
+          <ol id="file-list"></ol>
+        </div>
+      </aside>
+    </div>
+    <div id="toast" hidden></div>
+    <script src="/sessions.js"></script>
+  </body>
+</html>
