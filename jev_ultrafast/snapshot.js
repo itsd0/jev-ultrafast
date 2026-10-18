@@ -189,6 +189,29 @@
     const raw=e.getBoundingClientRect();
     return owns(e, resolveHit(e.ownerDocument||document, raw.x+raw.width/2, raw.y+raw.height/2));
   };
+  const svgTitle = e => {
+    try {
+      const t=e.querySelector('title');
+      return ((t && t.textContent) || '').trim();
+    } catch (error) { return ''; }
+  };
+  const describedBy = (e,doc) => (e.getAttribute('aria-describedby')||'').split(/\s+/)
+    .map(id=>{ const t=doc.getElementById(id); return t ? (t.innerText||'').trim() : ''; })
+    .filter(Boolean).join(' ').slice(0,40);
+  const hrefTail = e => {
+    const href=(e.getAttribute && e.getAttribute('href')) || '';
+    if (!href || href[0]==='#') return '';
+    if (/^[a-z][a-z0-9+.-]*:/i.test(href) && !/^https?:/i.test(href)) return '';
+    const tail=href.split(/[?#]/)[0].replace(/\/+$/,'').split('/').pop() || '';
+    return tail.replace(/\.[a-z0-9]+$/i,'').replace(/[-_]+/g,' ').trim().slice(0,40);
+  };
+  const nearbyText = e => {
+    for (let p=e.parentElement, depth=0; p && depth<2; p=p.parentElement, depth++) {
+      const text=(p.innerText||'').replace(/\s+/g,' ').trim();
+      if (text) return text.slice(0,40);
+    }
+    return '';
+  };
   const name = (e,seen=new Set()) => {
     if (!e || seen.has(e)) return '';
     seen.add(e);
@@ -200,7 +223,8 @@
       (['button','submit','reset'].includes(e.type) ? e.value : '') || e.getAttribute('alt') ||
       (e.tagName==='INPUT' ? '' : [...e.childNodes].map(n=>n.nodeType===3 ? n.textContent :
         n.nodeType===1 && n.getAttribute('aria-hidden')!=='true' ? name(n,seen) : '').join(' ').trim()) ||
-      e.getAttribute('title') || e.getAttribute('placeholder') || '';
+      e.getAttribute('title') || svgTitle(e) || e.getAttribute('placeholder') ||
+      describedBy(e,doc) || hrefTail(e) || '';
   };
   const roles=['button','link','checkbox','radio','switch','tab','menuitem','menuitemradio',
     'option','gridcell','combobox','textbox','searchbox','spinbutton'];
@@ -241,6 +265,27 @@
     return keys;
   };
   const normName=s=>(s||'').replace(/\s+/g,' ').trim().toLowerCase();
+  const pagerName=/^(next|more|older|›|»)$/i;
+  const stepperName=/^(\+|-|\u2212|\u2013)$|^(increase|decrease|increment|decrement|plus|minus)\b/i;
+  let pagerCount=0;
+  const isPager=(e,rname)=>{
+    if (rname!=='link' && rname!=='button') return false;
+    if ((e.rel||'').split(/\s+/).includes('next')) return true;
+    return pagerName.test(normName(name(e)));
+  };
+  const stepperValue=(e,label)=>{
+    if (!stepperName.test((label||'').trim())) return null;
+    const parent=e.parentElement;
+    if (!parent) return null;
+    if (![...parent.children].some(sib=>sib!==e &&
+        (sib.tagName==='BUTTON' || sib.getAttribute('role')==='button'))) return null;
+    const nums=[];
+    for (const n of parent.childNodes) {
+      if (n.nodeType===3 && /^\d{1,3}$/.test(n.textContent.trim())) nums.push(n.textContent.trim());
+      else if (n.nodeType===1 && /^\d{1,3}$/.test((n.textContent||'').trim())) nums.push(n.textContent.trim());
+    }
+    return nums.length===1 ? nums[0] : null;
+  };
   const describe=e=>{
     if (!e?.isConnected) return null;
     return {role:role(e), name:normName(name(e)), tag:e.tagName};
@@ -260,10 +305,29 @@
     const raw=e.getBoundingClientRect();
     const rect={x:raw.x+ox, y:raw.y+oy, w:raw.width, h:raw.height};
     const x=rect.x+rect.w/2, y=rect.y+rect.h/2, rname=role(e);
-    if (!rname || rect.w<=0 || rect.h<=0 || x<0 || y<0 || x>=innerWidth || y>=innerHeight) return;
+    if (!rname || rect.w<=0 || rect.h<=0) return;
+    const inView=x>=0 && y>=0 && x<innerWidth && y<innerHeight;
+    let offscreen=false;
+    if (!inView) {
+      if (!isPager(e,rname) || pagerCount>=5) return;
+      pagerCount++;
+      offscreen=true;
+    }
     if (rname==='gridcell' && e.querySelector('button,[role="button"]')) return;
     const node=identity(e);
-    const base={node, frame:frameId, role:rname, label:name(e)||rname, rect};
+    let label=name(e), generic=false;
+    if (!label) {
+      generic=true;
+      const near=nearbyText(e);
+      label=near ? `${rname} (unlabeled, near: '${near}')` : rname;
+    }
+    const base={node, frame:frameId, role:rname, label, rect};
+    if (generic) base.generic=true;
+    if (offscreen) base.offscreen=true;
+    if (rname==='button') {
+      const stepped=stepperValue(e,label);
+      if (stepped!==null) base.value=stepped;
+    }
     if (possibleClosedShadow(e)) base.possible_closed_shadow=true;
     seenNodes.add(frameId+':'+node);
     for (const key of ['checked','selected','expanded','pressed']) {
@@ -301,8 +365,8 @@
       const editable=!e.readOnly && e.getAttribute('aria-readonly')!=='true' &&
         (['textbox','searchbox','spinbutton'].includes(rname) ||
           (rname==='combobox' && ['INPUT','TEXTAREA'].includes(e.tagName)));
-      const value='value' in e ? String(e.value) :
-        e.isContentEditable || rname==='combobox' ? e.innerText.trim() : '';
+      const value=base.value ?? ('value' in e ? String(e.value) :
+        e.isContentEditable || rname==='combobox' ? e.innerText.trim() : '');
       actions.push({...base,kind:editable?'fill':'click',value});
       if (editable) actions.push({...base,kind:'click',value,label:'Open '+base.label});
     }

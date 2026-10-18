@@ -672,6 +672,9 @@ def page_for_choice(state):
             actions = kept
             # The toggle is already open: offer the controls inside it first.
             actions = sorted(actions, key=lambda a: not a.get("inner"))
+    if any(a.get("generic") for a in actions):
+        # Unlabeled controls sort last: prefer controls that say what they do.
+        actions = sorted(actions, key=lambda a: bool(a.get("generic")))
     if actions == state["page"]["actions"]:
         return state["page"]
     return {**state["page"], "actions": actions}

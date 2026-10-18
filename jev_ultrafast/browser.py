@@ -1660,6 +1660,18 @@ def browser_operation(request):
             if type(action["node"]) is not int:
                 raise ValueError("Invalid observed node")
             previous = None
+            if action.get("offscreen"):
+                # Pager below the fold: scroll it into view, then resolve fresh.
+                scrolled = evaluate(
+                    "(action => { const fast=window.__jevFast; "
+                    "const e=fast?.resolve ? fast.resolve(action) : fast?.nodes.get(action.node); "
+                    "if (!e?.isConnected) return false; "
+                    "e.scrollIntoView({block:'center',behavior:'instant'}); return true; })("
+                    + json.dumps(action)
+                    + ")"
+                )
+                if not scrolled:
+                    raise StalePage("Target changed or is covered. Observe again.")
             probe = request.get("probe") if kind in {"click", "fill", "select"} else None
             if probe:
                 probed = evaluate(action_probe_expression(action, probe))

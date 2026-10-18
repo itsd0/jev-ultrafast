@@ -1749,6 +1749,18 @@ def test_page_for_choice_suppression_by_fingerprint(runner):
     assert loop.page_for_choice(runner.state) is runner.state["page"]
 
 
+def test_page_for_choice_sorts_generic_targets_last(runner):
+    actions = runner.state["page"]["actions"]
+    first, second = actions[0], actions[1]
+    first["generic"] = True
+    runner.state["suppressed_fp"] = runner.state["page"]["fingerprint"]
+    runner.state["suppressed_keys"] = set()
+    offered = loop.page_for_choice(runner.state)
+    assert [a["id"] for a in offered["actions"]] == ["e2", "e3", "wait", "e1"]
+    offered["actions"][0]["label"] = "sentinel"
+    assert second["label"] == "sentinel"  # sorted copy still shares the action dicts
+
+
 def test_force_navigate_updates_suppression(runner):
     runner.state["subgoals"] = [{"id": 0, "text": "population", "satisfied": True, "value": "9M",
                                  "source": "https://one.test/"},

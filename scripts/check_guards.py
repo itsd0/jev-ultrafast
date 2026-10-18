@@ -403,6 +403,32 @@ def main():
         page = browser.observe(screenshot=False)
         assert page["title"] == "First", page["title"]
         passed.append("go_back returns to the previous document")
+
+        browser.call("Page.navigate", url="data:text/html," + quote((FIXTURES / "semantics.html").read_text()))
+        browser.wait_until_ready()
+        page = browser.observe(screenshot=False)
+        actions = page["actions"]
+        assert any(a.get("label") == "Close dialog" for a in actions)
+        assert any(a.get("label") == "Search flights" for a in actions)
+        assert any(a.get("kind") == "fill" and a.get("label", "").startswith("Enter the promo code") for a in actions)
+        assert any(a.get("label") == "lisbon portugal" for a in actions)
+        near = next(a for a in actions if "Passenger options" in a.get("label", ""))
+        assert near.get("generic") is True
+        passed.append("title, svg title, describedby, href tail, and nearby text label controls")
+        dec = next(a for a in actions if a.get("label") == "Decrease adults")
+        inc = next(a for a in actions if a.get("label") == "Increase adults")
+        assert dec.get("value") == "2", dec
+        assert inc.get("value") == "2", inc
+        assert any(a.get("value") == "3" for a in actions)
+        passed.append("stepper buttons carry the shared count value")
+        off = [a for a in actions if a.get("offscreen")]
+        assert len(off) == 5, [a.get("label") for a in off]
+        assert any(a.get("label") == "Continue reading" for a in off)
+        passed.append("offscreen pagers are indexed, capped, and rel=next counts")
+        more = next(a for a in actions if a.get("label") == "More" and a.get("offscreen"))
+        browser.act(more, page)
+        assert browser.evaluate("window.moreClicked") is True
+        passed.append("offscreen pager click scrolls into view first")
     finally:
         browser.close()
     print("\n".join(passed))
