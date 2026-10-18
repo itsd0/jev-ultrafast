@@ -184,6 +184,66 @@ def test_compose_reply_is_plain_sentences():
     assert "{" not in hosted.compose_reply({}, "blocked", "stopped by user")
 
 
+def test_tabs_event_published_on_tab_change(tmp_path):
+    browser = FakeBrowser("https://example.test/a")
+    ticks = []
+
+    def script():
+        ticks.append(1)
+        if len(ticks) == 1:
+            browser.tabs["t2"] = {"target": "bbb", "url": "https://example.test/b"}
+            browser.active = "t2"
+            return {"status": "running", "history": [], "page": {"url": browser.tabs["t2"]["url"]}}
+        return {"status": "done", "history": [], "answer": "Two tabs."}
+
+    def factory(url, goal, browser=None):
+        return FakeAgent(url, goal, browser=browser, script=script)
+
+    runner = _runner(tmp_path, agent_factory=factory)
+    sid = runner.create_session("local")
+    _inject(runner, sid, browser)
+    mid = runner.submit_message(sid, "open a second tab")
+    assert _wait_done(runner, sid, mid)["status"] == "done"
+    tabs_events = [event for _, event in runner.replay(sid) if event["type"] == "tabs"]
+    assert len(tabs_events) == 1
+    assert [(tab["key"], tab["active"]) for tab in tabs_events[0]["tabs"]] == [
+        ("t1", False), ("t2", True),
+    ]
+
+
+def test_no_tabs_event_without_change(tmp_path):
+    runner = _runner(tmp_path, agent_factory=FakeAgent)
+    sid = runner.create_session("local")
+    _inject(runner, sid, FakeBrowser())
+    mid = runner.submit_message(sid, "hi")
+    _wait_done(runner, sid, mid)
+    kinds = [event["type"] for _, event in runner.replay(sid)]
+    assert "tabs" not in kinds
+
+
+def test_session_tabs_reads_cached_titles():
+    browser = FakeBrowser("https://example.test/a")
+    browser.tabs["t1"]["title"] = "Page A"
+    assert hosted.session_tabs(browser) == [
+        {"key": "t1", "url": "https://example.test/a", "title": "Page A", "active": True},
+    ]
+    assert hosted.tabs_signature(browser) == (("t1", "https://example.test/a", True),)
+
+
+def test_viewer_follows_active_tab(tmp_path):
+    runner = _runner(tmp_path, agent_factory=FakeAgent)
+    sid = runner.create_session("local")
+    browser = FakeBrowser()
+    browser.session = "s1"
+    _inject(runner, sid, browser)
+    first, status = runner.get_viewer(sid)
+    assert status == 200 and first.session == "s1"
+    browser.session = "s2"
+    second, status = runner.get_viewer(sid)
+    assert status == 200 and second.session == "s2"
+    assert second is not first
+
+
 def test_bus_replays_events(tmp_path):
     runner = _runner(tmp_path, agent_factory=FakeAgent)
     sid = runner.create_session("local")

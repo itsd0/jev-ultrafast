@@ -279,12 +279,24 @@ class Browser:
         raise StalePage("Page did not settle")
 
     def _finish_observation(self, state):
+        self._remember_tab(state)
         if self.config.get("frames") == "all" and state.get("cross_frames"):
             state = self._attach_oopif(state)
         state = bind_uploads(state, self.config.get("files") or {})
         state = bind_navigate(state)
         state = bind_tabs(state, self)
         return bind_keys(state, self.config.get("keyboard", True))
+
+    def _remember_tab(self, state):
+        """Cache the active tab's url/title from the observation. Free, no CDP."""
+        tabs = getattr(self, "tabs", None) or {}
+        tab = tabs.get(getattr(self, "active", None))
+        if tab is None:
+            return
+        if state.get("url"):
+            tab["url"] = state["url"]
+        if state.get("title"):
+            tab["title"] = state["title"]
 
     def _attach_oopif(self, state):
         """Attach each visible cross-origin frame once per observation. Same-origin frames are already inlined."""
@@ -612,17 +624,46 @@ class Browser:
             return True
         return False
 
-    def _register_tab(self, target_id, session, url, opener=None):
+    def _register_tab(self, target_id, session, url, opener=None, title=""):
         for key, tab in self.tabs.items():
             if tab["target"] == target_id:
                 tab.update(session=session, url=url or tab.get("url") or "")
+                if title:
+                    tab["title"] = title
                 return key
         if len(self.tabs) >= 5:
             return None
         self._tab_serial += 1
         key = f"t{self._tab_serial}"
-        self.tabs[key] = {"target": target_id, "session": session, "url": url or "", "opener": opener}
+        self.tabs[key] = {
+            "target": target_id, "session": session, "url": url or "",
+            "opener": opener, "title": title or "",
+        }
         return key
+
+    def tab_infos(self):
+        """Tab-strip rows with fresh titles. One getTargets call, never raises."""
+        tabs = getattr(self, "tabs", None) or {}
+        active = getattr(self, "active", None)
+        try:
+            targets = cdp("Target.getTargets").get("targetInfos", [])
+        except Exception:
+            targets = []
+        by_target = {
+            info.get("targetId"): info for info in targets if isinstance(info, dict)
+        }
+        rows = []
+        for key, tab in tabs.items():
+            info = by_target.get(tab.get("target")) or {}
+            if info.get("url"):
+                tab["url"] = info["url"]
+            if info.get("title"):
+                tab["title"] = info["title"]
+            rows.append({
+                "key": key, "url": tab.get("url") or "",
+                "title": tab.get("title") or "", "active": key == active,
+            })
+        return rows
 
     def activate(self, key):
         tab = self.tabs.get(key)
@@ -664,7 +705,10 @@ class Browser:
                 cdp("Emulation.setFocusEmulationEnabled", session_id=session, enabled=True)
             except (RuntimeError, KeyError, TypeError):
                 continue
-            key = self._register_tab(target_id, session, info.get("url") or "", info.get("openerId"))
+            key = self._register_tab(
+                target_id, session, info.get("url") or "", info.get("openerId"),
+                title=info.get("title") or "",
+            )
             if key:
                 opened.append(key)
                 owned.add(target_id)
@@ -779,7 +823,7 @@ def bind_tabs(state, browser):
             "id": f"switch:{key}",
             "kind": "switch_tab",
             "tab": key,
-            "label": f"Switch to tab {tab.get('url') or key}",
+            "label": f"Switch to tab {tab.get('title') or tab.get('url') or key}",
         })
     actions.append({"id": "close_tab", "kind": "close_tab", "label": "Close current tab"})
     updated = {**state, "actions": actions}

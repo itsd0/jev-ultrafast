@@ -588,13 +588,31 @@ def session_title(text):
 
 
 def session_tabs(browser):
-    """Live tab list for context and the tab strip. Titles arrive in the tabs pass."""
+    """Live tab list for context and the tab strip."""
+    infos = getattr(browser, "tab_infos", None)
+    if callable(infos):
+        try:
+            return infos()
+        except Exception:
+            pass
     tabs = getattr(browser, "tabs", None) or {}
     active = getattr(browser, "active", None)
     return [
-        {"key": key, "url": tab.get("url") or "", "title": "", "active": key == active}
+        {
+            "key": key, "url": tab.get("url") or "",
+            "title": tab.get("title") or "", "active": key == active,
+        }
         for key, tab in tabs.items()
     ]
+
+
+def tabs_signature(browser):
+    """Cheap tab-set identity from cached values. No CDP, for change detection."""
+    tabs = getattr(browser, "tabs", None) or {}
+    active = getattr(browser, "active", None)
+    return tuple(sorted(
+        (key, tab.get("url") or "", key == active) for key, tab in tabs.items()
+    ))
 
 
 def session_context(prior, url, tabs, message):
@@ -1083,6 +1101,7 @@ class SessionRunner:
             trace = getattr(agent, "trace", None)
             entry["agent"] = agent
             recorded = 0
+            last_tabs = tabs_signature(browser)
             while True:
                 snapshot = agent.command("tick")
                 history = snapshot.get("history") or []
@@ -1097,6 +1116,13 @@ class SessionRunner:
                         for item in new_entries
                     ],
                 })
+                tabs_now = tabs_signature(browser)
+                if tabs_now != last_tabs:
+                    last_tabs = tabs_now
+                    self._publish(session_id, {
+                        "type": "tabs", "message_id": message_id,
+                        "tabs": session_tabs(browser),
+                    })
                 if entry["stop"].is_set():
                     self._close_turn_agent(entry, agent)
                     self._finish_message(

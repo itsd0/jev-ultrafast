@@ -76,6 +76,101 @@ def test_switch_and_close_update_the_active_session(monkeypatch):
     assert closed[0][1]["targetId"] == "cdp-2"
 
 
+def _tab_browser():
+    browser = Browser.__new__(Browser)
+    browser.config = {"tabs": True}
+    browser.tabs = {}
+    browser.active = None
+    browser._tab_serial = 0
+    return browser
+
+
+def test_tab_infos_refreshes_titles_from_targets(monkeypatch):
+    import jev_ultrafast.browser as browser_module
+
+    seen = []
+
+    def fake_cdp(method, **params):
+        seen.append(method)
+        return {"targetInfos": [
+            {"targetId": "cdp-1", "url": "https://example.test/a", "title": "Page A"},
+            {"targetId": "cdp-2", "url": "https://example.test/b", "title": "Page B"},
+            {"targetId": "foreign", "url": "https://evil.test", "title": "Evil"},
+        ]}
+
+    monkeypatch.setattr(browser_module, "cdp", fake_cdp)
+    browser = _tab_browser()
+    browser._register_tab("cdp-1", "s1", "https://example.test/a")
+    browser._register_tab("cdp-2", "s2", "https://example.test/b")
+    browser.active = "t2"
+    rows = browser.tab_infos()
+    assert seen == ["Target.getTargets"]
+    assert rows == [
+        {"key": "t1", "url": "https://example.test/a", "title": "Page A", "active": False},
+        {"key": "t2", "url": "https://example.test/b", "title": "Page B", "active": True},
+    ]
+    assert browser.tabs["t1"]["title"] == "Page A"
+
+
+def test_tab_infos_falls_back_to_cache_when_cdp_fails(monkeypatch):
+    import jev_ultrafast.browser as browser_module
+
+    def boom(method, **params):
+        raise RuntimeError("no daemon")
+
+    monkeypatch.setattr(browser_module, "cdp", boom)
+    browser = _tab_browser()
+    browser._register_tab("cdp-1", "s1", "https://example.test/a", title="Cached A")
+    browser.active = "t1"
+    assert browser.tab_infos() == [
+        {"key": "t1", "url": "https://example.test/a", "title": "Cached A", "active": True},
+    ]
+
+
+def test_collect_new_tabs_captures_title(monkeypatch):
+    import jev_ultrafast.browser as browser_module
+
+    events = [{"method": "Target.targetCreated", "params": {"targetInfo": {
+        "type": "page", "targetId": "popup", "openerId": "ours",
+        "url": "https://example.test/new", "title": "Fresh Popup",
+    }}}]
+    monkeypatch.setattr(browser_module, "drain_events", lambda: events)
+    monkeypatch.setattr(
+        browser_module, "cdp",
+        lambda method, **params: {"sessionId": "s-popup"} if method == "Target.attachToTarget" else {},
+    )
+    browser = _tab_browser()
+    browser._register_tab("ours", "s1", "https://example.test/")
+    browser.active = "t1"
+    assert browser.collect_new_tabs() == ["t2"]
+    assert browser.tabs["t2"]["title"] == "Fresh Popup"
+
+
+def test_remember_tab_caches_active_url_and_title():
+    browser = _tab_browser()
+    browser._register_tab("cdp-1", "s1", "https://old.test")
+    browser.active = "t1"
+    browser._remember_tab({"url": "https://example.test/a", "title": "Page A"})
+    assert browser.tabs["t1"]["url"] == "https://example.test/a"
+    assert browser.tabs["t1"]["title"] == "Page A"
+    browser._remember_tab({})
+    assert browser.tabs["t1"]["title"] == "Page A"
+
+
+def test_bind_tabs_prefers_title_in_labels():
+    browser = _tab_browser()
+    browser._register_tab("cdp-1", "s1", "https://example.test/a", title="Page A")
+    browser._register_tab("cdp-2", "s2", "https://example.test/b")
+    browser.active = "t1"
+    state = bind_tabs({"actions": [], "url": "u", "text": "", "scroll": {"y": 0}}, browser)
+    switches = [action for action in state["actions"] if action["kind"] == "switch_tab"]
+    assert [action["label"] for action in switches] == ["Switch to tab https://example.test/b"]
+    browser.active = "t2"
+    state = bind_tabs({"actions": [], "url": "u", "text": "", "scroll": {"y": 0}}, browser)
+    switches = [action for action in state["actions"] if action["kind"] == "switch_tab"]
+    assert [action["label"] for action in switches] == ["Switch to tab Page A"]
+
+
 def test_tabs_default_on(monkeypatch):
     monkeypatch.delenv("JEV_TABS", raising=False)
     assert resolve_config()["tabs"] is True
