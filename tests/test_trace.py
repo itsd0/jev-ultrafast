@@ -5,6 +5,7 @@ import json
 import logging
 import re
 import threading
+import types
 import urllib.error
 import urllib.request
 from http.server import ThreadingHTTPServer
@@ -160,8 +161,9 @@ def test_events_roundtrip(tmp_path):
 class SilentAgent:
     """A finished task with no trace of its own; the server still ends it cleanly."""
 
-    def __init__(self, url, goal, screenshots=False):
+    def __init__(self, url, goal, browser=None, screenshots=False):
         self.config = {}
+        self.browser = browser
 
     def command(self, name, body=None):
         return {"status": "done", "history": [], "decisions": [], "text_calls": [], "page": {"url": "u"}}
@@ -169,7 +171,7 @@ class SilentAgent:
     def snapshot(self):
         return self.command("tick")
 
-    def close(self):
+    def close(self, keep_browser=False):
         pass
 
 
@@ -180,7 +182,13 @@ def trace_service(tmp_path, monkeypatch):
 
     def start(token=""):
         store = hosted.Store(tmp_path / f"runs-{len(services)}.db")
-        runner = hosted.Runner(store, agent_factory=SilentAgent)
+        runner = hosted.SessionRunner(
+            store, agent_factory=SilentAgent,
+            browser_factory=lambda url: types.SimpleNamespace(
+                tabs={}, active=None, close=lambda: None, stop_cloud=lambda: None,
+            ),
+            files_root=tmp_path / "files",
+        )
         handler = type("Handler", (hosted.Handler,), {})
         handler.STORE = store
         handler.RUNNER = runner

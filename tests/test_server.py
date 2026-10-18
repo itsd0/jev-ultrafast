@@ -1,6 +1,8 @@
 """Offline contracts for the hosted task layer. No browsers, no paid APIs."""
 
 import json
+import pathlib
+import tempfile
 import threading
 import time
 import urllib.error
@@ -53,12 +55,12 @@ class FakeBrowser:
 
 
 class FakeAgent:
-    def __init__(self, url, goal, script, screenshots=False):
+    def __init__(self, url, goal, script, browser=None, screenshots=False):
         self.url = url
         self.goal = goal
         self.script = script
         self.config = {}
-        self.browser = None
+        self.browser = browser
         self.closed = False
         self.ticks = 0
         self.last = snap("running", 0)
@@ -72,7 +74,7 @@ class FakeAgent:
     def snapshot(self):
         return self.last
 
-    def close(self):
+    def close(self, keep_browser=False):
         self.closed = True
 
 
@@ -85,14 +87,21 @@ def start_service(tmp_path, monkeypatch):
     def start(script, max_concurrent=2, token="", browser=None):
         fakes = []
 
-        def factory(url, goal, screenshots=False):
-            fake = FakeAgent(url, goal, script, screenshots=screenshots)
-            fake.browser = browser() if callable(browser) else browser
+        def factory(url, goal, browser=None):
+            fake = FakeAgent(url, goal, script, browser=browser)
             fakes.append(fake)
             return fake
 
+        def browsers(url):
+            if callable(browser):
+                return browser()
+            return browser if browser is not None else FakeBrowser()
+
         store = hosted.Store(tmp_path / f"runs-{len(services)}.db")
-        runner = hosted.Runner(store, max_concurrent=max_concurrent, agent_factory=factory)
+        runner = hosted.SessionRunner(
+            store, max_concurrent=max_concurrent, agent_factory=factory,
+            browser_factory=browsers, files_root=tmp_path / "files",
+        )
         handler = type("Handler", (hosted.Handler,), {})
         handler.STORE = store
         handler.RUNNER = runner
@@ -307,15 +316,16 @@ def test_live_waits_for_browser_startup(monkeypatch):
             return snap("running", 0)
         return snap("done", 0)
 
-    def factory(url, goal, screenshots=False):
+    def factory(url, goal, browser=None):
         gate.wait(timeout=10)
-        fake = FakeAgent(url, goal, script, screenshots=screenshots)
-        fake.browser = browser
-        return fake
+        return FakeAgent(url, goal, script, browser=browser)
 
     # A service whose factory blocks until the viewer is already waiting.
     store = hosted.Store(":memory:")
-    runner = hosted.Runner(store, agent_factory=factory)
+    runner = hosted.SessionRunner(
+        store, agent_factory=factory, browser_factory=lambda url: browser,
+        files_root=pathlib.Path(tempfile.mkdtemp()),
+    )
     handler = type("Handler", (hosted.Handler,), {})
     handler.STORE = store
     handler.RUNNER = runner

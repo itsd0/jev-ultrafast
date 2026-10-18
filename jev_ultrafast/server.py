@@ -12,7 +12,6 @@ import sqlite3
 import threading
 import time
 import uuid
-from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
@@ -106,7 +105,12 @@ CREATE TABLE IF NOT EXISTS messages (
     duration_ms INTEGER,
     error TEXT,
     blocked_reason TEXT,
-    partial INTEGER
+    partial INTEGER,
+    final_url TEXT,
+    final_text TEXT,
+    answer_text TEXT,
+    decisions_count INTEGER,
+    start_url TEXT
 );
 CREATE INDEX IF NOT EXISTS messages_session ON messages(session_id, n);
 """
@@ -133,8 +137,8 @@ class Store:
                     self.conn.execute(f"ALTER TABLE tasks ADD COLUMN {column} {ctype}")
             self.conn.commit()
 
-    def create_task(self, goal, url, browser, max_decisions):
-        task_id = uuid.uuid4().hex
+    def create_task(self, goal, url, browser, max_decisions, task_id=None):
+        task_id = task_id or uuid.uuid4().hex
         with self.lock:
             self.conn.execute(
                 "INSERT INTO tasks (id, goal, url, browser, max_decisions, status, created_at)"
@@ -380,16 +384,6 @@ def cost_estimate_usd(prompt, completion):
     return round((prompt + completion) / 1000 * max(rate, 0), 6)
 
 
-def live_url_for(agent):
-    """A cloud run's live view, and only when the operator opted into showing it."""
-    if not env_bool("JEV_CLOUD_SHOW_LIVE_URL", False):
-        return None
-    handle = getattr(getattr(agent, "browser", None), "cloud", None)
-    if isinstance(handle, dict):
-        return handle.get("live_url")
-    return None
-
-
 def reclaim_daemon(name):
     """Stop our own daemon when its browser link is dead. Never touches others'.
 
@@ -573,253 +567,17 @@ class FramePump:
             time.sleep(0.03)
 
 
-class Runner:
-    """In-process FIFO queue. Worker threads drive one Agent each, tick by tick."""
-
-    def __init__(self, store, max_concurrent=2, agent_factory=None, daemon_name=None):
-        self.store = store
-        self.max_concurrent = max(1, int(max_concurrent))
-        self.agent_factory = agent_factory or Agent
-        self.pump = FramePump(daemon_name or os.environ.get("BU_NAME", "default"))
-        self._pending = deque()
-        self._active = {}
-        self._cond = threading.Condition()
-        self._create_lock = threading.Lock()
-        worker = threading.Thread(target=self._dispatch_loop, daemon=True)
-        worker.start()
-
-    def submit(self, goal, url, browser="local", max_decisions=None):
-        goal = (goal or "").strip()
-        if not goal or len(goal) > 2000:
-            raise ValueError("Enter a goal of 1-2,000 characters")
-        url = (url or "").strip() or "about:blank"
-        if url != "about:blank":
-            parsed = urlparse(url)
-            if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-                raise ValueError("Enter an http(s) start URL or leave it blank to navigate")
-        if browser not in {"local", "cloud"}:
-            raise ValueError("browser must be local or cloud")
-        if max_decisions is not None and not 1 <= int(max_decisions) <= 10000:
-            raise ValueError("max_decisions must be 1-10,000")
-        task_id = self.store.create_task(goal, url, browser, max_decisions)
-        with self._cond:
-            self._pending.append(task_id)
-            self._cond.notify()
-        LOG.info(f"[jev:server] task {task_id[:8]} queued ({browser})")
-        return task_id
-
-    def stop(self, task_id):
-        with self._cond:
-            task = self.store.get_task(task_id)
-            if task is None:
-                return None
-            if task["status"] == "queued" and task_id in self._pending:
-                self._pending.remove(task_id)
-                self.store.update_task(
-                    task_id, status="blocked", ended_at=time.time(), error="stopped by user"
-                )
-            elif task["status"] == "running" and task_id in self._active:
-                self._active[task_id]["stop"].set()
-            return self.store.get_task(task_id)
-
-    def _dispatch_loop(self):
-        while True:
-            with self._cond:
-                while not self._pending or len(self._active) >= self.max_concurrent:
-                    self._cond.wait()
-                task_id = self._pending.popleft()
-                self._active[task_id] = {"stop": threading.Event()}
-            worker = threading.Thread(target=self._run_task, args=(task_id,), daemon=True)
-            with self._cond:
-                self._active[task_id]["thread"] = worker
-            worker.start()
-
-    def _create_agent(self, task):
-        # JEV_BROWSER and JEV_RUN_ID are read once during construction. The lock
-        # plus restore keeps mixed tasks from seeing each other's values.
-        with self._create_lock:
-            previous_browser = os.environ.get("JEV_BROWSER")
-            previous_run = os.environ.get("JEV_RUN_ID")
-            os.environ["JEV_BROWSER"] = task["browser"]
-            os.environ["JEV_RUN_ID"] = task["id"]
-            try:
-                agent = self.agent_factory(task["url"], task["goal"], screenshots=False)
-            finally:
-                if previous_browser is None:
-                    os.environ.pop("JEV_BROWSER", None)
-                else:
-                    os.environ["JEV_BROWSER"] = previous_browser
-                if previous_run is None:
-                    os.environ.pop("JEV_RUN_ID", None)
-                else:
-                    os.environ["JEV_RUN_ID"] = previous_run
-        if task["max_decisions"] is not None:
-            agent.config["max_decisions"] = task["max_decisions"]
-        trace = getattr(agent, "trace", None)
-        if trace is not None:
-            trace.attach(task["id"], self.store)
-        return agent
-
-    def _record_new_steps(self, task_id, snapshot, recorded):
-        history = snapshot.get("history") or []
-        for entry in history[recorded:]:
-            self.store.add_step(
-                task_id,
-                entry.get("step", recorded + 1),
-                entry.get("operation"),
-                entry.get("action"),
-                entry.get("url"),
-                entry.get("elapsed_ms"),
-                entry.get("note"),
-            )
-        return len(history)
-
-    @staticmethod
-    def _final_text(browser, page):
-        """Bench evidence: full-document text for checks only. Viewport on failure."""
-        evaluate = getattr(browser, "evaluate", None)
-        if evaluate is not None:
-            try:
-                full = evaluate(full_text_expression())
-            except Exception:
-                full = None
-            if isinstance(full, str) and full.strip():
-                return full[:20000]
-        return (page.get("text") or "")[:20000]
-
-    def _finish(self, task_id, snapshot, status, error=None, trace=None, browser=None):
-        prompt, completion = tally_tokens(snapshot)
-        page = snapshot.get("page") or {}
-        self.store.update_task(
-            task_id,
-            status=status,
-            ended_at=time.time(),
-            final_url=page.get("url"),
-            final_text=self._final_text(browser, page),
-            answer_text=snapshot.get("answer"),
-            decisions_count=len(snapshot.get("decisions") or []),
-            blocked_reason=snapshot.get("blocked_reason"),
-            partial=int(bool(snapshot.get("partial"))),
-            verified_by_agent=int(status == "done"),
-            input_tokens=prompt,
-            output_tokens=completion,
-            cost_usd_estimate=cost_estimate_usd(prompt, completion),
-            error=error,
-        )
-        if trace is not None and not trace.ended:
-            trace.emit(
-                "end", step=len(snapshot.get("history") or []), status=status,
-                blocked_reason=snapshot.get("blocked_reason"), error=(error or "")[:200],
-                decisions=len(snapshot.get("decisions") or []),
-                input_tokens=prompt, output_tokens=completion,
-                cost_usd_estimate=cost_estimate_usd(prompt, completion),
-                wall_ms=snapshot.get("elapsed_ms"),
-                phases={phase: round(value) for phase, value in trace.phase_ms.items()},
-            )
-            trace.flush()
-        LOG.info(f"[jev:server] task {task_id[:8]} {status} tokens={prompt + completion} error={error or '-'}")
-
-    def wait_for_viewer(self, task_id, timeout=20):
-        """Like get_viewer, but waits out queueing and browser startup."""
-        deadline = time.monotonic() + timeout
-        while True:
-            viewer, status = self.get_viewer(task_id)
-            if viewer is not None or status == 404:
-                return viewer, status
-            task = self.store.get_task(task_id)
-            if task is None or task["status"] in TERMINAL or task["browser"] != "local":
-                return None, status
-            if time.monotonic() >= deadline:
-                return None, status
-            time.sleep(0.2)
-
-    def get_viewer(self, task_id):
-        """A task's live frame source, or (None, status) when unavailable."""
-        with self._cond:
-            entry = self._active.get(task_id)
-        task = self.store.get_task(task_id)
-        if task is None:
-            return None, 404
-        if task["status"] != "running" or entry is None or task["browser"] != "local":
-            return None, 409
-        browser = getattr(entry.get("agent"), "browser", None)
-        session = getattr(browser, "session", None)
-        call = getattr(browser, "call", None)
-        if session is None or call is None:
-            return None, 409
-        with self._cond:
-            viewer = entry.get("viewer")
-            if viewer is None:
-                viewer = Viewer(self.pump, call, session)
-                entry["viewer"] = viewer
-        return viewer, 200
-
-    def live_url(self, task_id):
-        """A running cloud task's live view. In-memory only, never in the DB."""
-        with self._cond:
-            entry = self._active.get(task_id)
-        if entry is None:
-            return None
-        return entry.get("live_url")
-
-    def _run_task(self, task_id):
-        with self._cond:
-            stopper = self._active[task_id]["stop"]
-        self.store.update_task(task_id, status="running", started_at=time.time())
-        agent = None
-        trace = None
+def final_text_for(browser, page):
+    """Bench evidence: full-document text for checks only. Viewport on failure."""
+    evaluate = getattr(browser, "evaluate", None)
+    if evaluate is not None:
         try:
-            agent = self._create_agent(self.store.get_task(task_id))
-            trace = getattr(agent, "trace", None)
-            with self._cond:
-                self._active[task_id]["agent"] = agent
-                self._active[task_id]["live_url"] = live_url_for(agent)
-            recorded = 0
-            while True:
-                snapshot = agent.command("tick")
-                recorded = self._record_new_steps(task_id, snapshot, recorded)
-                if stopper.is_set():
-                    self._finish(
-                        task_id, snapshot, "blocked", "stopped by user", trace,
-                        browser=agent.browser,
-                    )
-                    return
-                if snapshot.get("status") in TERMINAL - {"failed"}:
-                    self._finish(
-                        task_id, snapshot, snapshot["status"], trace=trace,
-                        browser=agent.browser,
-                    )
-                    return
-        except Exception as error:
-            try:
-                snapshot = agent.snapshot() if agent is not None else {}
-            except Exception:
-                snapshot = {}
-            if trace is not None:
-                trace.emit(
-                    "error", step=len((snapshot or {}).get("history") or []),
-                    type=type(error).__name__, message=str(error)[:300],
-                    where="run", retried=False,
-                )
-            safe = str(redact_secrets(f"{type(error).__name__}: {error}"))[:500]
-            snapshot = snapshot if isinstance(snapshot, dict) else {}
-            self._finish(
-                task_id, snapshot, "failed", safe, trace,
-                browser=getattr(agent, "browser", None),
-            )
-        finally:
-            if agent is not None:
-                try:
-                    agent.close()
-                except Exception:
-                    pass
-            if trace is not None:
-                trace.close()
-            with self._cond:
-                entry = self._active.pop(task_id, None)
-                self._cond.notify()
-            if entry is not None and entry.get("viewer") is not None:
-                entry["viewer"].shutdown()
+            full = evaluate(full_text_expression())
+        except Exception:
+            full = None
+        if isinstance(full, str) and full.strip():
+            return full[:20000]
+    return (page.get("text") or "")[:20000]
 
 
 def session_title(text):
@@ -919,10 +677,11 @@ class SessionRunner:
     """
 
     def __init__(self, store, max_concurrent=2, agent_factory=None, daemon_name=None,
-                 files_root=None, idle_min=None):
+                 files_root=None, idle_min=None, browser_factory=None):
         self.store = store
         self.max_concurrent = max(1, int(max_concurrent))
         self.agent_factory = agent_factory or Agent
+        self.browser_factory = browser_factory or Browser
         self.pump = FramePump(daemon_name or os.environ.get("BU_NAME", "default"))
         self.files_root = Path(files_root) if files_root else Path.cwd() / "artifacts" / "sessions"
         if idle_min is None:
@@ -993,12 +752,137 @@ class SessionRunner:
             self._running = max(0, self._running - 1)
             self._cond.notify_all()
 
-    def submit_message(self, session_id, text, max_decisions=None):
+    def submit_task(self, goal, url, browser="local", max_decisions=None):
+        """The old one-shot task API: one session, one message."""
+        goal = (goal or "").strip()
+        if not goal or len(goal) > 2000:
+            raise ValueError("Enter a goal of 1-2,000 characters")
+        url = (url or "").strip() or "about:blank"
+        if url != "about:blank":
+            parsed = urlparse(url)
+            if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+                raise ValueError("Enter an http(s) start URL or leave it blank to navigate")
+        session_id = self.create_session(browser, session_title(goal))
+        message_id = self.submit_message(
+            session_id, goal, max_decisions,
+            url=None if url == "about:blank" else url,
+        )
+        self.store.update_message(message_id, start_url=url)
+        # Legacy mirror so old tasks-table readers keep working; live_url stays NULL.
+        self.store.create_task(goal, url, browser, max_decisions, task_id=message_id)
+        return message_id
+
+    def task_view(self, message_id, with_steps=True, with_text=True):
+        """A message rendered as the legacy task shape. None when unknown."""
+        message = self.store.get_message(message_id)
+        if message is None:
+            return None
+        session = self.store.get_session(message["session_id"], with_steps=False)
+        if session is None:
+            return None
+        run_id = message.get("run_id") or message_id
+        view = {
+            "id": message_id,
+            "goal": message["user_text"],
+            "url": message.get("start_url") or "about:blank",
+            "browser": session["browser"],
+            "max_decisions": None,
+            "status": message["status"],
+            "created_at": message["created_at"],
+            "started_at": message["created_at"],
+            "ended_at": message.get("ended_at"),
+            "final_url": message.get("final_url"),
+            "verified_by_agent": int(message["status"] == "done"),
+            "input_tokens": message.get("input_tokens"),
+            "output_tokens": message.get("output_tokens"),
+            "cost_usd_estimate": message.get("cost_usd_estimate"),
+            "error": message.get("error"),
+            "live_url": self.live_url(message["session_id"]) if message["status"] == "running" else None,
+            "answer_text": message.get("answer_text"),
+            "decisions_count": message.get("decisions_count"),
+            "blocked_reason": message.get("blocked_reason"),
+            "partial": message.get("partial"),
+        }
+        if with_text:
+            view["final_text"] = message.get("final_text")
+        if with_steps:
+            view["steps"] = [dict(r) for r in self._message_steps(run_id)]
+            view["step_count"] = len(view["steps"])
+        return view
+
+    def _message_steps(self, run_id):
+        with self.store.lock:
+            return self.store.conn.execute(
+                "SELECT n, operation, target_label, url, ms, note FROM steps"
+                " WHERE task_id = ? ORDER BY n",
+                (run_id,),
+            ).fetchall()
+
+    def list_task_views(self, limit=50):
+        """Legacy task list: every session's first message plus pre-session rows."""
+        views = []
+        for session in self.store.list_sessions(limit=limit):
+            full = self.store.get_session(session["id"], with_steps=False)
+            messages = (full or {}).get("messages") or []
+            if not messages:
+                continue
+            view = self.task_view(messages[0]["id"], with_steps=False, with_text=False)
+            if view is not None:
+                view["step_count"] = self._step_count(messages[0].get("run_id"))
+                views.append(view)
+        legacy_ids = {view["id"] for view in views}
+        for task in self.store.list_tasks(limit=limit):
+            if task["id"] not in legacy_ids:
+                views.append(task)
+        views.sort(key=lambda item: item.get("created_at") or 0, reverse=True)
+        return views[:limit]
+
+    def _step_count(self, run_id):
+        if not run_id:
+            return 0
+        with self.store.lock:
+            row = self.store.conn.execute(
+                "SELECT COUNT(*) FROM steps WHERE task_id = ?", (run_id,)
+            ).fetchone()
+        return row[0] if row else 0
+
+    def stop_message(self, message_id):
+        """Stop one turn: queued turns block immediately, running turns stop."""
+        message = self.store.get_message(message_id)
+        if message is None:
+            return None
+        if message["status"] == "queued":
+            self.store.update_message(
+                message_id, status="blocked", ended_at=time.time(), error="stopped by user"
+            )
+        else:
+            self.stop(message["session_id"])
+        return self.task_view(message_id, with_steps=False, with_text=False)
+
+    def wait_for_viewer(self, session_id, timeout=20):
+        deadline = time.monotonic() + timeout
+        while True:
+            viewer, status = self.get_viewer(session_id)
+            if viewer is not None or status == 404:
+                return viewer, status
+            session = self.store.get_session(session_id, with_steps=False)
+            if session is None or session["browser"] != "local":
+                return None, status
+            if time.monotonic() >= deadline:
+                return None, status
+            time.sleep(0.2)
+
+    def submit_message(self, session_id, text, max_decisions=None, url=None):
         text = (text or "").strip()
         if not text or len(text) > 4000:
             raise ValueError("Enter a message of 1-4,000 characters")
         if max_decisions is not None and not 1 <= int(max_decisions) <= 10000:
             raise ValueError("max_decisions must be 1-10,000")
+        url = (url or "").strip() or None
+        if url is not None:
+            parsed = urlparse(url)
+            if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+                raise ValueError("Enter an http(s) start URL")
         entry = self._entry(session_id)
         if entry is None:
             return None
@@ -1008,7 +892,7 @@ class SessionRunner:
             self.store.update_session(session_id, title=session_title(text))
         worker = threading.Thread(
             target=self._run_message,
-            args=(session_id, message_id, text, max_decisions),
+            args=(session_id, message_id, text, max_decisions, url),
             daemon=True,
         )
         with self._cond:
@@ -1107,7 +991,7 @@ class SessionRunner:
             previous = os.environ.get("JEV_BROWSER")
             os.environ["JEV_BROWSER"] = browser_mode
             try:
-                browser = Browser("about:blank")
+                browser = self.browser_factory("about:blank")
             finally:
                 if previous is None:
                     os.environ.pop("JEV_BROWSER", None)
@@ -1149,7 +1033,7 @@ class SessionRunner:
             trace.attach(run_id, self.store)
         return agent
 
-    def _run_message(self, session_id, message_id, text, max_decisions):
+    def _run_message(self, session_id, message_id, text, max_decisions, url=None):
         entry = self._entry(session_id)
         if entry is None:
             return
@@ -1158,22 +1042,38 @@ class SessionRunner:
                 self.store.update_message(message_id, status="blocked", error="stopped by user")
                 return
             try:
-                self._drive_message(session_id, message_id, text, max_decisions, entry)
+                self._drive_message(session_id, message_id, text, max_decisions, entry, url)
             finally:
                 self._release_slot()
                 entry["last_active"] = time.time()
 
-    def _drive_message(self, session_id, message_id, text, max_decisions, entry):
+    @staticmethod
+    def _close_turn_agent(entry, agent):
+        """Release the turn's agent before its terminal status is visible. Idempotent."""
+        if agent is None or entry.get("agent") is not agent:
+            return
+        entry["agent"] = None
+        try:
+            agent.close(keep_browser=True)
+        except Exception:
+            pass
+
+    def _drive_message(self, session_id, message_id, text, max_decisions, entry, url=None):
         session = self.store.get_session(session_id, with_steps=False)
         if session is None:
             return
-        run_id = uuid.uuid4().hex
+        run_id = message_id
         started = time.monotonic()
         self.store.update_message(message_id, status="running", run_id=run_id)
         self._publish(session_id, {"type": "message", "message_id": message_id, "status": "running"})
         agent = trace = None
         try:
             browser = self._ensure_browser(session_id, session["browser"])
+            if url and not entry.get("navigated"):
+                navigate = getattr(browser, "navigate", None)
+                if callable(navigate):
+                    navigate(url)
+                entry["navigated"] = True
             current_url = self._browser_url(browser)
             goal = session_context(
                 self._prior_turns(session_id, message_id),
@@ -1198,12 +1098,14 @@ class SessionRunner:
                     ],
                 })
                 if entry["stop"].is_set():
+                    self._close_turn_agent(entry, agent)
                     self._finish_message(
                         session_id, message_id, snapshot, "blocked", "stopped by user",
                         trace, started, browser,
                     )
                     return
                 if snapshot.get("status") in TERMINAL - {"failed"}:
+                    self._close_turn_agent(entry, agent)
                     self._finish_message(
                         session_id, message_id, snapshot, snapshot["status"], None,
                         trace, started, browser,
@@ -1222,17 +1124,13 @@ class SessionRunner:
                 )
             safe = str(redact_secrets(f"{type(error).__name__}: {error}"))[:500]
             snapshot = snapshot if isinstance(snapshot, dict) else {}
+            self._close_turn_agent(entry, agent)
             self._finish_message(
                 session_id, message_id, snapshot, "failed", safe, trace, started,
                 getattr(agent, "browser", None),
             )
         finally:
-            if agent is not None:
-                try:
-                    agent.close(keep_browser=True)
-                except Exception:
-                    pass
-            entry["agent"] = None
+            self._close_turn_agent(entry, agent)
 
     def _prior_turns(self, session_id, message_id):
         current = self.store.get_message(message_id) or {}
@@ -1268,6 +1166,8 @@ class SessionRunner:
         cost = cost_estimate_usd(prompt, completion)
         reply = compose_reply(snapshot, status, error)
         duration_ms = round((time.monotonic() - started) * 1000)
+        page = snapshot.get("page") or {}
+        final_text = final_text_for(browser, page)
         self.store.update_message(
             message_id,
             status=status,
@@ -1278,6 +1178,27 @@ class SessionRunner:
             cost_usd_estimate=cost,
             duration_ms=duration_ms,
             error=error,
+            blocked_reason=snapshot.get("blocked_reason"),
+            partial=int(bool(snapshot.get("partial"))),
+            final_url=page.get("url"),
+            final_text=final_text,
+            answer_text=snapshot.get("answer"),
+            decisions_count=len(snapshot.get("decisions") or []),
+        )
+        # No-op unless this message backs a legacy /api/tasks row.
+        self.store.update_task(
+            message_id,
+            status=status,
+            ended_at=time.time(),
+            final_url=page.get("url"),
+            verified_by_agent=int(status == "done"),
+            input_tokens=prompt,
+            output_tokens=completion,
+            cost_usd_estimate=cost,
+            error=error,
+            final_text=final_text,
+            answer_text=snapshot.get("answer"),
+            decisions_count=len(snapshot.get("decisions") or []),
             blocked_reason=snapshot.get("blocked_reason"),
             partial=int(bool(snapshot.get("partial"))),
         )
@@ -1301,6 +1222,10 @@ class SessionRunner:
                 phases={phase: round(value) for phase, value in trace.phase_ms.items()},
             )
             trace.flush()
+            try:
+                trace.close()
+            except Exception:
+                pass
         self._publish(session_id, {
             "type": "reply", "message_id": message_id, "status": status,
             "reply": reply, "cost": cost, "duration_ms": duration_ms,
@@ -1402,8 +1327,28 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200, json.dumps({"status": "ok"}))
         if not self.authorized():
             return self.send(401, json.dumps({"error": "Bearer token required"}))
+        if path == "/api/sessions":
+            return self.send(200, json.dumps(self.STORE.list_sessions()))
+        if path == "/api/usage":
+            return self.send(200, json.dumps(self.STORE.usage_by_day()))
+        if path.startswith("/api/sessions/") and path.endswith("/events"):
+            session_id = path.removeprefix("/api/sessions/").removesuffix("/events")
+            query = dict(
+                part.split("=", 1) if "=" in part else (part, "")
+                for part in urlparse(self.path).query.split("&") if part
+            )
+            try:
+                since = int(query.get("since", "0") or 0)
+            except ValueError:
+                since = 0
+            return self.stream_session_events(session_id, since)
+        if path.startswith("/api/sessions/"):
+            session_id = path.removeprefix("/api/sessions/")
+            if "/" in session_id or not session_id:
+                return self.send(404, json.dumps({"error": "Not found"}))
+            return self.serve_session(session_id)
         if path == "/api/tasks":
-            return self.send(200, json.dumps(self.STORE.list_tasks()))
+            return self.send(200, json.dumps(self.RUNNER.list_task_views()))
         if path.startswith("/api/tasks/") and path.endswith("/live"):
             return self.stream_live(path.removeprefix("/api/tasks/").removesuffix("/live"))
         if path.startswith("/api/tasks/") and path.endswith("/trace"):
@@ -1417,18 +1362,40 @@ class Handler(BaseHTTPRequestHandler):
         task_id = path.removeprefix("/api/tasks/")
         if "/" in task_id or not task_id:
             return self.send(404, json.dumps({"error": "Not found"}))
-        task = self.STORE.get_task(task_id)
+        task = self.RUNNER.task_view(task_id)
+        if task is None:
+            task = self.STORE.get_task(task_id)
         if task is None:
             return self.send(404, json.dumps({"error": "Unknown task"}))
-        task["live_url"] = self.RUNNER.live_url(task_id)
         return self.send(200, json.dumps(task))
+
+    def serve_session(self, session_id):
+        session = self.STORE.get_session(session_id)
+        if session is None:
+            return self.send(404, json.dumps({"error": "Unknown session"}))
+        entry = self.RUNNER._entry(session_id)
+        browser = entry.get("browser") if entry else None
+        session["tabs"] = session_tabs(browser) if browser is not None else session["last_tabs"]
+        session["live_url"] = self.RUNNER.live_url(session_id)
+        session["browser_alive"] = browser is not None
+        return self.send(200, json.dumps(session))
+
+    def _run_id_for(self, task_id):
+        """A task id is a message id; its run id keys steps, events, and traces."""
+        message = self.STORE.get_message(task_id)
+        if message is not None:
+            return message.get("run_id") or task_id
+        if self.STORE.get_task(task_id) is not None:
+            return task_id
+        return None
 
     def serve_trace(self, task_id, download):
         if "/" in task_id or not task_id:
             return self.send(404, json.dumps({"error": "Not found"}))
-        if self.STORE.get_task(task_id) is None:
+        run_id = self._run_id_for(task_id)
+        if run_id is None:
             return self.send(404, json.dumps({"error": "Unknown task"}))
-        events = self.STORE.get_events(task_id)
+        events = self.STORE.get_events(run_id)
         if not download:
             return self.send(200, json.dumps({"task_id": task_id, "events": events}))
         body = "".join(json.dumps(event) + "\n" for event in events)
@@ -1440,10 +1407,11 @@ class Handler(BaseHTTPRequestHandler):
     def serve_failshot(self, task_id):
         if "/" in task_id or not task_id or not all(char.isalnum() or char == "-" for char in task_id):
             return self.send(404, json.dumps({"error": "Not found"}))
-        if self.STORE.get_task(task_id) is None:
+        run_id = self._run_id_for(task_id)
+        if run_id is None:
             return self.send(404, json.dumps({"error": "Unknown task"}))
         try:
-            shots = sorted(trace_dir(task_id).glob("fail-step-*.png"))
+            shots = sorted(trace_dir(run_id).glob("fail-step-*.png"))
         except OSError:
             shots = []
         if not shots:
@@ -1454,7 +1422,14 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(404, json.dumps({"error": "No failure screenshot"}))
 
     def stream_live(self, task_id):
-        viewer, status = self.RUNNER.wait_for_viewer(task_id)
+        message = self.STORE.get_message(task_id)
+        if message is None:
+            if self.STORE.get_task(task_id) is None:
+                return self.send(404, json.dumps({"error": "Unknown task"}))
+            return self.send(409, json.dumps({"error": "Live view needs a running local task"}))
+        if message["status"] in TERMINAL:
+            return self.send(409, json.dumps({"error": "Live view needs a running local task"}))
+        viewer, status = self.RUNNER.wait_for_viewer(message["session_id"])
         if viewer is None:
             if status == 404:
                 return self.send(404, json.dumps({"error": "Unknown task"}))
@@ -1472,9 +1447,9 @@ class Handler(BaseHTTPRequestHandler):
             while True:
                 with viewer.cond:
                     viewer.cond.wait_for(lambda: viewer.seq > last_seq, timeout=1.0)
-                task = self.STORE.get_task(task_id)
-                if task is None or task["status"] in TERMINAL:
-                    payload = {"ended": True, "status": (task or {}).get("status")}
+                message = self.STORE.get_message(task_id)
+                if message is None or message["status"] in TERMINAL:
+                    payload = {"ended": True, "status": (message or {}).get("status")}
                     self.wfile.write(f"data: {json.dumps(payload)}\n\n".encode())
                     self.wfile.flush()
                     return
@@ -1490,6 +1465,68 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             viewer.remove_viewer()
 
+    def stream_session_events(self, session_id, since=0):
+        if "/" in session_id or not session_id:
+            return self.send(404, json.dumps({"error": "Not found"}))
+        session = self.STORE.get_session(session_id, with_steps=False)
+        if session is None:
+            return self.send(404, json.dumps({"error": "Unknown session"}))
+        entry = self.RUNNER._entry(session_id)
+        bus = entry["bus"]
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+        viewer = None
+        try:
+            self.wfile.write(b": connected\n\n")
+            self.wfile.flush()
+            if session["browser"] == "local":
+                viewer, _ = self.RUNNER.get_viewer(session_id)
+                if viewer is not None:
+                    viewer.add_viewer()
+            else:
+                live_url = self.RUNNER.live_url(session_id)
+                if live_url:
+                    self.wfile.write(
+                        f"data: {json.dumps({'type': 'live_url', 'live_url': live_url})}\n\n".encode()
+                    )
+                    self.wfile.flush()
+            last_seq, last_frame = since, 0
+            for seq, event in self.RUNNER.replay(session_id, since):
+                last_seq = seq
+                self.wfile.write(f"data: {json.dumps({'seq': seq, **event})}\n\n".encode())
+            self.wfile.flush()
+            while True:
+                with bus.cond:
+                    bus.cond.wait_for(lambda: bus.seq > last_seq, timeout=1.0)
+                if viewer is not None:
+                    current, _ = self.RUNNER.get_viewer(session_id)
+                    if current is not viewer:
+                        viewer.remove_viewer()
+                        viewer = current
+                        if viewer is not None:
+                            viewer.add_viewer()
+                if viewer is not None and viewer.seq > last_frame:
+                    last_frame = viewer.seq
+                    payload = {"type": "frame", "seq": last_frame, "image": viewer.latest}
+                    self.wfile.write(f"data: {json.dumps(payload)}\n\n".encode())
+                elif bus.seq > last_seq:
+                    for seq, event in self.RUNNER.replay(session_id, last_seq):
+                        last_seq = seq
+                        self.wfile.write(
+                            f"data: {json.dumps({'seq': seq, **event})}\n\n".encode()
+                        )
+                else:
+                    self.wfile.write(b": ping\n\n")
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        finally:
+            if viewer is not None:
+                viewer.remove_viewer()
+
     def do_POST(self):
         if not (self.host_ok() and self.origin_ok()):
             return self.send(403, json.dumps({"error": "Local requests only"}))
@@ -1501,8 +1538,27 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError("Invalid request size")
             body = json.loads(self.rfile.read(length) or b"{}")
             path = urlparse(self.path).path
+            if path == "/api/sessions":
+                session_id = self.RUNNER.create_session(
+                    body.get("browser", "local"), body.get("title")
+                )
+                return self.send(201, json.dumps({"id": session_id}))
+            if path.startswith("/api/sessions/") and path.endswith("/messages"):
+                session_id = path.removeprefix("/api/sessions/").removesuffix("/messages")
+                message_id = self.RUNNER.submit_message(
+                    session_id, body.get("text"), body.get("max_decisions")
+                )
+                if message_id is None:
+                    return self.send(404, json.dumps({"error": "Unknown session"}))
+                return self.send(201, json.dumps({"id": message_id}))
+            if path.startswith("/api/sessions/") and path.endswith("/stop"):
+                session_id = path.removeprefix("/api/sessions/").removesuffix("/stop")
+                if self.STORE.get_session(session_id, with_steps=False) is None:
+                    return self.send(404, json.dumps({"error": "Unknown session"}))
+                self.RUNNER.stop(session_id)
+                return self.send(200, json.dumps({"id": session_id, "status": "stopping"}))
             if path == "/api/tasks":
-                task_id = self.RUNNER.submit(
+                task_id = self.RUNNER.submit_task(
                     body.get("goal"),
                     body.get("url"),
                     body.get("browser", "local"),
@@ -1511,15 +1567,33 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(201, json.dumps({"id": task_id}))
             if path.startswith("/api/tasks/") and path.endswith("/stop"):
                 task_id = path.removeprefix("/api/tasks/").removesuffix("/stop")
-                task = self.RUNNER.stop(task_id)
+                task = self.RUNNER.stop_message(task_id)
                 if task is None:
-                    return self.send(404, json.dumps({"error": "Unknown task"}))
+                    if self.STORE.get_task(task_id) is None:
+                        return self.send(404, json.dumps({"error": "Unknown task"}))
+                    return self.send(200, json.dumps({"id": task_id, "status": "blocked"}))
                 return self.send(200, json.dumps({"id": task_id, "status": task["status"]}))
             return self.send(404, json.dumps({"error": "Not found"}))
         except (ValueError, RuntimeError, TimeoutError) as error:
             self.send(400, json.dumps({"error": str(error)}))
         except Exception:
             self.send(500, json.dumps({"error": "Task request failed; nothing was retried."}))
+
+    def do_DELETE(self):
+        if not (self.host_ok() and self.origin_ok()):
+            return self.send(403, json.dumps({"error": "Local requests only"}))
+        if not self.authorized():
+            return self.send(401, json.dumps({"error": "Bearer [REDACTED] required"}))
+        path = urlparse(self.path).path
+        if path.startswith("/api/sessions/"):
+            session_id = path.removeprefix("/api/sessions/")
+            if "/" in session_id or not session_id:
+                return self.send(404, json.dumps({"error": "Not found"}))
+            if self.STORE.get_session(session_id, with_steps=False) is None:
+                return self.send(404, json.dumps({"error": "Unknown session"}))
+            self.RUNNER.delete_session(session_id)
+            return self.send(200, json.dumps({"id": session_id, "deleted": True}))
+        return self.send(404, json.dumps({"error": "Not found"}))
 
     def log_message(self, *_args):
         pass
@@ -1542,7 +1616,7 @@ def main():
     except ValueError:
         max_concurrent = 2
     Handler.STORE = Store(db_path)
-    Handler.RUNNER = Runner(Handler.STORE, max_concurrent=max_concurrent)
+    Handler.RUNNER = SessionRunner(Handler.STORE, max_concurrent=max_concurrent)
     Handler.HOST = host
     Handler.PORT = port
     Handler.TOKEN = os.environ.get("JEV_SERVER_TOKEN", "")
