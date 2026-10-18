@@ -508,3 +508,78 @@ def test_store_migrates_old_schema(tmp_path):
     assert row["goal"] == "Old"
     assert row["answer_text"] is None
     assert row["decisions_count"] is None
+
+
+def wait_session(base, session_id, statuses=("done", "blocked", "failed"), timeout=10):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        _, session = api(base, "GET", f"/api/sessions/{session_id}")
+        messages = session["messages"]
+        if messages and messages[-1]["status"] in statuses:
+            return session
+        time.sleep(0.05)
+    raise AssertionError("session message did not finish")
+
+
+def test_sessions_http_lifecycle(start_service):
+    base, _ = start_service(lambda fake: snap("done", 1))
+    status, created = api(base, "POST", "/api/sessions", {"browser": "local"})
+    assert status == 201
+    _, listed = api(base, "GET", "/api/sessions")
+    assert [session["id"] for session in listed] == [created["id"]]
+    status, posted = api(base, "POST", f"/api/sessions/{created['id']}/messages", {"text": "hi"})
+    assert status == 201
+    session = wait_session(base, created["id"])
+    assert session["messages"][0]["agent_reply"]
+    assert session["messages"][0]["id"] == posted["id"]
+    status, _ = api(base, "DELETE", f"/api/sessions/{created['id']}")
+    assert status == 200
+    assert api(base, "GET", f"/api/sessions/{created['id']}")[0] == 404
+
+
+def test_sessions_http_auth(start_service):
+    base, _ = start_service(lambda fake: snap("done", 0), token="secret")
+    assert api(base, "GET", "/api/sessions")[0] == 401
+    assert api(base, "POST", "/api/sessions", {"browser": "local"})[0] == 401
+    status, created = api(base, "POST", "/api/sessions", {"browser": "local"}, token="secret")
+    assert status == 201
+    _, session = api(base, "GET", f"/api/sessions/{created['id']}", token="secret")
+    assert session["id"] == created["id"]
+
+
+def test_session_files_roundtrip(start_service):
+    import base64
+
+    base, _ = start_service(lambda fake: snap("done", 0))
+    _, created = api(base, "POST", "/api/sessions", {"browser": "local"})
+    sid = created["id"]
+    _, listed = api(base, "GET", f"/api/sessions/{sid}/files")
+    assert listed == {"files": []}
+    body = {"name": "results.csv", "content_b64": base64.b64encode(b"a,b\n1,2\n").decode()}
+    status, stored = api(base, "POST", f"/api/sessions/{sid}/files", body)
+    assert status == 201
+    assert stored == {"name": "results.csv", "bytes": 8}
+    _, listed = api(base, "GET", f"/api/sessions/{sid}/files")
+    assert [row["name"] for row in listed["files"]] == ["results.csv"]
+    assert listed["files"][0]["bytes"] == 8
+    request = urllib.request.Request(base + f"/api/sessions/{sid}/files/results.csv", method="GET")
+    with urllib.request.urlopen(request, timeout=10) as response:
+        assert response.status == 200
+        assert response.read() == b"a,b\n1,2\n"
+        assert "attachment" in response.headers.get("Content-Disposition", "")
+    _, session = api(base, "GET", f"/api/sessions/{sid}")
+    assert [row["name"] for row in session["files"]] == ["results.csv"]
+
+
+def test_session_files_auth_and_validation(start_service):
+    base, _ = start_service(lambda fake: snap("done", 0), token="secret")
+    _, created = api(base, "POST", "/api/sessions", {"browser": "local"}, token="secret")
+    sid = created["id"]
+    assert api(base, "GET", f"/api/sessions/{sid}/files")[0] == 401
+    assert api(base, "POST", f"/api/sessions/{sid}/files", {"name": "a.txt"})[0] == 401
+    good = {"name": "a.txt", "content_b64": "aGk="}
+    assert api(base, "POST", "/api/sessions/nope/files", good, token="secret")[0] == 404
+    assert api(base, "GET", "/api/sessions/nope/files", token="secret")[0] == 404
+    assert api(base, "POST", f"/api/sessions/{sid}/files", {**good, "name": "../x"}, token="secret")[0] == 400
+    assert api(base, "POST", f"/api/sessions/{sid}/files", {**good, "content_b64": "!!"}, token="secret")[0] == 400
+    assert api(base, "GET", f"/api/sessions/{sid}/files/../x", token="secret")[0] == 404

@@ -244,6 +244,77 @@ def test_viewer_follows_active_tab(tmp_path):
     assert second is not first
 
 
+def test_files_event_published_when_agent_writes(tmp_path):
+    runner = _runner(tmp_path, agent_factory=None)
+    sid = runner.create_session("local")
+    files_dir = runner.session_files_dir(sid)
+    ticks = []
+
+    def script():
+        ticks.append(1)
+        if len(ticks) == 1:
+            (files_dir / "results.csv").write_text("a,b\n")
+            return {"status": "running", "history": [], "page": {"url": "about:blank"}}
+        return {"status": "done", "history": [], "answer": "Saved."}
+
+    def factory(url, goal, browser=None):
+        return FakeAgent(url, goal, browser=browser, script=script)
+
+    runner.agent_factory = factory
+    _inject(runner, sid, FakeBrowser())
+    mid = runner.submit_message(sid, "save it")
+    assert _wait_done(runner, sid, mid)["status"] == "done"
+    files_events = [event for _, event in runner.replay(sid) if event["type"] == "files"]
+    assert len(files_events) == 1
+    assert files_events[0]["files"] == [
+        {"name": "results.csv", "bytes": 4, "mtime": files_events[0]["files"][0]["mtime"]},
+    ]
+
+
+def test_no_files_event_without_change(tmp_path):
+    runner = _runner(tmp_path, agent_factory=FakeAgent)
+    sid = runner.create_session("local")
+    _inject(runner, sid, FakeBrowser())
+    mid = runner.submit_message(sid, "hi")
+    _wait_done(runner, sid, mid)
+    kinds = [event["type"] for _, event in runner.replay(sid)]
+    assert "files" not in kinds
+
+
+def test_session_files_join_upload_allowlist(tmp_path):
+    FakeAgent.seen.clear()
+    runner = _runner(tmp_path, agent_factory=FakeAgent)
+    sid = runner.create_session("local")
+    files_dir = runner.session_files_dir(sid)
+    (files_dir / "note.txt").write_text("hello")
+    _inject(runner, sid, FakeBrowser())
+    mid = runner.submit_message(sid, "hi")
+    _wait_done(runner, sid, mid)
+    assert FakeAgent.seen[-1].config["files"] == {"note.txt": str(files_dir / "note.txt")}
+
+
+def test_ensure_browser_routes_downloads(tmp_path):
+    class DownloadBrowser(FakeBrowser):
+        def __init__(self):
+            super().__init__()
+            self.config = {}
+            self.download_path = None
+
+        def configure_downloads(self, path):
+            self.download_path = path
+
+    made = []
+    runner = _runner(
+        tmp_path, agent_factory=FakeAgent,
+        browser_factory=lambda url: made.append(DownloadBrowser()) or made[-1],
+    )
+    sid = runner.create_session("local")
+    mid = runner.submit_message(sid, "hi")
+    _wait_done(runner, sid, mid)
+    assert made[0].download_path == runner.session_files_dir(sid)
+    assert made[0].config["files_dir"] == str(runner.session_files_dir(sid))
+
+
 def test_bus_replays_events(tmp_path):
     runner = _runner(tmp_path, agent_factory=FakeAgent)
     sid = runner.create_session("local")

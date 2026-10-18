@@ -5,8 +5,11 @@ each task drives a real Agent tick by tick, closes it in a finally block, and
 records steps. Screenshots stay off; credentials are never logged or stored.
 """
 
+import base64
+import binascii
 import hmac
 import json
+import mimetypes
 import os
 import sqlite3
 import threading
@@ -14,7 +17,7 @@ import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 from browser_harness import admin as harness_admin
 from browser_harness import helpers as harness_helpers
@@ -23,7 +26,7 @@ from .agent import Agent
 from .browser import Browser, full_text_expression
 from .config import env_bool
 from .demo import load_environment
-from .model import redact_secrets, token_counts
+from .model import redact_secrets, token_counts, validate_save_filename
 from .trace import configure_logging, get_logger, trace_dir
 
 LOG = get_logger("server")
@@ -615,6 +618,48 @@ def tabs_signature(browser):
     ))
 
 
+def session_file_names(files_dir):
+    """Sorted plain names in a session files dir. Never raises."""
+    try:
+        return sorted(
+            entry.name for entry in Path(files_dir).iterdir()
+            if entry.is_file() and _file_name_ok(entry.name)
+        )
+    except OSError:
+        return []
+
+
+def _file_name_ok(name):
+    return (
+        isinstance(name, str) and bool(name) and "/" not in name
+        and "\\" not in name and ".." not in name and not name.startswith(".")
+    )
+
+
+def session_files(files_dir):
+    """Files-tab rows: name, bytes, mtime. Never raises."""
+    rows = []
+    try:
+        entries = list(Path(files_dir).iterdir())
+    except OSError:
+        return rows
+    for entry in entries:
+        if not entry.is_file() or not _file_name_ok(entry.name):
+            continue
+        try:
+            stat = entry.stat()
+        except OSError:
+            continue
+        rows.append({"name": entry.name, "bytes": stat.st_size, "mtime": stat.st_mtime})
+    rows.sort(key=lambda row: row["name"])
+    return rows
+
+
+def files_signature(files_dir):
+    """Cheap files identity for change detection."""
+    return tuple((row["name"], row["bytes"], row["mtime"]) for row in session_files(files_dir))
+
+
 def session_context(prior, url, tabs, message):
     """The goal a follow-up runs with: past turns plus where the browser is."""
     lines = []
@@ -1017,6 +1062,13 @@ class SessionRunner:
                     os.environ["JEV_BROWSER"] = previous
         entry["browser"] = browser
         entry["live_url"] = live_url_for_agent_browser(browser)
+        files_dir = self.session_files_dir(session_id)
+        browser_config = getattr(browser, "config", None)
+        if isinstance(browser_config, dict):
+            browser_config["files_dir"] = str(files_dir)
+        configure = getattr(browser, "configure_downloads", None)
+        if callable(configure):
+            configure(files_dir)
         try:
             self._publish(session_id, {"type": "tabs", "tabs": session_tabs(browser)})
         except Exception:
@@ -1045,7 +1097,12 @@ class SessionRunner:
         if isinstance(config, dict):
             if max_decisions is not None:
                 config["max_decisions"] = max_decisions
-            config["files_dir"] = str(self.session_files_dir(session_id))
+            files_dir = self.session_files_dir(session_id)
+            config["files_dir"] = str(files_dir)
+            allowed = config.setdefault("files", {})
+            if isinstance(allowed, dict):
+                for name in session_file_names(files_dir):
+                    allowed.setdefault(name, str(files_dir / name))
         trace = getattr(agent, "trace", None)
         if trace is not None:
             trace.attach(run_id, self.store)
@@ -1060,6 +1117,9 @@ class SessionRunner:
                 self.store.update_message(message_id, status="blocked", error="stopped by user")
                 return
             try:
+                current = self.store.get_message(message_id)
+                if current is None or current["status"] != "queued":
+                    return
                 self._drive_message(session_id, message_id, text, max_decisions, entry, url)
             finally:
                 self._release_slot()
@@ -1102,6 +1162,8 @@ class SessionRunner:
             entry["agent"] = agent
             recorded = 0
             last_tabs = tabs_signature(browser)
+            files_dir = self.session_files_dir(session_id)
+            last_files = files_signature(files_dir)
             while True:
                 snapshot = agent.command("tick")
                 history = snapshot.get("history") or []
@@ -1122,6 +1184,13 @@ class SessionRunner:
                     self._publish(session_id, {
                         "type": "tabs", "message_id": message_id,
                         "tabs": session_tabs(browser),
+                    })
+                files_now = files_signature(files_dir)
+                if files_now != last_files:
+                    last_files = files_now
+                    self._publish(session_id, {
+                        "type": "files", "message_id": message_id,
+                        "files": session_files(files_dir),
                     })
                 if entry["stop"].is_set():
                     self._close_turn_agent(entry, agent)
@@ -1368,6 +1437,14 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError:
                 since = 0
             return self.stream_session_events(session_id, since)
+        if path.startswith("/api/sessions/") and "/files" in path:
+            rest = path.removeprefix("/api/sessions/")
+            session_id, _, name = rest.partition("/files")
+            if not session_id or (name and not name.startswith("/")):
+                return self.send(404, json.dumps({"error": "Not found"}))
+            if not name:
+                return self.serve_file_list(session_id)
+            return self.serve_file_download(session_id, name.removeprefix("/"))
         if path.startswith("/api/sessions/"):
             session_id = path.removeprefix("/api/sessions/")
             if "/" in session_id or not session_id:
@@ -1404,7 +1481,58 @@ class Handler(BaseHTTPRequestHandler):
         session["tabs"] = session_tabs(browser) if browser is not None else session["last_tabs"]
         session["live_url"] = self.RUNNER.live_url(session_id)
         session["browser_alive"] = browser is not None
+        session["files"] = session_files(self.RUNNER.session_files_dir(session_id))
         return self.send(200, json.dumps(session))
+
+    def serve_file_list(self, session_id):
+        if self.STORE.get_session(session_id, with_steps=False) is None:
+            return self.send(404, json.dumps({"error": "Unknown session"}))
+        files_dir = self.RUNNER.session_files_dir(session_id)
+        return self.send(200, json.dumps({"files": session_files(files_dir)}))
+
+    def serve_file_download(self, session_id, name):
+        if self.STORE.get_session(session_id, with_steps=False) is None:
+            return self.send(404, json.dumps({"error": "Unknown session"}))
+        name = unquote(name)
+        if not _file_name_ok(name):
+            return self.send(404, json.dumps({"error": "Not found"}))
+        path = self.RUNNER.session_files_dir(session_id) / name
+        if path.parent != self.RUNNER.session_files_dir(session_id):
+            return self.send(404, json.dumps({"error": "Not found"}))
+        try:
+            body = path.read_bytes()
+        except OSError:
+            return self.send(404, json.dumps({"error": "Not found"}))
+        mime = mimetypes.guess_type(name)[0] or "application/octet-stream"
+        return self.send(
+            200, body, mime, {"Content-Disposition": f'attachment; filename="{name}"'},
+        )
+
+    def serve_file_upload(self, session_id, body):
+        if self.STORE.get_session(session_id, with_steps=False) is None:
+            return self.send(404, json.dumps({"error": "Unknown session"}))
+        try:
+            name = validate_save_filename((body or {}).get("name"))
+        except ValueError as error:
+            return self.send(400, json.dumps({"error": str(error)}))
+        try:
+            raw = base64.b64decode((body or {}).get("content_b64") or "", validate=True)
+        except (binascii.Error, ValueError):
+            return self.send(400, json.dumps({"error": "content_b64 is not valid base64"}))
+        if not raw or len(raw) > 8 * 1024 * 1024:
+            return self.send(400, json.dumps({"error": "File must be 1 byte to 8 MiB"}))
+        files_dir = self.RUNNER.session_files_dir(session_id)
+        path = files_dir / name
+        if path.parent != files_dir:
+            return self.send(400, json.dumps({"error": "Invalid file name"}))
+        try:
+            path.write_bytes(raw)
+        except OSError:
+            return self.send(500, json.dumps({"error": "Could not store the file"}))
+        self.RUNNER._publish(
+            session_id, {"type": "files", "files": session_files(files_dir)}
+        )
+        return self.send(201, json.dumps({"name": name, "bytes": len(raw)}))
 
     def _run_id_for(self, task_id):
         """A task id is a message id; its run id keys steps, events, and traces."""
@@ -1559,11 +1687,12 @@ class Handler(BaseHTTPRequestHandler):
         if not self.authorized():
             return self.send(401, json.dumps({"error": "Bearer token required"}))
         try:
+            path = urlparse(self.path).path
+            limit = 12 * 1024 * 1024 if path.endswith("/files") else 16384
             length = int(self.headers.get("Content-Length", "0"))
-            if not 0 <= length < 16384:
+            if not 0 <= length < limit:
                 raise ValueError("Invalid request size")
             body = json.loads(self.rfile.read(length) or b"{}")
-            path = urlparse(self.path).path
             if path == "/api/sessions":
                 session_id = self.RUNNER.create_session(
                     body.get("browser", "local"), body.get("title")
@@ -1583,6 +1712,9 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send(404, json.dumps({"error": "Unknown session"}))
                 self.RUNNER.stop(session_id)
                 return self.send(200, json.dumps({"id": session_id, "status": "stopping"}))
+            if path.startswith("/api/sessions/") and path.endswith("/files"):
+                session_id = path.removeprefix("/api/sessions/").removesuffix("/files")
+                return self.serve_file_upload(session_id, body)
             if path == "/api/tasks":
                 task_id = self.RUNNER.submit_task(
                     body.get("goal"),

@@ -43,6 +43,14 @@ pages are about that item's subject. If you are not certain of a deep URL, retur
 URL from an unblocked engine instead of guessing. Local http fixture URLs are allowed only when the
 goal names them. No commentary, code, or browser actions. If no page can be determined, return {"text": null}."""
 
+SAVE_VALUE = """Return a JSON object with exactly two keys: filename and content.
+Write the goal's collected facts as a result file. filename is a plain name with an
+extension that fits the shape (csv for rows, json for records, md or txt otherwise),
+for example {"filename": "results.csv", "content": "..."}. content holds every collected
+fact, one row or record per item, copied exactly as seen. No commentary, code fences,
+or browser actions. Never invent facts; if the facts are unusable, return content as an
+empty string."""
+
 ANSWER_VALUE = """Return a JSON object with exactly one key, text: the final answer to the goal.
 Report what the goal asked for (names, numbers, prices, titles) using the current page and the action
 history. Prefer the collected evidence and facts: they may come from pages no longer open. If the goal

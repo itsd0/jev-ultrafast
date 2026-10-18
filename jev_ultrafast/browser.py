@@ -284,6 +284,7 @@ class Browser:
             state = self._attach_oopif(state)
         state = bind_uploads(state, self.config.get("files") or {})
         state = bind_navigate(state)
+        state = bind_save_file(state, self.config.get("files_dir"))
         state = bind_tabs(state, self)
         return bind_keys(state, self.config.get("keyboard", True))
 
@@ -624,6 +625,16 @@ class Browser:
             return True
         return False
 
+    def configure_downloads(self, path):
+        """Route this context's downloads into path. Best-effort; cloud may refuse."""
+        try:
+            params = {"behavior": "allow", "downloadPath": str(path)}
+            if getattr(self, "context", None):
+                params["browserContextId"] = self.context
+            cdp("Browser.setDownloadBehavior", **params)
+        except Exception as error:
+            get_logger("browser").warning(f"[jev:browser] downloads not routed ({error})")
+
     def _register_tab(self, target_id, session, url, opener=None, title=""):
         for key, tab in self.tabs.items():
             if tab["target"] == target_id:
@@ -803,6 +814,24 @@ def bind_navigate(state):
         "actions": [
             *actions,
             {"id": "navigate", "kind": "navigate", "label": "Navigate to a URL from the goal"},
+        ],
+    }
+    updated["fingerprint"] = fingerprint(updated)
+    return updated
+
+
+def bind_save_file(state, files_dir):
+    """Offer SAVE_FILE when the run has a files dir. Memo gating happens in the agent."""
+    if not files_dir:
+        return state
+    actions = state.get("actions") or []
+    if any(action.get("kind") == "save_file" for action in actions):
+        return state
+    updated = {
+        **state,
+        "actions": [
+            *actions,
+            {"id": "save_file", "kind": "save_file", "label": "Save collected facts to a file"},
         ],
     }
     updated["fingerprint"] = fingerprint(updated)

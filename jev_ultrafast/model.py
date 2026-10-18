@@ -5,6 +5,7 @@ import math
 import os
 import re
 import time
+from pathlib import Path
 
 import httpx
 
@@ -270,6 +271,9 @@ def action_space(actions):
             continue
         if kind == "close_tab":
             controls["CLOSE_TAB"] = action
+            continue
+        if kind == "save_file":
+            controls["SAVE_FILE"] = action
             continue
         if kind not in operations:
             controls[action["id"].upper()] = action
@@ -883,6 +887,59 @@ def parse_field_text(result):
     return value
 
 
+SAVE_FILE_SCHEMA = {
+    "type": "object",
+    "properties": {"filename": {"type": "string"}, "content": {"type": "string"}},
+    "required": ["filename", "content"],
+    "additionalProperties": False,
+}
+
+_SAVE_FILENAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._ \-]{0,99}")
+SAVE_CONTENT_LIMIT = 200_000
+
+
+def validate_save_filename(name):
+    """A plain file name. Fail-closed: no paths, no traversal, no hidden files."""
+    if not isinstance(name, str):
+        raise ValueError("invalid file name")
+    cleaned = name.strip()
+    if (
+        not cleaned
+        or len(cleaned) > 100
+        or ".." in cleaned
+        or "/" in cleaned
+        or "\\" in cleaned
+        or _SAVE_FILENAME_RE.fullmatch(cleaned) is None
+    ):
+        raise ValueError(f"invalid file name {name!r}")
+    return cleaned
+
+
+def parse_save_file(result):
+    output = json.loads(result["choices"][0]["message"]["content"])
+    if set(output) != {"filename", "content"}:
+        raise ValueError("invalid save file")
+    filename = validate_save_filename(output["filename"])
+    content = output["content"]
+    if not isinstance(content, str) or not content.strip() or len(content) > SAVE_CONTENT_LIMIT:
+        raise ValueError("invalid save file content")
+    return {"filename": filename, "content": content}
+
+
+def write_saved_file(files_dir, filename, content):
+    """Write agent content into the session files dir. The name is re-validated."""
+    name = validate_save_filename(filename)
+    if not isinstance(content, str) or not content:
+        raise ValueError("nothing to save")
+    root = Path(files_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    path = root / name
+    if path.parent != root:
+        raise ValueError(f"invalid file name {filename!r}")
+    path.write_text(content, encoding="utf-8")
+    return name
+
+
 _CURRENCY_CANONICAL = {
     "$": "USD", "USD": "USD",
     "€": "EUR", "EUR": "EUR",
@@ -940,6 +997,16 @@ def navigate_context(goal, todo, memo, page, history, visited=(), failed=(), blo
         "failed_urls": list(failed)[-10:],
         "blocked_hosts": sorted(blocked),
         "recent_actions": [{k: h.get(k) for k in ("action", "text")} for h in history[-6:]],
+    }
+
+
+def save_file_context(goal, memo, history, page):
+    return {
+        "goal": goal,
+        "facts": [item.get("fact", "") for item in memo][-20:],
+        "current_url": page.get("url"),
+        "current_title": page.get("title"),
+        "recent_actions": [h.get("action") for h in history[-6:]],
     }
 
 

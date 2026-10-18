@@ -14,6 +14,7 @@ from .browser import Browser, CoveredTarget, StalePage
 from .config import parse_search_engines, resolve_config
 from .model import (
     INVALID_RESPONSE,
+    SAVE_FILE_SCHEMA,
     action_space,
     answer_context,
     choose,
@@ -26,15 +27,19 @@ from .model import (
     judge_progress,
     match_option,
     navigate_context,
+    parse_save_file,
     post_json,
+    save_file_context,
     token_counts,
     track_context,
+    write_saved_file,
 )
 from .questions import (
     ANSWER_VALUE,
     GATE_SYSTEM,
     NAVIGATE_VALUE,
     PICK_OPTION_VALUE,
+    SAVE_VALUE,
     TEXT_VALUE,
     TRACK_SYSTEM,
 )
@@ -963,19 +968,23 @@ def suppression_reasons(state, page):
     """Suppressed noop_key -> reason. Forced-NAVIGATE keeps only navigate;
     otherwise zero-signal nav links and tried detours are hidden while choices remain."""
     actions = page.get("actions") or []
+    drop = {}
+    if not (state.get("memo") or []):
+        for action in actions:
+            if action.get("kind") == "save_file":
+                drop[noop_key(action)] = "nothing collected yet"
     if state.get("force_navigate"):
-        return {noop_key(a): "forced NAVIGATE" for a in actions if a.get("kind") != "navigate"}
+        return {**drop, **{noop_key(a): "forced NAVIGATE" for a in actions if a.get("kind") != "navigate"}}
     if state.get("subgoals") is None or state.get("page_target"):
         # Pagination runs follow the page counter, not link scores.
-        return {}
+        return drop
     todo_words = _score_words(current_todo(state))
     if not todo_words:
-        return {}
+        return drop
     tried = set(state.get("tried_links") or [])
     links = [a for a in actions if a.get("kind") == "click" and a.get("role") == "link"]
     if not links:
-        return {}
-    drop = {}
+        return drop
     for action in links:
         norm = normalize_link_url(action_url(page, action))
         if norm and norm in tried:
@@ -984,8 +993,10 @@ def suppression_reasons(state, page):
         score = score_link(action.get("label"), action_url(page, action), True, todo_words, tried)
         if action.get("nav") and score <= 0:
             drop[noop_key(action)] = "nav suppression"
-    if set(drop) >= {noop_key(a) for a in links}:
-        return {}
+    link_keys = {noop_key(a) for a in links}
+    if link_keys <= set(drop):
+        # Every link would be hidden; keep the links, keep other suppressions.
+        return {k: v for k, v in drop.items() if k not in link_keys}
     return drop
 
 
@@ -1006,6 +1017,7 @@ ACTION_STRATEGY = {
     "navigate": "navigate",
     "switch_tab": "switch_tab",
     "close_tab": "close_tab",
+    "save_file": "write file",
     "vision": "coordinate",
 }
 
@@ -1303,7 +1315,10 @@ class Agent:
         except Exception:
             return 0, 0.0
 
-    def _gen_text(self, state, step, context, system=TEXT_VALUE, purpose="field", action=None):
+    def _gen_text(
+        self, state, step, context, system=TEXT_VALUE, purpose="field", action=None,
+        schema=None, parse=None, name=None,
+    ):
         """One text-helper call with its trace event. Failures emit, then raise."""
         label = (action or {}).get("label")
         if self.pending_text and self.pending_text[0] == context:
@@ -1319,8 +1334,12 @@ class Agent:
         try:
             if system == TEXT_VALUE and purpose == "field":
                 text, helper = field_text(context)
-            else:
+            elif schema is None and parse is None and name is None:
                 text, helper = field_text(context, system=system)
+            else:
+                text, helper = field_text(
+                    context, system=system, schema=schema, name=name or "FieldText", parse=parse,
+                )
         except (ValueError, RuntimeError) as error:
             self.trace.emit(
                 "text", step=step, purpose=purpose, latency_ms=round((time.perf_counter() - started) * 1000),
@@ -1757,6 +1776,38 @@ class Agent:
                     note_failed_url(state, text)
                 self.pending_text = None
                 self.blocked_streak = 0
+            elif action["kind"] == "save_file":
+                memo = state.get("memo") or []
+                files_dir = (getattr(state["browser"], "config", None) or {}).get("files_dir")
+                if not files_dir or not memo:
+                    return self._skip_text_step(
+                        state, page, action, decision, selected, note="nothing to save yet"
+                    )
+                context = save_file_context(state["goal"], memo, state["history"], page)
+                cached = self.pending_text and self.pending_text[0] == context
+                try:
+                    text, helper = self._gen_text(
+                        state, step, context, SAVE_VALUE, "save_file", action,
+                        schema=SAVE_FILE_SCHEMA, parse=parse_save_file, name="SaveFile",
+                    )
+                except ValueError:
+                    return self._skip_text_step(state, page, action, decision, selected)
+                if not cached:
+                    self.pending_text = (context, text, helper)
+                    state["text_calls"].append({
+                        **helper, "field": action["label"],
+                        "value": f"{text['filename']} ({len(text['content'])} chars)",
+                    })
+                try:
+                    saved_name = write_saved_file(files_dir, text["filename"], text["content"])
+                except ValueError as error:
+                    return self._skip_text_step(
+                        state, page, action, decision, selected, note=str(error)[:200]
+                    )
+                self.pending_text = None
+                self.blocked_streak = 0
+                result = {"executed": action["id"], "saved": saved_name}
+                text = f"saved {saved_name}"
             elif action["kind"] == "select_option":
                 options = state["browser"].read_options(action) or []
                 matched = match_option(text, options)
@@ -1819,6 +1870,11 @@ class Agent:
                 and isinstance(result, dict)
                 and result.get("navigated") is False
             )
+            saved_name = (
+                result.get("saved")
+                if action["kind"] == "save_file" and isinstance(result, dict)
+                else None
+            )
             covered_navigated = isinstance(result, dict) and result.get("covered_navigate")
             same_date = (
                 action["kind"] == "fill"
@@ -1860,6 +1916,7 @@ class Agent:
                         "already selected" if check_set else None,
                         "value unchanged" if check_failed else None,
                         "navigation failed" if navigate_failed else None,
+                        f"saved {saved_name}" if saved_name else None,
                         "navigated to href (covered)" if covered_navigated else None,
                         "used search fallback" if fallback_used else None,
                         "scrolled inside the dialog" if modal_routed else None,
