@@ -372,6 +372,38 @@ def test_live_falls_back_to_screenshots(start_service):
     assert wait_for(base, created["id"], {"done"})["status"] == "done"
 
 
+def test_live_silent_screencast_flips_to_screenshots(monkeypatch):
+    import types
+
+    monkeypatch.setattr(hosted.Viewer, "QUIET_RESTART_S", 0.05)
+    monkeypatch.setattr(hosted.Viewer, "SHOT_FALLBACK_S", 0.1)
+    monkeypatch.setattr(hosted.Viewer, "SHOT_EVERY_S", 0.05)
+    calls = []
+
+    def fake_call(method, **params):
+        calls.append(method)
+        if method == "Page.captureScreenshot":
+            return {"data": "shot-bytes"}
+        return {}
+
+    pump = types.SimpleNamespace(register=lambda viewer: None, unregister=lambda viewer: None)
+    viewer = hosted.Viewer(pump, fake_call, "sess-1")
+    viewer.add_viewer()
+    try:
+        deadline = time.time() + 5
+        while viewer.mode != "screenshot" and time.time() < deadline:
+            time.sleep(0.02)
+        assert viewer.mode == "screenshot"
+        deadline = time.time() + 5
+        while viewer.latest is None and time.time() < deadline:
+            time.sleep(0.02)
+        assert viewer.latest == "shot-bytes"
+        assert "Page.stopScreencast" in calls
+    finally:
+        viewer.remove_viewer()
+        viewer.shutdown()
+
+
 def test_live_unavailable_states(start_service):
     browser = FakeBrowser()
     base, _ = start_service(lambda fake: snap("done", 0), browser=browser)

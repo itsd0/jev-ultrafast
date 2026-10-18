@@ -425,12 +425,14 @@ class Viewer:
     """One local task's frame source. Screencast primary, screenshot fallback.
 
     Frames arrive through the shared FramePump; the fallback captures directly.
-    Quiet-restarting the screencast heals ack stalls (a drain elsewhere eats a
-    frame) and is a no-op on a static page, which simply keeps its last frame.
+    A screencast that stays silent past SHOT_FALLBACK_S (suspended paint, no
+    compositor frames) flips to screenshots instead of restarting forever.
+    Quiet-restarting heals ack stalls once frames have flowed at least once.
     """
 
     QUIET_RESTART_S = 3.0
     SHOT_EVERY_S = 1.0
+    SHOT_FALLBACK_S = 6.0
 
     def __init__(self, pump, call, session):
         self.pump = pump
@@ -478,6 +480,8 @@ class Viewer:
 
     def _start_source(self):
         self._stop.clear()
+        self._source_started_at = time.monotonic()
+        self._framed_at_start = self.seq
         try:
             self._start_screencast()
             self.mode = "screencast"
@@ -500,12 +504,25 @@ class Viewer:
                 self._stop.wait(self.SHOT_EVERY_S)
             else:
                 if time.monotonic() - self.last_frame_at > self.QUIET_RESTART_S:
-                    try:
-                        self.call("Page.stopScreencast")
-                        self._start_screencast()
-                        self.last_frame_at = time.monotonic()
-                    except Exception:
+                    silent_since_start = (
+                        self.seq == getattr(self, "_framed_at_start", 0)
+                        and time.monotonic() - getattr(self, "_source_started_at", 0)
+                        > self.SHOT_FALLBACK_S
+                    )
+                    if silent_since_start:
                         self.mode = "screenshot"
+                        self.pump.unregister(self)
+                        try:
+                            self.call("Page.stopScreencast")
+                        except Exception:
+                            pass
+                    else:
+                        try:
+                            self.call("Page.stopScreencast")
+                            self._start_screencast()
+                            self.last_frame_at = time.monotonic()
+                        except Exception:
+                            self.mode = "screenshot"
                 self._stop.wait(0.5)
 
     def _stop_source(self):
