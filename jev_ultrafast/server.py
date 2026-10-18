@@ -1990,6 +1990,17 @@ class Handler(BaseHTTPRequestHandler):
             for seq, event in self.RUNNER.replay(session_id, since):
                 last_seq = seq
                 self.wfile.write(f"data: {json.dumps({'seq': seq, **event})}\n\n".encode())
+            # Replayed tabs/files may be stale; the live snapshot wins by order.
+            entry_now = self.RUNNER._entry(session_id)
+            live_browser = entry_now.get("browser") if entry_now else None
+            if live_browser is not None:
+                self.wfile.write(
+                    f"data: {json.dumps({'type': 'tabs', 'tabs': session_tabs(live_browser)})}\n\n".encode()
+                )
+            files_dir = self.RUNNER.session_files_dir(session_id)
+            self.wfile.write(
+                f"data: {json.dumps({'type': 'files', 'files': session_files(files_dir)})}\n\n".encode()
+            )
             self.wfile.flush()
             while True:
                 with bus.cond:

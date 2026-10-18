@@ -404,6 +404,35 @@ def test_live_silent_screencast_flips_to_screenshots(monkeypatch):
         viewer.shutdown()
 
 
+def test_events_stream_ends_replay_with_live_snapshot(start_service):
+    browser = FakeBrowser()
+    base, _ = start_service(lambda fake: snap("done", 0), browser=browser)
+    _, created = api(base, "POST", "/api/sessions", {"browser": "local"})
+    sid = created["id"]
+    _, posted = api(base, "POST", f"/api/sessions/{sid}/messages", {"text": "hi"})
+    assert posted["id"]
+    wait_session(base, sid)
+    browser.tabs = {"t1": {"target": "x", "url": "https://live.test/", "title": "Live"}}
+    browser.active = "t1"
+    request = urllib.request.Request(base + f"/api/sessions/{sid}/events", method="GET")
+    seen = []
+    with urllib.request.urlopen(request, timeout=10) as response:
+        for raw in response:
+            line = raw.decode().strip()
+            if not line.startswith("data: "):
+                continue
+            event = json.loads(line[len("data: "):])
+            if event.get("type") in {"tabs", "files"} and "seq" not in event:
+                seen.append(event)
+                if len(seen) == 2:
+                    break
+    tabs = next(event for event in seen if event["type"] == "tabs")
+    assert tabs["tabs"] == [
+        {"key": "t1", "url": "https://live.test/", "title": "Live", "active": True}
+    ]
+    assert next(event for event in seen if event["type"] == "files")["files"] == []
+
+
 def test_live_unavailable_states(start_service):
     browser = FakeBrowser()
     base, _ = start_service(lambda fake: snap("done", 0), browser=browser)
