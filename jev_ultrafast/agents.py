@@ -1,10 +1,10 @@
-"""Agent selection. JEV_AGENT=classic keeps TypeSafe+Mercury; default is Beam."""
+"""Agent selection. Classic (TypeSafe+Mercury) is the default; JEV_AGENT=new selects Beam."""
 
 import os
 
 
 def agent_name():
-    return "classic" if os.environ.get("JEV_AGENT", "new").strip().lower() == "classic" else "new"
+    return "new" if os.environ.get("JEV_AGENT", "classic").strip().lower() == "new" else "classic"
 
 
 def agent_class():

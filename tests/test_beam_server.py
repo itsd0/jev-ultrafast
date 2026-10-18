@@ -10,13 +10,13 @@ from jev_ultrafast.agents import agent_class, agent_name, default_agent_factory
 from jev_ultrafast.beam_agent import BeamAgent
 
 
-def test_agent_selection_defaults_to_beam(monkeypatch):
+def test_agent_selection_defaults_to_classic(monkeypatch):
     monkeypatch.delenv("JEV_AGENT", raising=False)
-    assert agent_name() == "new"
-    assert agent_class() is BeamAgent
-    monkeypatch.setenv("JEV_AGENT", "classic")
     assert agent_name() == "classic"
     assert agent_class().__name__ == "Agent"
+    monkeypatch.setenv("JEV_AGENT", "new")
+    assert agent_name() == "new"
+    assert agent_class() is BeamAgent
 
 
 def test_default_factory_builds_selected_agent(monkeypatch):
@@ -28,7 +28,7 @@ def test_default_factory_builds_selected_agent(monkeypatch):
             return {"url": "about:blank", "title": "", "actions": [], "text": ""}
 
     monkeypatch.setenv("JEV_LOG_LEVEL", "off")
-    monkeypatch.delenv("JEV_AGENT", raising=False)
+    monkeypatch.setenv("JEV_AGENT", "new")
     agent = default_agent_factory("about:blank", "hi", browser=FakeBrowser())
     assert isinstance(agent, BeamAgent)
 

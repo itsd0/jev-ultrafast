@@ -930,8 +930,8 @@ class SessionRunner:
     """Chat sessions. One browser per session, reused across messages.
 
     Each message runs an agent against the session browser with the goal set
-    to the message plus session context. Beam is the default agent;
-    JEV_AGENT=classic keeps TypeSafe+Mercury. Idle browsers close after
+    to the message plus session context. Classic (TypeSafe+Mercury) is the
+    default agent; JEV_AGENT=new selects Beam. Idle browsers close after
     JEV_SESSION_IDLE_MIN minutes; cloud browsers always stop on close.
     """
 
@@ -1040,7 +1040,7 @@ class SessionRunner:
             "decision_provider": os.environ.get("DECISION_PROVIDER", "typesafe"),
             "model_default": os.environ.get("JEV_MODEL", DEFAULT_MODEL),
             "effort_default": os.environ.get("JEV_REASONING_EFFORT", "low"),
-            "agent": os.environ.get("JEV_AGENT", "new"),
+            "agent": os.environ.get("JEV_AGENT", "classic"),
             "idle_min": self.idle_min,
         }
 
