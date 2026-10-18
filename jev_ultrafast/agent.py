@@ -7,10 +7,10 @@ import re
 import time
 import traceback
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import quote_plus, urlparse
 
 from .browser import Browser, StalePage
-from .config import resolve_config
+from .config import parse_search_engines, resolve_config
 from .model import (
     INVALID_RESPONSE,
     action_space,
@@ -24,6 +24,7 @@ from .model import (
     gate_context,
     judge_progress,
     match_option,
+    navigate_context,
     post_json,
     token_counts,
     track_context,
@@ -477,6 +478,57 @@ def on_blocked_host(state):
     return host_blocked(state, host)
 
 
+def note_visit(state, url):
+    """The last visited pages, normalized. Consecutive duplicates collapse."""
+    norm = normalize_link_url(url)
+    if not norm:
+        return
+    visited = list(state.get("visited_urls") or [])
+    if not visited or visited[-1] != norm:
+        visited.append(norm)
+    state["visited_urls"] = visited[-20:]
+
+
+def note_failed_url(state, url):
+    """A navigation target that failed or landed off-topic. Never proposed again."""
+    norm = normalize_link_url(url)
+    if not norm:
+        return
+    failed = list(state.get("failed_urls") or [])
+    if norm not in failed:
+        failed.append(norm)
+    state["failed_urls"] = failed[-20:]
+
+
+def search_fallback(todo, engines, state):
+    """A search-results URL on an unblocked engine. None when every engine is skipped."""
+    query = quote_plus((todo or "").strip())
+    if not query:
+        return None
+    candidates = []
+    for template in engines or []:
+        if "{q}" not in template:
+            continue
+        try:
+            url = template.format(q=query)
+        except (KeyError, IndexError, ValueError):
+            continue
+        try:
+            parsed = urlparse(url)
+        except ValueError:
+            continue
+        host = (parsed.hostname or "").lower()
+        if not host or (parsed.scheme or "").lower() != "https":
+            continue
+        candidates.append((host, url))
+    for host, url in candidates:
+        if not host_blocked(state, host):
+            return url
+    if candidates and take_host_retry(state, candidates[0][0]):
+        return candidates[0][1]
+    return None
+
+
 def suppression_reasons(state, page):
     """Suppressed noop_key -> reason. Forced-NAVIGATE keeps only navigate;
     otherwise zero-signal nav links and tried detours are hidden while choices remain."""
@@ -624,7 +676,10 @@ class Agent:
             elapsed_ms=0,
             started_at=None,
             record=bool(self.record_dir),
+            visited_urls=[],
+            failed_urls=[],
         )
+        note_visit(self.state, page.get("url"))
         if self.record_dir:
             self.record_dir.mkdir(parents=True, exist_ok=True)
             (self.record_dir / "000000.jpg").write_bytes(base64.b64decode(page["screenshot"]))
@@ -996,33 +1051,45 @@ class Agent:
             retries = 0
             invalid_reason = None
             started = time.perf_counter()
-            try:
-                state["decision"] = self._maybe_vision(state) or self._decide(state, shown)
-            except ValueError as exc:
-                if str(exc) != INVALID_RESPONSE:
-                    raise
-                self.log.info("[jev:decision] invalid response; retrying once")
-                invalid_reason = getattr(choose, "last_invalid", "") or "invalid response"
+            forced_nav = next(
+                (a for a in shown.get("actions") or [] if a.get("kind") == "navigate"), None
+            )
+            if state.get("force_navigate") and forced_nav is not None:
+                # Forced means leave: no decision model, no vision clicks that stay.
+                state["decision"] = {
+                    "choice": forced_nav["id"], "operation": "NAVIGATE", "target": None,
+                    "confidence": 1.0, "probabilities": {forced_nav["id"]: 1.0},
+                    "latency_ms": 0, "usage": {}, "model": "forced", "forced": True,
+                }
+            else:
                 try:
-                    retries = 1
                     state["decision"] = self._maybe_vision(state) or self._decide(state, shown)
-                except ValueError as retry_exc:
-                    if str(retry_exc) != INVALID_RESPONSE:
+                except ValueError as exc:
+                    if str(exc) != INVALID_RESPONSE:
                         raise
+                    self.log.info("[jev:decision] invalid response; retrying once")
                     invalid_reason = getattr(choose, "last_invalid", "") or "invalid response"
-                    self.trace.emit(
-                        "decision", step=step, provider=decision_provider(), model=None,
-                        latency_ms=None, duration_ms=round((time.perf_counter() - started) * 1000),
-                        choice=None, retries=retries, invalid_reason=invalid_reason,
-                    )
-                    self.trace.emit(
-                        "error", step=step, type="ValueError", message=INVALID_RESPONSE,
-                        where="predict", retried=True,
-                    )
-                    return self._terminal(state, "invalid decision response", step)
+                    try:
+                        retries = 1
+                        state["decision"] = self._maybe_vision(state) or self._decide(state, shown)
+                    except ValueError as retry_exc:
+                        if str(retry_exc) != INVALID_RESPONSE:
+                            raise
+                        invalid_reason = getattr(choose, "last_invalid", "") or "invalid response"
+                        self.trace.emit(
+                            "decision", step=step, provider=decision_provider(), model=None,
+                            latency_ms=None, duration_ms=round((time.perf_counter() - started) * 1000),
+                            choice=None, retries=retries, invalid_reason=invalid_reason,
+                        )
+                        self.trace.emit(
+                            "error", step=step, type="ValueError", message=INVALID_RESPONSE,
+                            where="predict", retried=True,
+                        )
+                        return self._terminal(state, "invalid decision response", step)
             decision = state["decision"]
             fields = {
-                "provider": decision_provider(), "model": decision.get("model"),
+                "provider": "forced" if decision.get("forced") else decision_provider(),
+                "model": decision.get("model"),
                 "latency_ms": decision.get("latency_ms"),
                 "duration_ms": round((time.perf_counter() - started) * 1000),
                 "choice": decision.get("choice"), "operation": decision.get("operation"),
@@ -1050,6 +1117,24 @@ class Agent:
             state["decision"] = None
             selected = decision["choice"]
             step = len(state.get("history") or []) + 1
+            if (
+                selected in {"DONE", "BLOCKED"}
+                and state.get("force_navigate")
+                and not state.get("forced_override_used")
+            ):
+                # Forced means leave: one terminal choice becomes the way out.
+                forced_out = next((a for a in page["actions"] if a.get("kind") == "navigate"), None)
+                if forced_out is not None:
+                    state["forced_override_used"] = True
+                    decision = {
+                        **decision, "choice": forced_out["id"], "operation": "NAVIGATE",
+                        "target": None, "probabilities": {forced_out["id"]: 1.0},
+                    }
+                    self.trace.emit(
+                        "guard", step=step, type="forced_override", terminal=selected,
+                        evidence="terminal choice while forced; navigating out once",
+                    )
+                    selected = forced_out["id"]
             if selected in {"DONE", "BLOCKED"}:
                 # Terminal choices are never freshness-gated: DONE must not go
                 # stale on a live page, and BLOCKED must stay decidable.
@@ -1123,10 +1208,17 @@ class Agent:
             result = {"executed": action["id"]}
             cdp_calls, cdp_ms = self._cdp(state["browser"])
             act_started = time.perf_counter()
+            navigate_todo = ""
+            fallback_used = False
             if action["kind"] == "navigate":
                 if not state["browser"].fresh(page):
                     raise StalePage("Page changed before text generation. Choose again.")
-                context = field_context(state["goal"], action, page, state["history"])
+                navigate_todo = current_todo(state)
+                context = navigate_context(
+                    state["goal"], navigate_todo, state.get("memo") or [], page, state["history"],
+                    visited=state.get("visited_urls") or [], failed=state.get("failed_urls") or [],
+                    blocked=(state.get("blocked_hosts") or {}),
+                )
                 cached = self.pending_text and self.pending_text[0] == context
                 try:
                     text, helper = self._gen_text(state, step, context, NAVIGATE_VALUE, "navigate", action)
@@ -1135,12 +1227,21 @@ class Agent:
                 if not cached:
                     self.pending_text = (context, text, helper)
                     state["text_calls"].append({**helper, "field": action["label"], "value": text})
+                validated = self._validated_navigate_url(state, text, navigate_todo, step)
+                if validated is None:
+                    return self._skip_text_step(
+                        state, page, action, decision, selected, note="no unblocked navigation target"
+                    )
+                fallback_used = validated != text
+                text = validated
                 try:
                     result = state["browser"].navigate(text)
                 except ValueError:
                     return self._skip_text_step(
                         state, page, action, decision, selected, note="invalid navigation URL"
                     )
+                if isinstance(result, dict) and result.get("navigated") is False:
+                    note_failed_url(state, text)
                 self.pending_text = None
                 self.blocked_streak = 0
             elif action["kind"] == "select_option":
@@ -1226,6 +1327,7 @@ class Agent:
                         "already selected" if check_set else None,
                         "value unchanged" if check_failed else None,
                         "navigation failed" if navigate_failed else None,
+                        "used search fallback" if fallback_used else None,
                         date_note,
                     ) if part) or None,
                     "page_changed": None,
@@ -1277,6 +1379,19 @@ class Agent:
             state["_prev_fp"] = state["page"].get("fingerprint")
             self.trace.maybe_step_shot(done_step, state["page"].get("screenshot"))
             state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
+            note_visit(state, state["page"].get("url"))
+            off_topic = (
+                action.get("kind") == "navigate"
+                and not navigate_failed
+                and bool(navigate_todo)
+                and not page_entity_match(state["page"], navigate_todo)
+            )
+            if off_topic:
+                note_failed_url(state, state["page"].get("url"))
+                base_note = state["history"][-1]["note"]
+                state["history"][-1]["note"] = (
+                    f"{base_note}; off-topic landing" if base_note else "off-topic landing"
+                )
             state["history"][-1].update(
                 page_changed=changed,
                 url=state["page"]["url"],
@@ -1293,7 +1408,7 @@ class Agent:
             state["hold_reasons"] = reasons
             if action.get("kind") != "wait":
                 window = state.get("loop_window") or []
-                progress = bool(switched) or not same_page(window, state["page"])
+                progress = (bool(switched) or not same_page(window, state["page"])) and not off_topic
                 window.append(loop_step(decision, action, state["page"], progress))
                 state["loop_window"] = window[-LOOP_WINDOW:]
             if (
@@ -1678,6 +1793,29 @@ class Agent:
             self.log.info(f"[jev:captcha] could not go back ({error}); forcing navigation instead")
         add_event_note(state, f"Captcha wall on {host or 'this page'}; leaving it alone.")
 
+    def _validated_navigate_url(self, state, text, todo, step):
+        """The model's URL, unless it revisits a seen page or a blocked host. Then a search fallback."""
+        norm = normalize_link_url(text)
+        try:
+            host = (urlparse(text or "").hostname or "").lower()
+        except ValueError:
+            host = ""
+        seen = {
+            normalize_link_url((state.get("page") or {}).get("url")),
+            *(state.get("visited_urls") or []),
+            *(state.get("failed_urls") or []),
+        }
+        seen.discard("")
+        if (norm and norm in seen) or (host and host_blocked(state, host)):
+            engines = (getattr(self, "config", None) or {}).get("search_engines")
+            fallback = search_fallback(todo or state["goal"], engines or parse_search_engines(), state)
+            self.trace.emit(
+                "guard", step=step, type="navigate_fallback", proposed=text,
+                fallback=fallback, reason="revisit" if norm in seen else "blocked host",
+            )
+            return fallback
+        return text
+
     def _update_suppression(self, state, step=None):
         subgoals = state.get("subgoals") or []
         todo = any(not item.get("satisfied") for item in subgoals)
@@ -1691,6 +1829,8 @@ class Agent:
             and state.get("leave_site_url") == state["page"].get("url")
             and not held_nav
         ) or on_blocked_host(state)
+        if not forced:
+            state.pop("forced_override_used", None)
         if forced and not state.get("force_navigate"):
             step = len(state.get("history") or []) if step is None else step
             self.trace.emit(

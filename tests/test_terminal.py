@@ -231,10 +231,10 @@ def test_failed_navigate_step_is_noted(runner, monkeypatch):
         {"id": "navigate", "kind": "navigate", "label": "Navigate to a URL from the goal"}
     )
     monkeypatch.setattr(
-        loop, "field_text", Mock(return_value=("https://example.test/", {"model": "t", "latency_ms": 1}))
+        loop, "field_text", Mock(return_value=("https://else.test/", {"model": "t", "latency_ms": 1}))
     )
     runner.state["browser"].navigate.return_value = {
-        "executed": "navigate", "url": "https://example.test/", "navigated": False,
+        "executed": "navigate", "url": "https://else.test/", "navigated": False,
     }
     runner.state["decision"] = {**decision("navigate"), "operation": "NAVIGATE"}
     runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
@@ -256,7 +256,7 @@ def test_double_timeout_tick_blocks_with_partial(runner, monkeypatch):
     def fake_field_text(_context, **_kwargs):
         calls["n"] += 1
         if calls["n"] == 1:
-            return "https://example.test/", {"model": "t", "latency_ms": 1}
+            return "https://else.test/", {"model": "t", "latency_ms": 1}
         return ANSWER, {"model": "t", "latency_ms": 1}
 
     monkeypatch.setattr(loop, "field_text", fake_field_text)

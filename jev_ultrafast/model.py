@@ -891,6 +891,19 @@ def field_context(goal, action, page, history):
     }
 
 
+def navigate_context(goal, todo, memo, page, history, visited=(), failed=(), blocked=()):
+    return {
+        "goal": goal,
+        "todo": todo,
+        "facts": [item.get("fact", "") for item in memo][-8:],
+        "current_url": page.get("url"),
+        "visited_urls": list(visited)[-10:],
+        "failed_urls": list(failed)[-10:],
+        "blocked_hosts": sorted(blocked),
+        "recent_actions": [{k: h.get(k) for k in ("action", "text")} for h in history[-6:]],
+    }
+
+
 def answer_context(goal, page, history, evidence=(), memo=(), partial=False):
     return {
         "goal": goal,

@@ -30,8 +30,11 @@ If a required value is missing, return {"text": null}. Otherwise return {"text":
 NAVIGATE_VALUE = """Return a JSON object with exactly one key, text: the full https URL to visit next for the goal.
 If the goal names a site or page, use it. Otherwise use your knowledge of the public web to pick the
 right page for the current need given the actions so far (for example, https://en.wikipedia.org for a
-Wikipedia article). Local http fixture URLs are allowed only when the goal names them. No commentary,
-code, or browser actions. If no page can be determined, return {"text": null}."""
+Wikipedia article). Return a URL for the TODO item, not for the overall goal. It MUST NOT be the
+current URL or any URL in visited/failed, and MUST NOT be on a blocked host. Prefer a site whose
+pages are about that item's subject. If you are not certain of a deep URL, return a search-results
+URL from an unblocked engine instead of guessing. Local http fixture URLs are allowed only when the
+goal names them. No commentary, code, or browser actions. If no page can be determined, return {"text": null}."""
 
 ANSWER_VALUE = """Return a JSON object with exactly one key, text: the final answer to the goal.
 Report what the goal asked for (names, numbers, prices, titles) using the current page and the action

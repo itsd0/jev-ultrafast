@@ -23,6 +23,26 @@ def env_choice(name, default, allowed):
     return value if value in allowed else default
 
 
+DEFAULT_SEARCH_ENGINES = (
+    "https://www.bing.com/search?q={q}",
+    "https://duckduckgo.com/?q={q}",
+    "https://search.brave.com/search?q={q}",
+    "https://www.google.com/search?q={q}",
+)
+
+
+def parse_search_engines(override=None):
+    """Generic search URL templates, each embedding {q}. Non-Google engines first."""
+    if override:
+        engines = [str(item).strip() for item in override]
+    else:
+        raw = os.environ.get("JEV_SEARCH_ENGINES")
+        if raw is None or not str(raw).strip():
+            return list(DEFAULT_SEARCH_ENGINES)
+        engines = [item.strip() for item in str(raw).split(",")]
+    return [item for item in engines if item]
+
+
 def parse_files(override=None):
     files = {}
     for part in os.environ.get("JEV_UPLOAD_FILES", "").split(","):
@@ -145,6 +165,7 @@ def resolve_config(
     large_select=None,
     select_inline_max=None,
     vision=None,
+    search_engines=None,
 ):
     if frames is None:
         chosen = env_choice("JEV_FRAMES", "same", {"same", "all", "off"})
@@ -170,6 +191,7 @@ def resolve_config(
         "select_inline_max": _inline_max(select_inline_max),
         "vision": env_bool("JEV_VISION", False) if vision is None else bool(vision),
         "max_decisions": _clamped_int("JEV_MAX_DECISIONS", 80, 1, 10000),
+        "search_engines": parse_search_engines(search_engines),
     }
 
 
