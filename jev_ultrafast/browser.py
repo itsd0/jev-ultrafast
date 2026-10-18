@@ -465,10 +465,42 @@ class Browser:
         return False
 
     def navigate(self, url):
-        """Model-directed first navigation. The URL gate fails closed."""
+        """Model-directed first navigation. The URL gate fails closed.
+
+        An IPC timeout retries once: the daemon may have died, or the
+        navigate committed and only the acknowledgement was lost. A second
+        timeout records a failed step instead of raising.
+        """
         target = validate_navigate_url(url)
-        self.call("Page.navigate", url=target)
-        self.wait_until_ready()
+        try:
+            self.call("Page.navigate", url=target)
+            self.wait_until_ready()
+        except TimeoutError:
+            pass
+        else:
+            self.after_input = None
+            return {"executed": "navigate", "url": target}
+        try:
+            current = self.evaluate("location.href")
+        except (TimeoutError, StalePage):
+            current = None
+        if isinstance(current, str) and current.rstrip("/") == target.rstrip("/"):
+            self.after_input = None
+            return {"executed": "navigate", "url": target}
+        if (getattr(self, "config", None) or {}).get("browser") != "cloud":
+            # A stale cloud daemon owns a billable browser; only a local
+            # navigate respawns the daemon. A cloud navigate just retries.
+            ensure_daemon()
+        try:
+            self.call("Page.navigate", url=target)
+            self.wait_until_ready()
+        except TimeoutError as error:
+            self.after_input = None
+            get_logger("browser").warning(f"[jev:navigate] {target} timed out twice; recording a failed step")
+            return {
+                "executed": "navigate", "url": target, "navigated": False,
+                "error": f"{type(error).__name__}: {error}"[:200],
+            }
         self.after_input = None
         return {"executed": "navigate", "url": target}
 

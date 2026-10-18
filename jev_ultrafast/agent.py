@@ -712,10 +712,11 @@ class Agent:
             return None
         return shot.get("data") if isinstance(shot, dict) else None
 
-    def _block(self, state, reason, step):
-        """A terminal blocked stop with its evidence bundle and trace flush."""
+    def _terminal(self, state, reason, step):
+        """The single blocked stop: keeps the memo as a partial answer, then the evidence bundle."""
         state["status"] = "blocked"
-        state["blocked_reason"] = reason
+        if reason is not None:
+            state["blocked_reason"] = reason
         self._partial_close(state)
         state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
         self.trace.save_failure(step, self._failshot(state))
@@ -823,38 +824,52 @@ class Agent:
             }
         return info
 
+    def _tick(self, state, step):
+        """One predict-act cycle. Unexpected errors propagate to tick's env catch."""
+        try:
+            self.command("predict", {})
+        except StalePage as error:
+            self.trace.emit(
+                "error", step=step, type="StalePage", message=str(error)[:300],
+                where="predict", retried=True,
+                stack=traceback.format_exc(limit=5) if self.trace.level >= 2 else None,
+            )
+            state["decision"] = None
+            state["status"] = "ready"
+            try:
+                started = time.perf_counter()
+                state["page"] = state["browser"].observe(screenshot=self.screenshots)
+                indexer_ms = round((time.perf_counter() - started) * 1000)
+            except StalePage:
+                # The document never settled, even after observe's own
+                # backoff. Block honestly instead of failing the run.
+                return self._terminal(state, "page never settled", step)
+            self._emit_snapshot(state, step, indexer_ms, page_changed=True)
+            state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
+            self.trace.flush()
+            return self.snapshot()
+        if state["status"] in {"done", "blocked"}:
+            return self.snapshot()
+        decision = state.get("decision") or {}
+        locator = pending_locator(state["page"], decision.get("choice"))
+        return self._act_resilient(state, step, decision, locator)
+
     def command(self, name, body=None):
         body = body or {}
         state = self.state
         if name == "tick":
             step = len(state.get("history") or []) + 1
             try:
-                self.command("predict", {})
-            except StalePage as error:
+                return self._tick(state, step)
+            except Exception as error:
+                # Anything unexpected (dead daemon, API outage) ends the run
+                # as blocked with the memo kept, never as a crashed run.
                 self.trace.emit(
-                    "error", step=step, type="StalePage", message=str(error)[:300],
-                    where="predict", retried=True,
+                    "error", step=step, type=type(error).__name__, message=str(error)[:300],
+                    where="tick", retried=False,
                     stack=traceback.format_exc(limit=5) if self.trace.level >= 2 else None,
                 )
-                state["decision"] = None
-                state["status"] = "ready"
-                try:
-                    started = time.perf_counter()
-                    state["page"] = state["browser"].observe(screenshot=self.screenshots)
-                    indexer_ms = round((time.perf_counter() - started) * 1000)
-                except StalePage:
-                    # The document never settled, even after observe's own
-                    # backoff. Block honestly instead of failing the run.
-                    return self._block(state, "page never settled", step)
-                self._emit_snapshot(state, step, indexer_ms, page_changed=True)
-                state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
-                self.trace.flush()
-                return self.snapshot()
-            if state["status"] in {"done", "blocked"}:
-                return self.snapshot()
-            decision = state.get("decision") or {}
-            locator = pending_locator(state["page"], decision.get("choice"))
-            return self._act_resilient(state, step, decision, locator)
+                return self._terminal(state, f"env:{type(error).__name__}", step)
 
         elif name == "predict":
             if not state["browser"]:
@@ -891,7 +906,7 @@ class Agent:
                     evidence=[{"op": item.get("key", ["?"])[0], "label": item.get("label")} for item in tail],
                 )
                 if state["loop_fires"] >= LOOP_STOP_FIRES:
-                    return self._block(state, "loop detected", step)
+                    return self._terminal(state, "loop detected", step)
             self._stall_check(state, step)
             if "page_target" not in state:
                 state["page_target"] = goal_page_target(state["goal"])
@@ -903,7 +918,7 @@ class Agent:
             budget = config.get("max_decisions") or DEFAULT_MAX_DECISIONS
             if len(state["decisions"]) >= budget:
                 self.trace.emit("guard", step=step, type="budget", used=len(state["decisions"]), budget=budget)
-                return self._block(state, "decision budget", step)
+                return self._terminal(state, "decision budget", step)
             if len(state["decisions"]) >= budget * 0.75 and not state.get("winding_down"):
                 state["winding_down"] = True
                 self.trace.emit("guard", step=step, type="wind_down", used=len(state["decisions"]), budget=budget)
@@ -937,7 +952,7 @@ class Agent:
                         "error", step=step, type="ValueError", message=INVALID_RESPONSE,
                         where="predict", retried=True,
                     )
-                    return self._block(state, "invalid decision response", step)
+                    return self._terminal(state, "invalid decision response", step)
             decision = state["decision"]
             fields = {
                 "provider": decision_provider(), "model": decision.get("model"),
@@ -995,15 +1010,12 @@ class Agent:
                         state["status"] = "ready"
                         return self.snapshot()
                     state["partial"] = verdict["partial"]
-                state["status"] = "done" if selected == "DONE" else "blocked"
                 state["plan_index"] = int(selected == "DONE")
-                if selected == "DONE":
-                    state["answer"] = self._final_answer(state, page, step)
+                if selected == "BLOCKED":
+                    return self._terminal(state, state.get("blocked_reason") or "gave up", step)
+                state["status"] = "done"
+                state["answer"] = self._final_answer(state, page, step)
                 state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
-                if selected == "BLOCKED" and not state.get("blocked_reason"):
-                    state["blocked_reason"] = "gave up"
-                if state["status"] == "blocked":
-                    self.trace.save_failure(step, self._failshot(state))
                 self._emit_end(state, state["status"])
                 self.trace.flush()
                 return self.snapshot()
@@ -1022,7 +1034,7 @@ class Agent:
             if len(state["history"]) >= action_budget:
                 # Every action costs a decision, so the action cap follows the
                 # run's decision budget instead of a smaller fixed number.
-                return self._block(state, "action budget", step)
+                return self._terminal(state, "action budget", step)
             text, helper = None, None
             unmatched_option = False
             if action["kind"] in {"fill", "select_option"}:
@@ -1107,6 +1119,11 @@ class Agent:
                 and not result.get("already_set")
                 and not result.get("verified", False)
             )
+            navigate_failed = (
+                action["kind"] == "navigate"
+                and isinstance(result, dict)
+                and result.get("navigated") is False
+            )
             same_date = (
                 action["kind"] == "fill"
                 and isinstance(result, dict)
@@ -1141,6 +1158,7 @@ class Agent:
                         "coordinate-based" if action.get("kind") == "vision" else None,
                         "already selected" if check_set else None,
                         "value unchanged" if check_failed else None,
+                        "navigation failed" if navigate_failed else None,
                         date_note,
                     ) if part) or None,
                     "page_changed": None,
@@ -1160,7 +1178,7 @@ class Agent:
                 "action", step=done_step, operation=decision["operation"], target=action["label"],
                 kind=action.get("kind"), strategy=strategy,
                 cdp_calls=cdp_calls, cdp_ms=cdp_ms, duration_ms=act_ms,
-                ok=not (text_failed or check_failed or unmatched_option or commit_failed),
+                ok=not (text_failed or check_failed or unmatched_option or commit_failed or navigate_failed),
             )
             verify_started = time.perf_counter()
             post_started = time.perf_counter()
@@ -1238,9 +1256,7 @@ class Agent:
                     "guard", step=len(state["history"]), type="stall",
                     evidence=[h.get("action") for h in repeated],
                 )
-                self.trace.save_failure(len(state["history"]), self._failshot(state))
-                self._emit_end(state, "blocked")
-                self.trace.flush()
+                return self._terminal(state, state.get("blocked_reason"), len(state["history"]))
         else:
             raise ValueError("Unknown command")
         return self.snapshot()
@@ -1317,7 +1333,7 @@ class Agent:
                 ANSWER_VALUE,
                 "answer",
             )
-        except (ValueError, RuntimeError):
+        except Exception:
             self.log.info("[jev:answer] text helper failed; finishing without an answer")
             return None
         state["text_calls"].append({**helper, "field": "final answer", "value": text})
@@ -1745,7 +1761,7 @@ class Agent:
                     state["page"] = state["browser"].observe(screenshot=self.screenshots)
                     indexer_ms = round((time.perf_counter() - started) * 1000)
                 except StalePage:
-                    return self._block(state, "page never settled", step)
+                    return self._terminal(state, "page never settled", step)
                 self._emit_snapshot(state, step, indexer_ms, page_changed=True)
                 state["decision"] = None
                 state["status"] = "ready"

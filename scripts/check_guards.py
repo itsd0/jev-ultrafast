@@ -1,6 +1,10 @@
 """Local-browser freshness/execution regressions. No model calls or external websites."""
 
 import json
+import os
+import threading
+from functools import partial
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import quote
 
@@ -348,6 +352,27 @@ def main():
         assert result.get("retried") is True, result
         assert browser.evaluate("document.querySelector('#city').value") == "Lisbon, Portugal"
         passed.append("unmatched typing reverts on blur without committing a wrong option")
+
+        class Quiet(SimpleHTTPRequestHandler):
+            def log_message(self, *_args):
+                pass
+
+        os.environ["JEV_ALLOW_LOCAL"] = "1"
+        server = ThreadingHTTPServer(("127.0.0.1", 0), partial(Quiet, directory=str(FIXTURES)))
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            target = f"http://127.0.0.1:{server.server_port}/shadow.html"
+            result = browser.navigate(target)
+            assert result == {"executed": "navigate", "url": target}, result
+            page = browser.observe(screenshot=False)
+            assert page["url"].startswith("http://127.0.0.1:"), page["url"]
+            assert "Inside shadow" in [a["label"] for a in page["actions"]]
+            passed.append("navigate round-trips a local page and records success")
+        finally:
+            server.shutdown()
+            thread.join(timeout=5)
+            os.environ.pop("JEV_ALLOW_LOCAL", None)
     finally:
         browser.close()
     print("\n".join(passed))
