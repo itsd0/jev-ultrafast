@@ -79,6 +79,32 @@
     return !!(cfg().shadow && element.tagName && element.tagName.includes("-") && !element.shadowRoot);
   }
 
+  // Depth and shadow membership for the agent's indented element tree.
+  // @test-export-start: dom-meta
+  function domDepth(element) {
+    let depth = 0, node = element;
+    const seen = new Set();
+    while (node && !seen.has(node) && depth < 40) {
+      seen.add(node);
+      if (node.parentElement) { node = node.parentElement; depth++; }
+      else if (node.parentNode && node.parentNode.host) { node = node.parentNode.host; depth++; }
+      else break;
+    }
+    return depth;
+  }
+
+  function inShadow(element) {
+    let node = element;
+    const seen = new Set();
+    while (node && !seen.has(node)) {
+      seen.add(node);
+      if (node.parentNode && node.parentNode.host) return true;
+      node = node.parentElement || null;
+    }
+    return false;
+  }
+  // @test-export-end: dom-meta
+
   // Same-origin frames are listed here. Cross-origin frames are recorded and left for Python.
   function frameEntries(doc, origin, top, alloc) {
     const entries = [];
@@ -112,25 +138,26 @@
     const actions = [];
     for (const item of ranked) {
       const label = item.label || "container";
+      const tag = item.tag || "div";
       if (item.vertical) {
         const delta = Math.max(1, Math.round(item.clientHeight * 0.8));
         actions.push({kind:"scroll", node:item.node, frame:item.frame, axis:"y", delta,
-          label:"Scroll down " + label});
+          label:"Scroll down " + label, tag});
         actions.push({kind:"scroll", node:item.node, frame:item.frame, axis:"y", delta:-delta,
-          label:"Scroll up " + label});
+          label:"Scroll up " + label, tag});
       }
       if (item.horizontal) {
         const delta = Math.max(1, Math.round(item.clientWidth * 0.8));
         actions.push({kind:"scroll", node:item.node, frame:item.frame, axis:"x", delta,
-          label:"Scroll right " + label});
+          label:"Scroll right " + label, tag});
         actions.push({kind:"scroll", node:item.node, frame:item.frame, axis:"x", delta:-delta,
-          label:"Scroll left " + label});
+          label:"Scroll left " + label, tag});
       }
     }
     return actions;
   }
 
-  const api = {queryAllDeep, resolveHit, owns, possibleClosedShadow, frameEntries, scrollTargets, childDocument, cfg};
+  const api = {queryAllDeep, resolveHit, owns, possibleClosedShadow, frameEntries, scrollTargets, childDocument, cfg, domDepth, inShadow};
   globalThis.__jevApi = api;
   if (typeof document === "undefined") return api;
   if (!document.body) return null;
@@ -343,7 +370,9 @@
       const near=nearbyText(e);
       label=near ? `${rname} (unlabeled, near: '${near}')` : rname;
     }
-    const base={node, frame:frameId, role:rname, label, rect};
+    const base={node, frame:frameId, role:rname, label, rect,
+      tag:String(e.tagName||'').toLowerCase(), depth:domDepth(e)};
+    if (inShadow(e)) base.shadow=true;
     if (generic) base.generic=true;
     if (offscreen) base.offscreen=true;
     if (isPager(e,rname)) base.pager=true;
@@ -412,7 +441,8 @@
       if (seenNodes.has(key)) continue;
       seenNodes.add(key);
       actions.push({node, frame:frameId, role:'button', label, kind:'click', value:'',
-        possible_closed_shadow:true, rect});
+        possible_closed_shadow:true, rect, tag:String(e.tagName||'').toLowerCase(), depth:domDepth(e)});
+      if (inShadow(e)) actions[actions.length-1].shadow=true;
     }
   }
   let frameSerial=0;
@@ -531,6 +561,7 @@
           node:identity(e), frame:frameId, vertical, horizontal, area,
           clientHeight:e.clientHeight, clientWidth:e.clientWidth,
           label:(name(e)||'container').trim().slice(0, 40),
+          tag:String(e.tagName||'div').toLowerCase(),
         });
       }
     }
@@ -612,7 +643,11 @@
       sectionsLength+=body.length;
     }
   }
+  let shadowRoots=0;
+  if (cfg().shadow) {
+    for (const host of queryAllDeep(document, '*')) if (host.shadowRoot) shadowRoots++;
+  }
   return {url:location.href,title:document.title,w:innerWidth,h:innerHeight,text,
     scroll:{y:scrollY,height},actions,marker,page_key,guards,omitted_actions,cross_frames,surfaces,
-    modal_scoped:modalScoped,overlay,status:httpStatus,sections};
+    modal_scoped:modalScoped,overlay,status:httpStatus,sections,shadow_roots:shadowRoots};
 })()

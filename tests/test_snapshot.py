@@ -93,3 +93,20 @@ def test_slider_state_reads_range_inputs_and_aria():
         " min: stub.min, max: stub.max, value: stub.value, step: stub.step}))));"
     )
     assert run_block(block, script) == [want for _, want in cases]
+
+
+@needs_node
+def test_dom_meta_depth_and_shadow_membership():
+    block = snapshot_block("dom-meta")
+    script = (
+        "const html = {parentElement: null, parentNode: null};"
+        "const body = {parentElement: html, parentNode: html};"
+        "const host = {parentElement: body, parentNode: body};"
+        "const root = {host};" 
+        "const inner = {parentElement: null, parentNode: root};"
+        "const plain = {parentElement: body, parentNode: body};"
+        "console.log(JSON.stringify({"
+        " depth: domDepth(inner), plain: domDepth(plain),"
+        " shadow: inShadow(inner), light: inShadow(plain)}));"
+    )
+    assert run_block(block, script) == {"depth": 3, "plain": 2, "shadow": True, "light": False}
