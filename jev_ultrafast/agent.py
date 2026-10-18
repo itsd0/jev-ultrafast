@@ -1020,6 +1020,7 @@ ACTION_STRATEGY = {
     "navigate": "navigate",
     "switch_tab": "switch_tab",
     "close_tab": "close_tab",
+    "new_tab": "new_tab",
     "save_file": "write file",
     "vision": "coordinate",
 }

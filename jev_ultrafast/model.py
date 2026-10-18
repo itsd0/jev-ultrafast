@@ -272,6 +272,9 @@ def action_space(actions):
         if kind == "close_tab":
             controls["CLOSE_TAB"] = action
             continue
+        if kind == "new_tab":
+            controls["NEW_TAB"] = action
+            continue
         if kind == "save_file":
             controls["SAVE_FILE"] = action
             continue

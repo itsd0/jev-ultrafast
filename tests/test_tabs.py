@@ -171,6 +171,44 @@ def test_bind_tabs_prefers_title_in_labels():
     assert [action["label"] for action in switches] == ["Switch to tab Page A"]
 
 
+def test_new_tab_offered_until_cap():
+    browser = _tab_browser()
+    browser._register_tab("cdp-1", "s1", "https://example.test/a")
+    browser.active = "t1"
+    state = bind_tabs({"actions": [], "url": "u", "text": "", "scroll": {"y": 0}}, browser)
+    assert [action["kind"] for action in state["actions"]] == ["new_tab"]
+    _elements, _targets, controls = action_space(state["actions"])
+    assert controls["NEW_TAB"]["id"] == "new_tab"
+    for index in range(2, 6):
+        browser._register_tab(f"cdp-{index}", f"s{index}", f"https://example.test/{index}")
+    state = bind_tabs({"actions": [], "url": "u", "text": "", "scroll": {"y": 0}}, browser)
+    assert "new_tab" not in {action["kind"] for action in state["actions"]}
+
+
+def test_new_tab_registers_and_activates(monkeypatch):
+    import jev_ultrafast.browser as browser_module
+
+    calls = []
+
+    def fake_cdp(method, **params):
+        calls.append(method)
+        if method == "Target.createTarget":
+            return {"targetId": "cdp-9"}
+        if method == "Target.attachToTarget":
+            return {"sessionId": "s9"}
+        return {}
+
+    monkeypatch.setattr(browser_module, "cdp", fake_cdp)
+    browser = _tab_browser()
+    browser.context = None
+    browser._register_tab("cdp-1", "s1", "https://example.test/a")
+    browser.active = "t1"
+    tab = browser.new_tab()
+    assert browser.active == "t2"
+    assert tab["target"] == "cdp-9" and browser.session == "s9"
+    assert "Target.createTarget" in calls
+
+
 def test_tabs_default_on(monkeypatch):
     monkeypatch.delenv("JEV_TABS", raising=False)
     assert resolve_config()["tabs"] is True

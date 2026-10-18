@@ -572,6 +572,10 @@ class Browser:
             self.close_active()
             self.after_input = None
             return {"executed": action["id"]}
+        if action["kind"] == "new_tab":
+            self.new_tab()
+            self.after_input = None
+            return {"executed": action["id"]}
         session = self.session
         if action.get("route"):
             session = self.frame_sessions.get(action["route"])
@@ -684,6 +688,22 @@ class Browser:
         self.target = tab["target"]
         self.session = tab["session"]
         return tab
+
+    def new_tab(self):
+        """Open a blank tab and switch to it. The five-tab cap still holds."""
+        if len(self.tabs) >= 5:
+            raise StalePage("Tab limit reached. Close one first.")
+        params = {"url": "about:blank", "background": True, "newWindow": False}
+        if getattr(self, "context", None):
+            params["browserContextId"] = self.context
+            params["newWindow"] = True
+        target_id = cdp("Target.createTarget", **params)["targetId"]
+        session = cdp("Target.attachToTarget", targetId=target_id, flatten=True)["sessionId"]
+        cdp("Emulation.setFocusEmulationEnabled", session_id=session, enabled=True)
+        key = self._register_tab(target_id, session, "about:blank")
+        if key is None:
+            raise StalePage("Tab limit reached. Close one first.")
+        return self.activate(key)
 
     def close_active(self):
         if len(self.tabs) <= 1:
@@ -839,22 +859,30 @@ def bind_save_file(state, files_dir):
 
 
 def bind_tabs(state, browser):
-    """Add SWITCH_TAB / CLOSE_TAB controls. Choice ids are t1, t2, not CDP target ids."""
+    """Add SWITCH_TAB / CLOSE_TAB / NEW_TAB controls. Choice ids are t1, t2, not CDP target ids."""
     tabs = getattr(browser, "tabs", {}) or {}
-    if not (getattr(browser, "config", None) or {}).get("tabs", True) or len(tabs) <= 1:
+    if not (getattr(browser, "config", None) or {}).get("tabs", True):
         return state
-    actions = [action for action in state.get("actions", []) if action.get("kind") not in {"switch_tab", "close_tab"}]
-    active = getattr(browser, "active", None)
-    for key, tab in tabs.items():
-        if key == active:
-            continue
-        actions.append({
-            "id": f"switch:{key}",
-            "kind": "switch_tab",
-            "tab": key,
-            "label": f"Switch to tab {tab.get('title') or tab.get('url') or key}",
-        })
-    actions.append({"id": "close_tab", "kind": "close_tab", "label": "Close current tab"})
+    actions = [
+        action for action in state.get("actions", [])
+        if action.get("kind") not in {"switch_tab", "close_tab", "new_tab"}
+    ]
+    if len(tabs) > 1:
+        active = getattr(browser, "active", None)
+        for key, tab in tabs.items():
+            if key == active:
+                continue
+            actions.append({
+                "id": f"switch:{key}",
+                "kind": "switch_tab",
+                "tab": key,
+                "label": f"Switch to tab {tab.get('title') or tab.get('url') or key}",
+            })
+        actions.append({"id": "close_tab", "kind": "close_tab", "label": "Close current tab"})
+    if len(tabs) < 5:
+        actions.append({"id": "new_tab", "kind": "new_tab", "label": "Open a new tab"})
+    if len(actions) == len(state.get("actions") or []):
+        return state
     updated = {**state, "actions": actions}
     updated["fingerprint"] = fingerprint(updated)
     return updated
