@@ -7,7 +7,7 @@ import re
 import time
 import traceback
 from pathlib import Path
-from urllib.parse import quote_plus, urlparse
+from urllib.parse import parse_qsl, quote_plus, urlparse
 
 from .browser import Browser, StalePage
 from .config import parse_search_engines, resolve_config
@@ -184,6 +184,33 @@ def normalize_link_url(url):
     if not parsed.hostname:
         return ""
     return (parsed.hostname.lower() + (parsed.path or "").rstrip("/")).rstrip("/")
+
+
+_OPAQUE_TOKEN = re.compile(r"^[A-Za-z0-9_-]{16,}$")
+
+
+def page_identity(url):
+    """Host + path + sorted query for revisit detection. Opaque tokens (long
+    random values) and utm_* params don't create new identities."""
+    try:
+        parsed = urlparse(url or "")
+    except ValueError:
+        return ""
+    if not parsed.hostname:
+        return ""
+    base = (parsed.hostname.lower() + (parsed.path or "").rstrip("/")).rstrip("/")
+    try:
+        pairs = parse_qsl(parsed.query, keep_blank_values=True)
+    except ValueError:
+        pairs = []
+    params = [
+        (key, value) for key, value in pairs
+        if not key.lower().startswith("utm_") and not _OPAQUE_TOKEN.match(value or "")
+    ]
+    if not params:
+        return base
+    query = "&".join(f"{key}={value}" for key, value in sorted(params))
+    return f"{base}?{query}"
 
 
 def score_link(label, url, nav, todo_words, tried, stem=False):
@@ -664,8 +691,8 @@ def on_blocked_host(state):
 
 
 def note_visit(state, url):
-    """The last visited pages, normalized. Consecutive duplicates collapse."""
-    norm = normalize_link_url(url)
+    """The last visited pages, by identity. Consecutive duplicates collapse."""
+    norm = page_identity(url)
     if not norm:
         return
     visited = list(state.get("visited_urls") or [])
@@ -676,7 +703,7 @@ def note_visit(state, url):
 
 def note_failed_url(state, url):
     """A navigation target that failed or landed off-topic. Never proposed again."""
-    norm = normalize_link_url(url)
+    norm = page_identity(url)
     if not norm:
         return
     failed = list(state.get("failed_urls") or [])
@@ -685,9 +712,27 @@ def note_failed_url(state, url):
     state["failed_urls"] = failed[-20:]
 
 
-def search_fallback(todo, engines, state):
-    """A search-results URL on an unblocked engine. None when every engine is skipped."""
-    query = quote_plus((todo or "").strip())
+_QUERY_UI_VERBS = frozenset(
+    {"click", "open", "navigate", "select", "set", "apply", "report", "find", "identify", "locate"}
+)
+_QUERY_UI_NOUNS = frozenset({"link", "button", "page"})
+
+
+def search_query(text):
+    """Content words for a fallback search: UI verbs and nouns stripped, so the
+    query is never the raw imperative ("Click the 'More' link…")."""
+    words = []
+    for token in (text or "").split():
+        core = re.sub(r"^[^a-z0-9]+|[^a-z0-9]+$", "", token.lower())
+        if core and core not in _QUERY_UI_VERBS and core not in _QUERY_UI_NOUNS:
+            words.append(token)
+    return " ".join(words)
+
+
+def search_fallback(todo, engines, state, goal=""):
+    """A search-results URL on an unblocked engine. None when every engine is
+    skipped, or when no content words remain."""
+    query = quote_plus(search_query(todo) or search_query(goal))
     if not query:
         return None
     candidates = []
@@ -2215,24 +2260,37 @@ class Agent:
         return index if 0 <= index < len(choices) else None
 
     def _validated_navigate_url(self, state, text, todo, step):
-        """The model's URL, unless it revisits a seen page or a blocked host. Then a search fallback."""
-        norm = normalize_link_url(text)
+        """The model's URL, unless it is the current page, a failed URL, a blocked
+        host, or a twice-visited page. Then a search fallback."""
+        norm = page_identity(text)
         try:
             host = (urlparse(text or "").hostname or "").lower()
         except ValueError:
             host = ""
-        seen = {
-            normalize_link_url((state.get("page") or {}).get("url")),
-            *(state.get("visited_urls") or []),
-            *(state.get("failed_urls") or []),
-        }
-        seen.discard("")
-        if (norm and norm in seen) or (host and host_blocked(state, host)):
+        current = page_identity((state.get("page") or {}).get("url"))
+        failed = set(state.get("failed_urls") or [])
+        reject = None
+        if norm and (norm == current or norm in failed):
+            reject = "revisit"
+        elif host and host_blocked(state, host):
+            reject = "blocked host"
+        elif norm and norm in (state.get("visited_urls") or []):
+            # One revisit is legitimate (back-pagination, re-checks); the second loops.
+            once = set(state.get("revisited_once") or [])
+            if norm in once:
+                reject = "revisit"
+            else:
+                once.add(norm)
+                state["revisited_once"] = sorted(once)[-20:]
+        if reject is not None:
             engines = (getattr(self, "config", None) or {}).get("search_engines")
-            fallback = search_fallback(todo or state["goal"], engines or parse_search_engines(), state)
+            fallback = search_fallback(
+                todo or state["goal"], engines or parse_search_engines(), state,
+                goal=state["goal"],
+            )
             self.trace.emit(
                 "guard", step=step, type="navigate_fallback", proposed=text,
-                fallback=fallback, reason="revisit" if norm in seen else "blocked host",
+                fallback=fallback, reason=reject,
             )
             return fallback
         return text

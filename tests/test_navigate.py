@@ -97,7 +97,7 @@ def test_current_url_is_replaced_by_search_fallback(runner, monkeypatch, isolate
     runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
     fallback = runner.state["browser"].navigate.call_args[0][0]
     assert fallback.startswith("https://www.bing.com/search?q=")
-    assert quote_plus("Find the population of Bangkok") in fallback
+    assert quote_plus("the population of Bangkok") in fallback  # UI verb "Find" stripped
     assert runner.state["history"][-1]["text"] == fallback
     assert runner.state["history"][-1]["note"] == "used search fallback"
     assert seen["context"]["current_url"] == "https://example.test/"
@@ -126,6 +126,51 @@ def test_no_unblocked_engine_skips_the_step(runner, monkeypatch, isolated_hosts)
     runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
     runner.state["browser"].navigate.assert_not_called()
     assert runner.state["history"][-1]["note"] == "no unblocked navigation target"
+
+
+def test_page_identity_keeps_query_but_drops_tokens():
+    assert loop.page_identity("https://news.test/?p=3") != loop.page_identity("https://news.test/?p=4")
+    assert loop.page_identity("https://s.test/?b=2&a=1") == loop.page_identity("https://s.test/?a=1&b=2")
+    token = "sei=" + "A" * 20 + "&ved=" + "z" * 24
+    assert loop.page_identity(f"https://g.test/search?q=lisbon&{token}") == "g.test/search?q=lisbon"
+    assert loop.page_identity("https://g.test/?utm_source=x&p=2") == "g.test?p=2"
+    assert loop.page_identity("https://example.test/") == "example.test"
+    assert loop.page_identity("not a url") == ""
+    assert loop.page_identity("") == ""
+
+
+def test_back_pagination_proposal_is_accepted(runner, isolated_hosts):
+    runner.state["page"]["url"] = "https://news.test/?p=4"
+    runner.state["visited_urls"] = ["news.test?p=2", "news.test?p=3", "news.test?p=4"]
+    accepted = runner._validated_navigate_url(runner.state, "https://news.test/?p=3", "todo", 4)
+    assert accepted == "https://news.test/?p=3"
+    assert runner.state["revisited_once"] == ["news.test?p=3"]
+
+
+def test_revisit_policy_current_failed_and_twice_visited(runner, isolated_hosts):
+    runner.state["page"]["url"] = "https://news.test/?p=4"
+    runner.state["visited_urls"] = ["news.test?p=3"]
+    runner.state["failed_urls"] = ["shop.test/bad"]
+    current = runner._validated_navigate_url(runner.state, "https://news.test/?p=4", "todo", 1)
+    assert current.startswith("https://www.bing.com/search?q=")
+    failed = runner._validated_navigate_url(runner.state, "https://shop.test/bad", "todo", 1)
+    assert failed.startswith("https://www.bing.com/search?q=")
+    once = runner._validated_navigate_url(runner.state, "https://news.test/?p=3", "todo", 1)
+    assert once == "https://news.test/?p=3"
+    twice = runner._validated_navigate_url(runner.state, "https://news.test/?p=3", "todo", 2)
+    assert twice.startswith("https://www.bing.com/search?q=")
+
+
+def test_fallback_query_has_no_ui_words(isolated_hosts):
+    state = {}
+    engines = ["https://www.bing.com/search?q={q}"]
+    url = loop.search_fallback("Click the 'More' link to navigate to the second page.", engines, state)
+    query = url.split("?q=", 1)[1].lower()
+    assert "click" not in query and "link" not in query and "navigate" not in query and "page" not in query
+    assert "more" in query and "second" in query
+    assert loop.search_fallback("Click link navigate page", engines, state) is None
+    todo = "Click link navigate page"
+    assert loop.search_fallback(todo, engines, state, goal="Bangkok weather") is not None
 
 
 def test_blocked_host_proposal_uses_fallback(runner, monkeypatch, isolated_hosts):
