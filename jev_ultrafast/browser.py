@@ -192,7 +192,7 @@ class Browser:
         )
         return value or []
 
-    def evaluate(self, expression, session=None):
+    def evaluate(self, expression, session=None, await_promise=False):
         started = time.perf_counter()
         try:
             response = cdp(
@@ -200,6 +200,7 @@ class Browser:
                 session_id=session or self.session,
                 expression=expression,
                 returnByValue=True,
+                awaitPromise=await_promise,
             )
         finally:
             self._bump_cdp(time.perf_counter() - started)
@@ -363,10 +364,8 @@ class Browser:
             " arm(); })"
         )
         try:
-            self.call(
-                "Runtime.evaluate", expression=expression, awaitPromise=True, returnByValue=True,
-            )
-        except (RuntimeError, KeyError, TypeError):
+            self.evaluate(expression, await_promise=True)
+        except (RuntimeError, KeyError, TypeError, StalePage):
             pass
 
     def _target_fresh(self, page, action):

@@ -79,10 +79,12 @@ def test_missing_route_session_is_stale():
 
 
 def test_settle_dom_never_raises():
-    tab = browser(call=RuntimeError("navigated mid-settle"))
+    tab = browser(evaluate=RuntimeError("navigated mid-settle"))
     tab.settle_dom()  # must not raise
-    tab.call.assert_called_once()
-    assert "MutationObserver" in tab.call.call_args.kwargs["expression"]
+    tab.evaluate.assert_called_once()
+    assert "MutationObserver" in tab.evaluate.call_args.args[0]
+    assert tab.evaluate.call_args.kwargs == {"await_promise": True}
+    tab.call.assert_not_called()
 
 
 def test_retarget_finds_the_same_control_under_a_shifted_id():

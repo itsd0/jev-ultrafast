@@ -170,6 +170,7 @@ def test_oopif_click_routes_to_the_child_session(monkeypatch):
     tab.session = "top"
     tab.frame_sessions = {"f2": "child-session"}
     tab.fresh = Mock(return_value=True)
+    tab.evaluate = Mock(return_value=True)
     tab.after_input = None
     seen = {}
 

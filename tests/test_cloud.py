@@ -333,6 +333,7 @@ def test_local_act_never_sends_a_probe(monkeypatch):
     tab = Browser.__new__(Browser)
     tab.config = {"browser": "cloud"}
     tab.fresh = Mock(return_value=True)
+    tab.evaluate = Mock(return_value=True)
     tab.session = "s"
     tab.frame_sessions = {}
     tab.after_input = None
