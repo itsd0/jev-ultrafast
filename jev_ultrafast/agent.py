@@ -355,6 +355,23 @@ def detect_pingpong(visited):
 
 SCROLL_EXHAUSTED_COUNT = 4
 SCROLL_HOLD_STEPS = 5
+CALENDAR_HOLD_STEPS = 4
+
+
+def modal_transition(before, after):
+    """A modal opened, closed, or neither between two observations."""
+    was_open, is_open = bool(before.get("modal_scoped")), bool(after.get("modal_scoped"))
+    if is_open and not was_open:
+        return "opened"
+    if was_open and not is_open:
+        return "closed"
+    return None
+
+
+def _field_value(page, key):
+    """The current value of the tracked field, or None when it is gone."""
+    match = next((item for item in page.get("actions", []) if noop_key(item) == key), None)
+    return match.get("value") if match is not None else None
 
 
 def update_scroll_watch(watch, page_key, memo_len, satisfied):
@@ -962,6 +979,12 @@ def page_for_choice(state):
             actions = kept
             # The toggle is already open: offer the controls inside it first.
             actions = sorted(actions, key=lambda a: not a.get("inner"))
+    grid_hold = state.get("_grid_hold_until") or 0
+    if grid_hold and len(state.get("history") or []) < grid_hold:
+        # Calendar stall: day cells wait while the model types the date instead.
+        kept = [a for a in actions if not (a.get("kind") == "click" and a.get("in_grid"))]
+        if kept:
+            actions = kept
     if any(a.get("generic") for a in actions):
         # Unlabeled controls sort last: prefer controls that say what they do.
         actions = sorted(actions, key=lambda a: bool(a.get("generic")))
@@ -1279,7 +1302,11 @@ class Agent:
         commit = (result or {}).get("commit")
         if kind == "fill":
             verified = bool((result or {}).get("text_verified", True))
-            if commit and (result or {}).get("committed", True):
+            if (result or {}).get("date_committed") is False:
+                # Date entry commits before calendars: the typed date must land
+                # in the field before any day-clicking counts.
+                success, nxt = False, "date not committed; type the date and press Enter"
+            elif commit and (result or {}).get("committed", True):
                 # The commit expanded the typed fragment to the full option
                 # ("lisbon" -> "Lisbon, Portugal"); the text mismatch is expected.
                 success, nxt = True, None
@@ -1731,10 +1758,15 @@ class Agent:
                 and isinstance(result, dict)
                 and result.get("same_date")
             )
+            date_failed = (
+                action["kind"] == "fill"
+                and isinstance(result, dict)
+                and result.get("date_committed") is False
+            )
             date_note = (
                 f"field shows {result.get('typed')} for {text} (same date)"
                 if same_date
-                else None
+                else ("date not committed" if date_failed else None)
             )
             # Record execution before observing. A stale post-action observation must not erase the action.
             state["history"].append(
@@ -1783,6 +1815,7 @@ class Agent:
                 kind=action.get("kind"), strategy=strategy,
                 cdp_calls=cdp_calls, cdp_ms=cdp_ms, duration_ms=act_ms,
                 ok=not (text_failed or check_failed or unmatched_option or commit_failed or navigate_failed),
+                ordering=(result or {}).get("ordering"),
             )
             verify_started = time.perf_counter()
             post_started = time.perf_counter()
@@ -1873,6 +1906,44 @@ class Agent:
                     state["scroll_watch"] = {
                         "key": key, "count": 0, "memo": memo_len, "satisfied": satisfied
                     }
+            transition = modal_transition(page, state["page"])
+            if (
+                transition == "opened"
+                and action.get("kind") == "fill"
+                and "date_committed" in (result or {})
+            ):
+                tracked = state.get("_modal_cycles") or {}
+                if tracked.get("key") != noop_key(action):
+                    tracked = {"key": noop_key(action), "cycles": 0}
+                # Baseline from the before page: the field hides behind the modal.
+                tracked["value"] = _field_value(page, tracked["key"])
+                state["_modal_cycles"] = tracked
+            elif transition == "closed":
+                tracked = state.get("_modal_cycles") or {}
+                if tracked.get("key") and _field_value(state["page"], tracked["key"]) == tracked.get(
+                    "value"
+                ):
+                    tracked["cycles"] = tracked.get("cycles", 0) + 1
+                    state["_modal_cycles"] = tracked
+                    if tracked["cycles"] >= 2:
+                        # Open+close twice with no value change: stall the grid,
+                        # switch to type+enter.
+                        state["_grid_hold_until"] = done_step + CALENDAR_HOLD_STEPS
+                        add_event_note(
+                            state,
+                            "the calendar opened and closed twice without setting the date; "
+                            "type the date and press Enter instead of clicking days.",
+                        )
+                        self.trace.emit(
+                            "guard", step=done_step, type="calendar_stall",
+                            field=action.get("label"), cycles=tracked["cycles"],
+                            evidence="calendar opened and closed twice; field value unchanged"[:200],
+                        )
+                        state["_modal_cycles"] = {
+                            "key": tracked["key"], "value": tracked["value"], "cycles": 0
+                        }
+                else:
+                    state["_modal_cycles"] = {}
             off_topic = (
                 action.get("kind") == "navigate"
                 and not navigate_failed

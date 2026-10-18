@@ -1,0 +1,31 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Calendar</title></head>
+<body>
+<label>Departure <input id="departure" type="text" autocomplete="off"></label>
+<dialog id="cal" aria-label="Calendar">
+  <div role="grid" aria-label="June 2027">
+    <div role="row">
+      <button role="gridcell" data-date="2027-06-12">12</button>
+      <button role="gridcell" data-date="2027-06-13">13</button>
+    </div>
+  </div>
+  <button id="done">Done</button>
+</dialog>
+<script>
+const field = document.getElementById('departure');
+const cal = document.getElementById('cal');
+field.addEventListener('focus', () => { if (!cal.open) cal.showModal(); });
+cal.addEventListener('click', (event) => {
+  const day = event.target.closest('[role="gridcell"]');
+  if (!day) return;
+  field.value = day.dataset.date;  // a day click commits and closes
+  cal.close();
+});
+field.addEventListener('keydown', (event) => {
+  if (event.key === 'Enter' && field.value) cal.close();  // Enter commits typed text
+});
+document.getElementById('done').addEventListener('click', () => cal.close());
+</script>
+</body>
+</html>

@@ -168,6 +168,45 @@ def _click_step(label, progress=False):
     }
 
 
+def test_verify_info_fails_an_uncommitted_date(runner):
+    action = {"id": "e1", "kind": "fill", "label": "Departure", "value": ""}
+    before = runner.state["page"]
+    after = {**before, "fingerprint": "fp2"}
+    info = loop.Agent._verify_info(action, before, after, {"text_verified": True, "date_committed": False})
+    assert info["success"] is False
+    assert "press Enter" in info["next"]
+    info = loop.Agent._verify_info(action, before, after, {"text_verified": True, "date_committed": True})
+    assert info["success"] is True
+
+
+def test_calendar_open_close_twice_stalls_the_grid(runner, monkeypatch):
+    from unittest.mock import Mock
+
+    monkeypatch.setattr(
+        loop, "field_text", Mock(return_value=("June 12 2027", {"model": "t", "latency_ms": 1}))
+    )
+    field = {"id": "f1", "kind": "fill", "label": "Departure", "role": "textbox", "value": "",
+             "node": 7, "frame": "f0"}
+    day = {"id": "d1", "kind": "click", "label": "Sunday, June 13", "role": "gridcell",
+           "node": 5, "in_grid": True}
+    wait = {"id": "wait", "kind": "wait", "label": "Wait"}
+    plain = {**runner.state["page"], "modal_scoped": False, "fingerprint": "s1", "actions": [field, wait]}
+    modal = {**runner.state["page"], "modal_scoped": True, "fingerprint": "m1", "actions": [day, wait]}
+    runner.state["page"] = dict(plain)
+    fill_result = {"executed": "f1", "text_verified": True, "typed": "", "date_committed": False}
+    click_result = {"executed": "d1"}
+    runner.state["browser"].act.side_effect = [fill_result, click_result, fill_result, click_result]
+    runner.state["browser"].observe.side_effect = [modal, plain, modal, plain]
+    for selected, operation in (("f1", "TYPE_TEXT"), ("d1", "CLICK"), ("f1", "TYPE_TEXT"), ("d1", "CLICK")):
+        runner.state["decision"] = {**decision(selected), "operation": operation}
+        runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    assert runner.state["_grid_hold_until"] == 4 + loop.CALENDAR_HOLD_STEPS
+    assert any("press Enter instead of clicking days" in note["text"] for note in runner.state["event_notes"])
+    runner.state["page"] = dict(modal)
+    offered = loop.page_for_choice(runner.state)
+    assert [a["id"] for a in offered["actions"]] == ["wait"]
+
+
 def test_blocked_reasks_do_not_escalate_a_loop(runner, monkeypatch):
     monkeypatch.setattr(loop, "decompose_goal", lambda goal: ["goal"])
     monkeypatch.setattr(loop, "choose", lambda *_args, **kwargs: decision("BLOCKED"))

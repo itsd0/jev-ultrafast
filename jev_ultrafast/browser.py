@@ -1108,6 +1108,71 @@ def _verify_value(call, evaluate, action, expected, previous, actual):
     return result
 
 
+def twin_value_expression():
+    """Read the focused editable directly (the live twin), or null."""
+    return (
+        "(() => { const a=document.activeElement; "
+        "if (!a || !(a.isContentEditable||a.tagName==='INPUT'||a.tagName==='TEXTAREA')) return null; "
+        "return a.isContentEditable ? a.innerText : ('value' in a ? String(a.value) : ''); })()"
+    )
+
+
+_COMMIT_KEY_CODES = {"Enter": "Enter", "Tab": "Tab", "Escape": "Escape"}
+
+
+def commit_key_expression(action, key="Enter"):
+    """Commit the field with a key in keydown-beforeinput-input order.
+
+    Resolves the focused twin when the observed node detached, asserts
+    document.activeElement is the target (focusing twice if needed), then
+    dispatches keydown, beforeinput, and input. Reports {focused, ordered}.
+    """
+    locator = {k: action[k] for k in ("node", "frame") if k in action}
+    code = _COMMIT_KEY_CODES.get(key, key)
+    input_type = "insertLineBreak" if key == "Enter" else "insertText"
+    return (
+        "(payload => { const fast=window.__jevFast; "
+        "let e=fast?.resolve ? fast.resolve(payload.action) : fast?.nodes.get(payload.action.node); "
+        "if (e && !e.isConnected) { const a=document.activeElement; "
+        "if (a && (a.isContentEditable||a.tagName==='INPUT'||a.tagName==='TEXTAREA')) e=a; } "
+        "if (!e) return {focused:false, ordered:false}; "
+        "if (document.activeElement!==e) e.focus(); "
+        "if (document.activeElement!==e) e.focus(); "
+        "const focused=document.activeElement===e; "
+        "e.dispatchEvent(new KeyboardEvent('keydown',"
+        "{key:payload.key,code:payload.code,bubbles:true,cancelable:true})); "
+        "e.dispatchEvent(new InputEvent('beforeinput',"
+        "{inputType:payload.inputType,bubbles:true,cancelable:true})); "
+        "e.dispatchEvent(new InputEvent('input',{inputType:payload.inputType,bubbles:true})); "
+        "return {focused, ordered:true}; })("
+        + json.dumps({"action": locator, "key": key, "code": code, "inputType": input_type})
+        + ")"
+    )
+
+
+def commit_date(call, evaluate, action, expected, previous):
+    """Commit a typed date: when the field doesn't show it but the focused twin
+    does, commit with Enter in keydown-beforeinput order and re-poll once."""
+    order = _numeric_order(previous)
+    if parse_date(expected, order) is None:
+        return {}
+    if _compare_values(expected, evaluate(field_value_expression(action)), order) in (
+        "exact", "same_date",
+    ):
+        return {"date_committed": True}
+    if _compare_values(expected, evaluate(twin_value_expression()), order) not in (
+        "exact", "same_date",
+    ):
+        return {"date_committed": False}
+    ordering = evaluate(commit_key_expression(action, "Enter"))
+    if not isinstance(ordering, dict):
+        ordering = {}
+    time.sleep(0.6)
+    read = evaluate(field_value_expression(action))
+    committed = _compare_values(expected, read, order) in ("exact", "same_date")
+    return {"date_committed": committed, "ordering": {"key": "Enter", **ordering}}
+
+
 _TOKEN_STOPWORDS = frozenset("the a an to of and for on in with or by from".split())
 
 
@@ -1742,6 +1807,11 @@ def browser_operation(request):
                                 request.get("text") or "",
                                 previous,
                                 wait_ready=bool(request.get("verify_wait")),
+                            )
+                        )
+                        extra.update(
+                            commit_date(
+                                call, evaluate, action, request.get("text") or "", previous
                             )
                         )
                         extra.update(
