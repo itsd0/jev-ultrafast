@@ -1168,6 +1168,7 @@ class SessionRunner:
                 else:
                     os.environ["JEV_BROWSER"] = previous
         entry["browser"] = browser
+        entry["fresh_browser"] = True
         entry["live_url"] = live_url_for_agent_browser(browser)
         files_dir = self.session_files_dir(session_id)
         browser_config = getattr(browser, "config", None)
@@ -1366,6 +1367,14 @@ class SessionRunner:
                 if callable(navigate):
                     navigate(url)
                 entry["navigated"] = True
+            elif entry.pop("fresh_browser", False) and url is None and session.get("last_url"):
+                # Idle-timeout or restart resume: reopen where the session was.
+                navigate = getattr(browser, "navigate", None)
+                if callable(navigate):
+                    try:
+                        navigate(session["last_url"])
+                    except Exception:
+                        pass
             current_url = self._browser_url(browser)
             background = session_background(
                 self._prior_turns(session_id, message_id),

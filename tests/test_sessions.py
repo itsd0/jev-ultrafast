@@ -492,6 +492,42 @@ def test_default_max_decisions_reaches_agent(tmp_path):
     assert FakeAgent.seen[-1].config["max_decisions"] == 12
 
 
+def test_fresh_browser_reopens_last_url(tmp_path):
+    navigated = []
+
+    class NavBrowser(FakeBrowser):
+        def navigate(self, url):
+            navigated.append(url)
+            return {"navigated": True}
+
+    runner = _runner(
+        tmp_path, agent_factory=FakeAgent, browser_factory=lambda url: NavBrowser(),
+    )
+    sid = runner.create_session("local")
+    runner.store.update_session(sid, last_url="https://example.test/there")
+    mid = runner.submit_message(sid, "continue")
+    _wait_done(runner, sid, mid)
+    assert navigated == ["https://example.test/there"]
+
+
+def test_explicit_url_wins_over_last_url(tmp_path):
+    navigated = []
+
+    class NavBrowser(FakeBrowser):
+        def navigate(self, url):
+            navigated.append(url)
+            return {"navigated": True}
+
+    runner = _runner(
+        tmp_path, agent_factory=FakeAgent, browser_factory=lambda url: NavBrowser(),
+    )
+    sid = runner.create_session("local")
+    runner.store.update_session(sid, last_url="https://example.test/there")
+    mid = runner.submit_message(sid, "go", url="https://example.test/explicit")
+    _wait_done(runner, sid, mid)
+    assert navigated == ["https://example.test/explicit"]
+
+
 def test_bus_replays_events(tmp_path):
     runner = _runner(tmp_path, agent_factory=FakeAgent)
     sid = runner.create_session("local")
