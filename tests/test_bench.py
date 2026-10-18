@@ -83,3 +83,19 @@ def test_classify_success_is_none():
     task = {"checks": [{"type": "text_contains", "value": "points"}]}
     good = bench.run_checks(task, evidence())
     assert bench.classify(task, evidence(), good, False) is None
+
+
+def test_text_regex_and_hotels_checks():
+    task = {"checks": [{"type": "text_regex", "pattern": "(?i)lisbon"}]}
+    assert bench.run_checks(task, evidence(final_text="Hotels in Lisbon"))[0]["passed"]
+    assert not bench.run_checks(task, evidence(final_text="Hotels in Paris"))[0]["passed"]
+    hotels = {"checks": [
+        {"type": "url_regex", "pattern": "/travel/(hotels|search)"},
+        {"type": "text_contains", "value": "per night"},
+        {"type": "text_regex", "pattern": "(?i)lisbon"},
+    ]}
+    search_url = "https://www.google.com/travel/search?q=lisbon"
+    good = evidence(final_url=search_url, final_text="Lisbon · $120 per night")
+    assert all(r["passed"] for r in bench.run_checks(hotels, good))
+    wrong_city = evidence(final_url=search_url, final_text="Paris · $120 per night")
+    assert not all(r["passed"] for r in bench.run_checks(hotels, wrong_city))

@@ -27,8 +27,9 @@ tasks:
     max_decisions: 80
     expect_host: google.com
     checks:
-      - {type: url_regex, pattern: travel/hotels}
+      - {type: url_regex, pattern: "/travel/(hotels|search)"}
       - {type: text_contains, value: per night}
+      - {type: text_regex, pattern: "(?i)lisbon"}
 
   - id: hn-top5
     kind: extraction

@@ -59,6 +59,9 @@ def run_checks(task, evidence):
         elif kind == "text_contains":
             passed = normalize(value) in normalize(page_text)
             detail = f"{len(page_text)} chars of final text"
+        elif kind == "text_regex":
+            passed = re.search(check["pattern"], page_text or "") is not None
+            detail = f"{len(page_text)} chars of final text"
         elif kind == "answer_contains_all":
             missing = [v for v in check["values"] if normalize(v) not in normalize(answer)]
             passed = answer is not None and not missing
