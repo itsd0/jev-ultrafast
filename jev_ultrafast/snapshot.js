@@ -477,7 +477,13 @@
         rect:{x:raw.x, y:raw.y, w:raw.width, h:raw.height}});
     }
   }
+  let httpStatus=null;
+  try {
+    const entries=performance.getEntriesByType ? performance.getEntriesByType('navigation') : [];
+    const code=entries && entries[0] && entries[0].responseStatus;
+    if (typeof code==='number' && code>0) httpStatus=code;
+  } catch (error) { httpStatus=null; }
   return {url:location.href,title:document.title,w:innerWidth,h:innerHeight,text,
     scroll:{y:scrollY,height},actions,marker,page_key,guards,omitted_actions,cross_frames,surfaces,
-    modal_scoped:modalScoped,overlay};
+    modal_scoped:modalScoped,overlay,status:httpStatus};
 })()

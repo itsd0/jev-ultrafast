@@ -373,6 +373,20 @@ def main():
             server.shutdown()
             thread.join(timeout=5)
             os.environ.pop("JEV_ALLOW_LOCAL", None)
+
+        browser.call("Page.navigate", url="data:text/html," + quote("<title>Calm</title><p>Nothing here.</p>"))
+        browser.wait_until_ready()
+        page = browser.observe(screenshot=False)
+        assert page.get("status") == 200, page.get("status")
+        assert page.get("captcha_reason") is None, page.get("captcha_reason")
+        browser.call("Page.navigate", url="data:text/html," + quote(
+            "<title>Wall</title><p>Our systems have detected unusual traffic.</p>"
+            '<iframe src="https://recaptcha.invalid/anchor" width="300" height="80"></iframe>'
+        ))
+        browser.wait_until_ready()
+        page = browser.observe(screenshot=False)
+        assert (page.get("captcha_reason") or "").startswith("challenge "), page.get("captcha_reason")
+        passed.append("captcha text and challenge iframe flag the page")
     finally:
         browser.close()
     print("\n".join(passed))

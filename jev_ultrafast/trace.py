@@ -274,24 +274,30 @@ class Trace:
 def diagnose_trace(events):
     """One failure cause from a trace, with evidence. Generic across sites.
 
-    Priority: environment/API error, budget, loop, widget not verified,
-    wandering, second-hop missing. Returns (cause, evidence) or (None, "").
+    Priority: captcha, environment error, transport error, then budget, loop,
+    widget not verified, wandering, second-hop missing. Returns (cause, evidence) or (None, "").
     """
     kinds = [event.get("kind") for event in events]
     data = [event.get("data") or {} for event in events]
     end = next((item for kind, item in zip(kinds, data) if kind == "end"), {})
     if end.get("status") == "done":
         return None, ""
+    guards = [item for kind, item in zip(kinds, data) if kind == "guard"]
+    captcha = [item for item in guards if item.get("type") == "captcha"]
+    if captcha:
+        return "captcha", f"captcha wall on {captcha[-1].get('host', '?')}"[:160]
+    reason = end.get("blocked_reason") or ""
+    if reason.lower().startswith("env:"):
+        return "environment/API error", reason[:160]
     errors = [item for kind, item in zip(kinds, data) if kind == "error"]
     for item in errors:
         message = f"{item.get('type', '')} {item.get('message', '')}".lower()
         if any(word in message for word in ("connection", "http 4", "http 5", "429", "timeout", "unavailable")):
             return "environment/API error", f"{item.get('type')}: {item.get('message')}"[:160]
-    reason = (end.get("blocked_reason") or "").lower()
-    if "budget" in reason:
-        return "budget", end.get("blocked_reason", "")
-    guards = [item for kind, item in zip(kinds, data) if kind == "guard"]
-    if "loop" in reason or sum(1 for item in guards if item.get("type") == "loop") >= 3:
+    lowered = reason.lower()
+    if "budget" in lowered:
+        return "budget", reason
+    if "loop" in lowered or sum(1 for item in guards if item.get("type") == "loop") >= 3:
         evidence = next((item.get("pattern", "") for item in guards if item.get("type") == "loop"), "")
         return "loop", f"loop detected {evidence}"[:160] or "loop detected"
     verify = [item for kind, item in zip(kinds, data) if kind == "verify"]

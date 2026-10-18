@@ -2,6 +2,7 @@
 
 import base64
 import os
+import random
 import re
 import time
 import traceback
@@ -414,6 +415,66 @@ def current_todo(state):
     subgoals = state.get("subgoals") or []
     todo = [item["text"] for item in subgoals if not item.get("satisfied")]
     return todo[0] if todo else ""
+
+
+HOST_BLOCK_TTL_S = 30 * 60
+HOST_RETRY_MIN_S = 20
+HOST_RETRY_MAX_S = 40
+MAX_HOST_RETRIES = 1
+
+_HOST_BLOCKS = {}
+
+
+def block_host(state, host, now=None):
+    """Block a captcha-walled host: this run backs off with jitter, other runs skip it for ~30 min."""
+    if not host:
+        return None
+    now = time.monotonic() if now is None else now
+    hosts = dict(state.get("blocked_hosts") or {})
+    entry = dict(hosts.get(host) or {})
+    entry["until"] = now + random.uniform(HOST_RETRY_MIN_S, HOST_RETRY_MAX_S)
+    entry.setdefault("retries", 0)
+    hosts[host] = entry
+    state["blocked_hosts"] = hosts
+    _HOST_BLOCKS[host] = now + HOST_BLOCK_TTL_S
+    return entry
+
+
+def host_blocked(state, host, now=None):
+    """True while a host must be skipped: backoff running, retry spent, or another run blocked it."""
+    if not host:
+        return False
+    now = time.monotonic() if now is None else now
+    entry = (state.get("blocked_hosts") or {}).get(host)
+    if entry is not None:
+        if now < entry.get("until", 0):
+            return True
+        return entry.get("retries", 0) >= MAX_HOST_RETRIES
+    return _HOST_BLOCKS.get(host, 0) > now
+
+
+def take_host_retry(state, host, now=None):
+    """Consume the single post-backoff retry. False when the host stays skipped."""
+    if not host:
+        return True
+    now = time.monotonic() if now is None else now
+    entry = (state.get("blocked_hosts") or {}).get(host)
+    if entry is None:
+        return _HOST_BLOCKS.get(host, 0) <= now
+    if now < entry.get("until", 0) or entry.get("retries", 0) >= MAX_HOST_RETRIES:
+        return False
+    entry["retries"] = entry.get("retries", 0) + 1
+    return True
+
+
+def on_blocked_host(state):
+    """The current page's host is blocked: the run must navigate away, not decide here."""
+    url = (state.get("page") or {}).get("url") or ""
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except ValueError:
+        return False
+    return host_blocked(state, host)
 
 
 def suppression_reasons(state, page):
@@ -890,6 +951,12 @@ class Agent:
             state["decision"] = None
             if state["status"] in {"done", "blocked"}:
                 raise ValueError("This run has stopped. Start a fresh demo.")
+            captcha = (state.get("page") or {}).get("captcha_reason")
+            if captcha and not state.get("force_navigate"):
+                # A wall, not a page: block the host and step back without
+                # spending a decision. Once forcing, decide the way out.
+                self._handle_captcha(state, step, captcha)
+                return self.snapshot()
             cycle = detect_cycle(state.get("loop_window") or [])
             if cycle:
                 reasons = dict(state.get("hold_reasons") or {})
@@ -1593,6 +1660,24 @@ class Agent:
         state["judged_url"] = state["page"].get("url") or ""
         state["judged_step"] = len(state.get("history") or [])
 
+    def _handle_captcha(self, state, step, reason):
+        """A wall, not a page: block the host, step back, and force a way out. Never solve it."""
+        url = (state.get("page") or {}).get("url") or ""
+        try:
+            host = (urlparse(url).hostname or "").lower()
+        except ValueError:
+            host = ""
+        block_host(state, host)
+        self.trace.emit("guard", step=step, type="captcha", host=host, reason=reason, url=url)
+        state["force_navigate"] = True
+        try:
+            state["browser"].go_back()
+            state["browser"].wait_until_ready()
+            state["page"] = state["browser"].observe(screenshot=self.screenshots)
+        except (StalePage, RuntimeError) as error:
+            self.log.info(f"[jev:captcha] could not go back ({error}); forcing navigation instead")
+        add_event_note(state, f"Captcha wall on {host or 'this page'}; leaving it alone.")
+
     def _update_suppression(self, state, step=None):
         subgoals = state.get("subgoals") or []
         todo = any(not item.get("satisfied") for item in subgoals)
@@ -1605,7 +1690,7 @@ class Agent:
             and state.get("leave_site")
             and state.get("leave_site_url") == state["page"].get("url")
             and not held_nav
-        )
+        ) or on_blocked_host(state)
         if forced and not state.get("force_navigate"):
             step = len(state.get("history") or []) if step is None else step
             self.trace.emit(

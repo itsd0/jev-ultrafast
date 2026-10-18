@@ -642,6 +642,41 @@ def fingerprint(state):
     return hashlib.sha256(json.dumps(content, sort_keys=True).encode()).hexdigest()
 
 
+_CAPTCHA_PATH = re.compile(r"/sorry|captcha|challenge", re.IGNORECASE)
+_CHALLENGE_FRAME = re.compile(r"recaptcha|hcaptcha|turnstile|cloudflare", re.IGNORECASE)
+_CAPTCHA_TEXT = re.compile(
+    r"unusual traffic|verify you(?:'re| are)(?: a)? human|are you a robot|not a robot|access denied",
+    re.IGNORECASE,
+)
+
+
+def detect_captcha(state):
+    """A generic environment wall: sorry/captcha URL, challenge iframe, 403/429, or challenge text.
+
+    Only visible cross-origin iframes are reported, so an invisible background
+    captcha that never blocks input does not fire. Returns a reason, or None.
+    """
+    url = state.get("url") or ""
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        parsed = None
+    if parsed is not None and (parsed.scheme or "").lower() in {"http", "https"}:
+        if _CAPTCHA_PATH.search(parsed.path or ""):
+            return f"captcha path: {(parsed.path or '')[:80]}"
+    for frame in state.get("cross_frames") or []:
+        src = frame.get("url") or frame.get("src") or ""
+        if _CHALLENGE_FRAME.search(src):
+            return f"challenge iframe: {src[:80]}"
+    if state.get("status") in (403, 429):
+        return f"http {state['status']}"
+    text = f"{state.get('title') or ''}\n{state.get('text') or ''}"
+    match = _CAPTCHA_TEXT.search(text)
+    if match:
+        return f"challenge text: {match.group(0)[:60]}"
+    return None
+
+
 def new_page_targets(events, owned_ids):
     """Pages whose opener is one of our targets. Unrelated Chrome tabs are ignored."""
     found = []
@@ -1554,6 +1589,7 @@ def browser_operation(request):
     if info is None:
         raise StalePage("Document is navigating")
     info["fingerprint"] = fingerprint(info)
+    info["captcha_reason"] = detect_captcha(info)
     if request.get("screenshot", True):
         info["screenshot"] = call("Page.captureScreenshot", format="jpeg", quality=72)["data"]
     return info
