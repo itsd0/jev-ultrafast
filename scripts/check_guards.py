@@ -172,6 +172,20 @@ def main():
         assert value == "Generated", repr(value)
         assert any(a.get("role") == "option" for a in page["actions"])
         passed.append("real text input waits for asynchronous combobox suggestions")
+
+        browser.evaluate("document.body.innerHTML=" + repr('<label>Code <input id="twin"></label>'))
+        page = browser.observe(screenshot=False)
+        field = next(a for a in page["actions"] if a["kind"] == "fill")
+        browser.evaluate(
+            "document.querySelector('#twin').addEventListener('focus',()=>{"
+            "const old=document.querySelector('#twin');const next=document.createElement('input');"
+            "next.id='twin';old.replaceWith(next);next.focus();})"
+        )
+        result = browser.act(field, page, text="K7")
+        assert result.get("text_verified") is True, result
+        assert browser.evaluate("document.querySelector('#twin').value") == "K7"
+        assert browser.evaluate("document.querySelectorAll('input').length") == 1
+        passed.append("replaced field verifies through the focused twin")
         browser.call("Page.navigate", url="about:blank")
         assert not browser.fresh(page, field)
         passed.append("navigation invalidates the old document")

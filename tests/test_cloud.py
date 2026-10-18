@@ -232,10 +232,11 @@ def test_action_freshness_uses_the_frame_pair():
     assert action_freshness(page, {"node": 2, "frame": "f0", "route": "f1"}) == ["child", "guard-2"]
 
 
-def test_active_element_fallback_is_cloud_only():
+def test_active_element_fallback_is_unconditional():
     action = {"node": 1, "frame": "f0"}
-    assert "document.activeElement" in field_value_expression(action, fallback=True)
-    assert "document.activeElement" not in field_value_expression(action)
+    expression = field_value_expression(action)
+    assert "document.activeElement" in expression
+    assert "editable.length===1" in expression
 
 
 def test_cloud_probe_merges_guard_locate_and_previous(monkeypatch):
@@ -260,7 +261,6 @@ def test_cloud_probe_merges_guard_locate_and_previous(monkeypatch):
         "action": {"id": "e1", "kind": "fill", "node": 1, "frame": "f0"},
         "probe": ["parent", "guard-1"],
         "keyboard": True,
-        "verify_active": True,
         "verify_wait": True,
     })
     evaluates = [params["expression"] for method, params in calls if method == "Runtime.evaluate"]
@@ -310,11 +310,11 @@ def test_local_act_never_sends_a_probe(monkeypatch):
     action = {"id": "e1", "kind": "click", "node": 1, "frame": "f0"}
     tab.act(action, page)
     assert seen[-1]["probe"] == ["parent", "guard-1"]
-    assert seen[-1]["verify_active"] is True
+    assert "verify_active" not in seen[-1]
     tab.config = {"browser": "local"}
     tab.act(action, page)
     assert seen[-1]["probe"] is None
-    assert seen[-1]["verify_active"] is False
+    assert "verify_active" not in seen[-1]
 
 
 def test_ready_after_the_verify_skips_the_extra_ready_call():

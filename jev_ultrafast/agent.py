@@ -1107,6 +1107,16 @@ class Agent:
                 and not result.get("already_set")
                 and not result.get("verified", False)
             )
+            same_date = (
+                action["kind"] == "fill"
+                and isinstance(result, dict)
+                and result.get("same_date")
+            )
+            date_note = (
+                f"field shows {result.get('typed')} for {text} (same date)"
+                if same_date
+                else None
+            )
             # Record execution before observing. A stale post-action observation must not erase the action.
             state["history"].append(
                 {
@@ -1131,6 +1141,7 @@ class Agent:
                         "coordinate-based" if action.get("kind") == "vision" else None,
                         "already selected" if check_set else None,
                         "value unchanged" if check_failed else None,
+                        date_note,
                     ) if part) or None,
                     "page_changed": None,
                     "url": page["url"],

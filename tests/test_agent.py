@@ -544,6 +544,17 @@ def test_text_mismatch_is_recorded_without_another_attempt(runner, monkeypatch):
     assert runner.state["browser"].act.call_count == 1
 
 
+def test_same_date_fill_names_both_sides(runner, monkeypatch):
+    monkeypatch.setattr(
+        loop, "field_text", Mock(return_value=("June 12 2027", {"model": "t", "latency_ms": 1}))
+    )
+    runner.state["browser"].act.return_value = {
+        "executed": "e1", "text_verified": True, "typed": "Sat, Jun 12", "same_date": True,
+    }
+    runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    assert runner.state["history"][-1]["note"] == "field shows Sat, Jun 12 for June 12 2027 (same date)"
+
+
 def test_fill_already_set_skips_the_mutation_and_holds(runner, monkeypatch):
     runner.state["page"]["actions"].append(
         {"id": "e5", "kind": "fill", "label": "Departure", "value": "Mon, Nov 16", "node": 30}

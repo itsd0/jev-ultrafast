@@ -6,6 +6,7 @@ import os
 import re
 import sys
 import time
+import unicodedata
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -512,7 +513,6 @@ class Browser:
             "files": (getattr(self, "config", None) or {}).get("files") or {},
             "keyboard": (getattr(self, "config", None) or {}).get("keyboard", True),
             "probe": probe,
-            "verify_active": cloud_mode,
             "verify_wait": cloud_mode,
             "counter": getattr(self, "cdp_counter", None),
         })
@@ -816,38 +816,144 @@ def bind_keys(state, enabled):
     return updated
 
 
-def _field_value_reader(fallback=False):
-    active = ""
-    if fallback:
-        # A click can make the page replace the focused control. Read the live
-        # replacement instead of the disconnected observed node.
-        active = (
-            "if (e && !e.isConnected && document.activeElement) { const a=document.activeElement; "
-            "if (a.isContentEditable || a.tagName==='INPUT' || a.tagName==='TEXTAREA') e=a; } "
-        )
+def _field_value_reader():
+    # SPAs often replace the focused control while keeping the same logical
+    # field. When the observed node is detached and the DOM holds exactly one
+    # editable, read the live replacement via the focused element. With two or
+    # more editables the replacement is ambiguous, so the read stays a miss.
     return (
         "(action => { const fast=window.__jevFast; "
         "let e=fast?.resolve ? fast.resolve(action) : fast?.nodes.get(action.node); "
-        + active
-        + "if (!e) return null; "
+        "if (e && !e.isConnected) { "
+        "const editable=document.querySelectorAll("
+        "'input,textarea,[contenteditable=\"\"],[contenteditable=\"true\"]'); "
+        "if (editable.length===1) { const a=document.activeElement; "
+        "if (a && (a.isContentEditable||a.tagName==='INPUT'||a.tagName==='TEXTAREA')) e=a; } } "
+        "if (!e) return null; "
         "return e.isContentEditable ? e.innerText : ('value' in e ? String(e.value) : ''); })"
     )
 
 
-def field_value_expression(action, fallback=False):
+def field_value_expression(action):
     locator = {k: action[k] for k in ("node", "frame") if k in action}
-    return _field_value_reader(fallback) + "(" + json.dumps(locator) + ")"
+    return _field_value_reader() + "(" + json.dumps(locator) + ")"
 
 
-def ready_value_expression(action, fallback=False):
+def ready_value_expression(action):
     """One read for the post-input value and readyState, so a ready page skips another call."""
     locator = {k: action[k] for k in ("node", "frame") if k in action}
     return (
-        "(action => { const read=" + _field_value_reader(fallback) + "; "
+        "(action => { const read=" + _field_value_reader() + "; "
         "return {ready: document.readyState === 'complete', value: read(action)}; })("
         + json.dumps(locator)
         + ")"
     )
+
+
+_MONTHS = {
+    "january": 1, "jan": 1, "february": 2, "feb": 2, "march": 3, "mar": 3,
+    "april": 4, "apr": 4, "may": 5, "june": 6, "jun": 6, "july": 7, "jul": 7,
+    "august": 8, "aug": 8, "september": 9, "sep": 9, "sept": 9, "october": 10,
+    "oct": 10, "november": 11, "nov": 11, "december": 12, "dec": 12,
+}
+_WEEKDAYS = {
+    "mon", "monday", "tue", "tues", "tuesday", "wed", "wednesday", "thu",
+    "thur", "thurs", "thursday", "fri", "friday", "sat", "saturday", "sun", "sunday",
+}
+_NUMERIC_DATE = re.compile(r"(\d{1,2})[/.](\d{1,2})(?:[/.](\d{2,4}))?")
+
+
+def parse_date(value, order=None):
+    """Parse the suite's date displays into (month, day, year or None).
+
+    Accepts ISO ("2027-06-12"), "June 12 2027", "12 June 2027", "Jun 12",
+    and "Sat, Jun 12". The weekday is parsed and ignored, never validated.
+    Numeric forms use the caller's order ("mdy"/"dmy", taken from the field's
+    own format); without one only self-disambiguating numerics parse, so
+    "06/07" stays a non-date and falls back to strict comparison.
+    """
+    if not isinstance(value, str):
+        return None
+    parts = value.strip().lower().replace(",", " ").split()
+    if parts and parts[0] in _WEEKDAYS:
+        parts = parts[1:]
+    if not parts:
+        return None
+    first = parts[0]
+    iso = re.fullmatch(r"(\d{4})-(\d{1,2})-(\d{1,2})", first)
+    if iso and len(parts) == 1:
+        year, month, day = (int(group) for group in iso.groups())
+        return (month, day, year) if 1 <= month <= 12 and 1 <= day <= 31 else None
+    numeric = _NUMERIC_DATE.fullmatch(first)
+    if numeric and len(parts) == 1:
+        first_num, second_num, year_text = numeric.groups()
+        year = None
+        if year_text is not None:
+            year = int(year_text) + (2000 if len(year_text) == 2 else 0)
+        orders = [order] if order in ("mdy", "dmy") else ("mdy", "dmy")
+        found = None
+        for candidate in orders:
+            one, two = (first_num, second_num) if candidate == "mdy" else (second_num, first_num)
+            month, day = int(one), int(two)
+            if 1 <= month <= 12 and 1 <= day <= 31:
+                if order in ("mdy", "dmy"):
+                    return (month, day, year)
+                if found is not None:
+                    return None
+                found = (month, day, year)
+        return found
+    month = day = year = None
+    for token in parts:
+        if token in _MONTHS and month is None:
+            month = _MONTHS[token]
+        elif token.isdigit() and len(token) == 4 and year is None:
+            year = int(token)
+        elif token.isdigit() and day is None:
+            day = int(token)
+        else:
+            return None
+    if month is None or day is None or not 1 <= day <= 31:
+        return None
+    return (month, day, year)
+
+
+def _numeric_order(previous):
+    """The field's own numeric date order, or None when it does not disambiguate."""
+    if not isinstance(previous, str):
+        return None
+    tokens = previous.strip().lower().replace(",", " ").split()
+    if len(tokens) != 1 or not _NUMERIC_DATE.fullmatch(tokens[0]):
+        return None
+    month_first = parse_date(previous, "mdy")
+    day_first = parse_date(previous, "dmy")
+    if bool(month_first) == bool(day_first):
+        return None
+    return "mdy" if month_first else "dmy"
+
+
+def _norm_text(value):
+    folded = unicodedata.normalize("NFKD", str(value))
+    stripped = "".join(char for char in folded if not unicodedata.combining(char))
+    return " ".join(stripped.casefold().split())
+
+
+def _compare_values(expected, actual, order=None):
+    """Classify a fill read-back as exact, same_date, rewritten, or no match."""
+    if actual == expected:
+        return "exact"
+    if not isinstance(actual, str) or not actual:
+        return None
+    want = parse_date(expected, order) if isinstance(expected, str) else None
+    got = parse_date(actual, order)
+    if want and got and want[:2] == got[:2]:
+        if want[2] is None or got[2] is None or want[2] == got[2]:
+            return "same_date"
+    norm_want, norm_got = _norm_text(expected), _norm_text(actual)
+    if norm_want and (
+        norm_want in norm_got or set(norm_want.split()) <= set(norm_got.split())
+    ):
+        return "rewritten"
+    return None
 
 
 def verify_typed_text(
@@ -857,7 +963,6 @@ def verify_typed_text(
     expected,
     previous=None,
     *,
-    fallback=False,
     wait_ready=False,
 ):
     """Read the field after insertText. Retype once only if the value did not change.
@@ -866,28 +971,37 @@ def verify_typed_text(
     result drops the suggestion list. Keyboard-only fields leave the value
     untouched, and those are the ones that need key events.
     """
-    expression = field_value_expression(action, fallback)
+    expression = field_value_expression(action)
     ready = None
     if wait_ready:
-        combined = evaluate(ready_value_expression(action, fallback))
+        combined = evaluate(ready_value_expression(action))
         if isinstance(combined, dict):
             actual, ready = combined.get("value"), bool(combined.get("ready"))
         else:
             actual = combined
     else:
         actual = evaluate(expression)
-    result = _verify_value(call, evaluate, action, expected, previous, actual, fallback)
+    result = _verify_value(call, evaluate, action, expected, previous, actual)
     if ready is not None:
         result["ready"] = ready
     return result
 
 
-def _verify_value(call, evaluate, action, expected, previous, actual, fallback):
-    expression = field_value_expression(action, fallback)
-    if actual == expected:
-        return {"text_verified": True, "typed": actual}
+def _verify_value(call, evaluate, action, expected, previous, actual):
+    expression = field_value_expression(action)
+    order = _numeric_order(previous)
+    outcome = _compare_values(expected, actual, order)
+    if outcome and (actual == expected or (actual not in (None, "") and actual != previous)):
+        result = {"text_verified": True, "typed": actual}
+        if outcome == "same_date":
+            result["same_date"] = True
+        elif outcome == "rewritten":
+            result["rewritten"] = True
+        return result
     if actual not in (None, "") and actual != previous:
-        return {"text_verified": True, "typed": actual, "rewritten": True}
+        # The field changed to something unrelated. Retyping over a live
+        # rewrite (autocomplete, twin swap) only garbles it further.
+        return {"text_verified": False, "typed": actual}
     modifier = 4 if sys.platform == "darwin" else 2
     call(
         "Input.dispatchKeyEvent",
@@ -898,7 +1012,13 @@ def _verify_value(call, evaluate, action, expected, previous, actual, fallback):
     for character in expected:
         dispatch_char(call, character)
     actual = evaluate(expression)
-    return {"text_verified": actual == expected, "typed": actual}
+    outcome = _compare_values(expected, actual, order)
+    result = {"text_verified": bool(outcome), "typed": actual}
+    if outcome == "same_date":
+        result["same_date"] = True
+    elif outcome == "rewritten":
+        result["rewritten"] = True
+    return result
 
 
 def match_combobox_option(typed, options):
@@ -1390,7 +1510,6 @@ def browser_operation(request):
                                 action,
                                 request.get("text") or "",
                                 previous,
-                                fallback=bool(request.get("verify_active")),
                                 wait_ready=bool(request.get("verify_wait")),
                             )
                         )
