@@ -1642,18 +1642,24 @@ def test_maybe_go_back_rules(runner):
     assert any("Went back" in note["text"] for note in runner.state["event_notes"])
 
     browser.go_back.reset_mock()
+    runner.state["page"] = {**page(), "title": "usb-c hub", "text": "usb-c hub price deals"}
     runner.state["excursion"] = {"from": "a", "at": "https://shop.test/itm/9", "label": "G", "page": None}
     runner._maybe_go_back(runner.state, "https://shop.test/itm/9", True, [])
-    assert browser.go_back.call_count == 0  # New evidence: stay.
+    assert browser.go_back.call_count == 0  # New evidence on an on-goal page: stay.
 
     runner.state["excursion"] = {"from": "a", "at": "https://shop.test/itm/9", "label": "G", "page": None}
     runner._maybe_go_back(runner.state, "https://shop.test/itm/9", False, ["usb-c hub price 100"])
-    assert browser.go_back.call_count == 0  # On-topic facts: stay.
+    assert browser.go_back.call_count == 0  # On-topic facts on an on-goal page: stay.
+
+    runner.state["page"] = page()
+    runner.state["excursion"] = {"from": "a", "at": "https://shop.test/itm/9", "label": "G", "page": None}
+    runner._maybe_go_back(runner.state, "https://shop.test/itm/9", True, [])
+    assert browser.go_back.call_count == 1  # Off-goal detour overrides claimed gain.
 
     runner.state["excursion"] = {"from": "a", "at": "https://else.test/", "label": "G", "page": None}
     runner.state["backs_used"] = 3
     runner._maybe_go_back(runner.state, "https://else.test/", False, [])
-    assert browser.go_back.call_count == 0  # Back budget spent.
+    assert browser.go_back.call_count == 1  # Back budget spent.
     assert runner.state["excursion"] is None
 
 

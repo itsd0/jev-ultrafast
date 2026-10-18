@@ -323,10 +323,31 @@ def control_unchanged(action, before, after):
         return None
     if action.get("value") and match.get("value") == action.get("value"):
         return "value unchanged"
+    if action.get("expanded") == "true" and match.get("expanded") == "true":
+        return "already open"
     for key in ("pressed", "selected"):
         if action.get(key) == "true" and match.get(key) == "true":
             return "already selected"
     return None
+
+
+def noop_key(action):
+    """A no-op toggle's identity across snapshots. Positional ids shift; kind+label do not.
+
+    A plain string: state must stay JSON-serializable for the inspector.
+    """
+    return f"{action.get('kind') or ''}\u0000{action.get('label') or ''}"
+
+
+def page_entity_match(page, todo):
+    """The page shares at least one distinctive word with the current sub-goal."""
+    words = _score_words(todo)
+    if not words:
+        return True
+    hay = _score_words(
+        (page.get("title") or "") + " " + (page.get("url") or "") + " " + (page.get("text") or "")[:2000]
+    )
+    return bool(words & hay)
 
 
 GUARD_HREF_INDEX = 12
@@ -414,6 +435,13 @@ def page_for_choice(state):
     suppressed = state.get("suppressed_ids") or set()
     if suppressed and state.get("suppressed_fp") == state["page"].get("fingerprint"):
         actions = [a for a in actions if a.get("id") not in suppressed]
+    dead = (state.get("noop_page") or {}).get(state["page"].get("url") or "")
+    if dead:
+        kept = [a for a in actions if noop_key(a) not in dead]
+        if kept:
+            actions = kept
+            # The toggle is already open: offer the controls inside it first.
+            actions = sorted(actions, key=lambda a: not a.get("inner"))
     if actions == state["page"]["actions"]:
         return state["page"]
     return {**state["page"], "actions": actions}
@@ -710,10 +738,20 @@ class Agent:
             else None
         )
         kind = action.get("kind")
+        commit = (result or {}).get("commit")
         if kind == "fill":
-            success = bool((result or {}).get("text_verified", True))
+            verified = bool((result or {}).get("text_verified", True))
+            if commit and (result or {}).get("committed", True):
+                # The commit expanded the typed fragment to the full option
+                # ("lisbon" -> "Lisbon, Portugal"); the text mismatch is expected.
+                success, nxt = True, None
+            elif commit:
+                success, nxt = False, f"commit failed ({commit}); held"
+            else:
+                success, nxt = verified, None
+            if not success and nxt is None:
+                nxt = "held; try typing in the field twin and pressing Enter"
             changed = before.get("value") != (after or {}).get("value") if after else None
-            nxt = None if success else "held; try typing in the field twin and pressing Enter"
         elif kind == "check":
             success = bool((result or {}).get("already_set") or (result or {}).get("verified", False))
             changed = before.get("checked") != (after or {}).get("checked") if after else None
@@ -726,7 +764,14 @@ class Agent:
             success = after_page.get("fingerprint") != before_page.get("fingerprint") or match is None
             changed = after_page.get("fingerprint") != before_page.get("fingerprint")
             nxt = None if success else "held for two steps"
-        return {"before": before, "after": after, "changed": changed, "success": success, "next": nxt}
+        info = {"before": before, "after": after, "changed": changed, "success": success, "next": nxt}
+        if commit:
+            info["commit"] = {
+                "strategy": commit, "picked": (result or {}).get("picked"),
+                "committed": (result or {}).get("committed"), "reverted": (result or {}).get("reverted"),
+                "retried": (result or {}).get("retried"),
+            }
+        return info
 
     def command(self, name, body=None):
         body = body or {}
@@ -1002,6 +1047,9 @@ class Agent:
             text_failed = isinstance(result, dict) and result.get("text_verified") is False
             if unmatched_option:
                 text_failed = False
+            if action.get("kind") == "fill" and isinstance(result, dict) and result.get("commit"):
+                # A committed expansion rewrites the typed fragment by design.
+                text_failed = not result.get("committed", True)
             switched = None
             if getattr(type(state["browser"]), "collect_new_tabs", None):
                 opened = state["browser"].collect_new_tabs()
@@ -1053,11 +1101,16 @@ class Agent:
                 }
             )
             done_step = len(state["history"])
+            strategy = ACTION_STRATEGY.get(action.get("kind"), action.get("kind"))
+            commit_failed = False
+            if action.get("kind") == "fill" and isinstance(result, dict) and result.get("commit"):
+                strategy = "type+commit"
+                commit_failed = not result.get("committed", True)
             self.trace.emit(
                 "action", step=done_step, operation=decision["operation"], target=action["label"],
-                kind=action.get("kind"), strategy=ACTION_STRATEGY.get(action.get("kind"), action.get("kind")),
+                kind=action.get("kind"), strategy=strategy,
                 cdp_calls=cdp_calls, cdp_ms=cdp_ms, duration_ms=act_ms,
-                ok=not (text_failed or check_failed or unmatched_option),
+                ok=not (text_failed or check_failed or unmatched_option or commit_failed),
             )
             verify_started = time.perf_counter()
             post_started = time.perf_counter()
@@ -1068,6 +1121,9 @@ class Agent:
             if unchanged:
                 base_note = state["history"][-1]["note"]
                 state["history"][-1]["note"] = f"{base_note}; {unchanged}" if base_note else unchanged
+                self._note_noop(state, action, unchanged)
+            elif action.get("kind") == "click":
+                (state.get("noop_streak") or {}).pop(noop_key(action), None)
             if not changed and reload_like(action) and getattr(state["browser"], "wait_for_refresh", None):
                 refreshed = state["browser"].wait_for_refresh(
                     page["fingerprint"], timeout=3, screenshot=self.screenshots
@@ -1079,7 +1135,8 @@ class Agent:
             self.trace.emit(
                 "verify", step=done_step, kind=action.get("kind"), before=verify["before"],
                 after=verify["after"], changed=verify["changed"], success=verify["success"],
-                next_strategy=verify["next"], duration_ms=round((time.perf_counter() - verify_started) * 1000),
+                next_strategy=verify["next"], commit=verify.get("commit"),
+                duration_ms=round((time.perf_counter() - verify_started) * 1000),
             )
             self._emit_snapshot(state, done_step, post_ms, page_changed=changed)
             state["_prev_fp"] = state["page"].get("fingerprint")
@@ -1096,7 +1153,7 @@ class Agent:
                 {"id": selected, "kind": action.get("kind")},
                 False if unchanged else changed,
                 reasons,
-                "already selected" if unchanged == "already selected" else "no-progress hold",
+                unchanged if unchanged in ("already selected", "already open") else "no-progress hold",
             )
             state["hold_reasons"] = reasons
             if action.get("kind") != "wait":
@@ -1308,6 +1365,34 @@ class Agent:
             )
         return f"{stall['label']} is not responding; try a different strategy instead of clicking it again."
 
+    def _note_noop(self, state, action, unchanged):
+        """A click that cannot move its own state is a no-op: suppress it for the
+        rest of this page and point the model at the controls inside it."""
+        if action.get("kind") != "click":
+            return
+        url_now = state["page"].get("url") or ""
+        if state.get("noop_url") != url_now:
+            state["noop_url"] = url_now
+            state["noop_page"] = {}
+            state["noop_streak"] = {}
+            state["noop_noted"] = []
+        key = noop_key(action)
+        streak = state["noop_streak"]
+        streak[key] = streak.get(key, 0) + 1
+        if unchanged != "already open" and streak[key] < 2:
+            return
+        dead = state["noop_page"].setdefault(url_now, [])
+        if key not in dead:
+            dead.append(key)
+        if key in state["noop_noted"]:
+            return
+        state["noop_noted"].append(key)
+        add_event_note(state, f"'{action.get('label')}' is already open; use the controls inside it.")
+        self.trace.emit(
+            "guard", step=len(state.get("history") or []), type="noop", label=action.get("label"),
+            evidence=f"{unchanged} (streak {streak[key]})",
+        )
+
     def _track_progress(self, state, step=None):
         step = len(state.get("history") or []) if step is None else step
         if should_activate_subgoals(state):
@@ -1392,16 +1477,20 @@ class Agent:
             if excursion:
                 state["excursion"] = None
             return
-        if gained:
-            state["excursion"] = None
-            return
         if state.get("page_target") and state.get("page_current") != excursion.get("page"):
             state["excursion"] = None
             return
-        todo_words = _score_words(current_todo(state))
-        if todo_words and any(todo_words & _score_words(fact) for fact in new_facts):
-            state["excursion"] = None
-            return
+        # An off-goal detour is a dead end even when the judge claims progress:
+        # the page shares no distinctive word with the current sub-goal entity.
+        off_goal = bool(current_todo(state)) and not page_entity_match(state["page"], current_todo(state))
+        if not off_goal:
+            if gained:
+                state["excursion"] = None
+                return
+            todo_words = _score_words(current_todo(state))
+            if todo_words and any(todo_words & _score_words(fact) for fact in new_facts):
+                state["excursion"] = None
+                return
         if (state.get("backs_used") or 0) >= MAX_BACKS:
             state["excursion"] = None
             return
@@ -1428,8 +1517,12 @@ class Agent:
         self.trace.emit(
             "guard", step=step, type="back", label=excursion.get("label"),
             back_from=excursion.get("at"), back_to=state["page"].get("url"),
-            backs_used=state["backs_used"],
-            evidence="click landed on a page that advanced no sub-goal and added no on-topic fact",
+            backs_used=state["backs_used"], off_goal=off_goal,
+            evidence=(
+                "off-goal detour: page shares no word with the current sub-goal"
+                if off_goal
+                else "click landed on a page that advanced no sub-goal and added no on-topic fact"
+            ),
         )
         state["judged_url"] = state["page"].get("url") or ""
         state["judged_step"] = len(state.get("history") or [])
@@ -1454,6 +1547,26 @@ class Agent:
         state["suppressed_fp"] = state["page"].get("fingerprint")
         state["suppression_reasons"] = suppression_reasons(state, state["page"])
         state["suppressed_ids"] = set(state["suppression_reasons"])
+        url_now = state["page"].get("url") or ""
+        if state.get("noop_url") != url_now:
+            state["noop_url"] = url_now
+            state["noop_page"] = {}
+            state["noop_streak"] = {}
+            state["noop_noted"] = []
+        dead = state["noop_page"].setdefault(url_now, [])
+        noted = state["noop_noted"]
+        for action in state["page"].get("actions") or []:
+            # Our own Open twin on an already-expanded field: satisfied, not a choice.
+            if (
+                action.get("kind") == "click"
+                and (action.get("label") or "").startswith("Open ")
+                and action.get("expanded") == "true"
+                and noop_key(action) not in dead
+            ):
+                dead.append(noop_key(action))
+                if noop_key(action) not in noted:
+                    noted.append(noop_key(action))
+                    add_event_note(state, f"'{action.get('label')}' is already open; use the controls inside it.")
 
     def _done_verdict(self, state, page, step=None):
         """Accept DONE only when pagination and every sub-goal check out. Bounded: two

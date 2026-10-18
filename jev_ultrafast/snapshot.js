@@ -447,6 +447,23 @@
     }
   }
   actions.push({id:'wait',kind:'wait',label:'Wait for the page to update'});
+  // Controls inside a region an expanded toggle controls: offered first once the
+  // toggle itself is a no-op ("already open, use the controls inside it").
+  const regions=[];
+  for (const e of queryAllDeep(document, '[aria-expanded="true"]')) {
+    const ids=(e.getAttribute('aria-controls')||e.getAttribute('aria-owns')||'').split(/\s+/).filter(Boolean);
+    for (const id of ids) {
+      const region=e.ownerDocument ? e.ownerDocument.getElementById(id) : null;
+      if (region) regions.push(region);
+    }
+  }
+  if (regions.length) {
+    for (const action of actions) {
+      if (action.node == null || (action.frame && action.frame!==rootFrame)) continue;
+      const n=cache.nodes.get(action.node);
+      if (n && regions.some(r=>r!==n && r.contains(n))) action.inner=true;
+    }
+  }
   const cross_frames=frames.filter(entry=>!entry.same).map(({id,rect,src,url})=>({id,rect,src,url}));
   const surfaces=[];
   if (cfg().vision) {
