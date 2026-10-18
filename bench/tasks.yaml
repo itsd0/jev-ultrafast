@@ -30,6 +30,7 @@ tasks:
       - {type: url_regex, pattern: "/travel/(hotels|search)"}
       - {type: text_contains, value: per night}
       - {type: text_regex, pattern: "(?i)lisbon"}
+      - {type: answer_contains_all, values: [lisbon, per night]}
 
   - id: hn-top5
     kind: extraction
@@ -53,6 +54,7 @@ tasks:
     max_decisions: 40
     expect_host: ebay.com
     checks:
+      - {type: url_host, value: www.ebay.com}
       - {type: answer_regex, pattern: "(?i)(\\$|THB|฿|USD)"}
       - {type: answer_min_length, value: 30}
 

@@ -166,6 +166,68 @@ def test_git_info_hashes_untracked_names_and_contents(tmp_path):
     assert hashed_clean["dirty"] is False
 
 
+def _suite_task(task_id):
+    import yaml
+
+    suite = yaml.safe_load(
+        (Path(__file__).resolve().parent.parent / "bench" / "tasks.yaml").read_text()
+    )
+    return next(t for t in suite["tasks"] if t["id"] == task_id)
+
+
+def test_ebay_pins_the_results_host():
+    task = _suite_task("ebay-usb-hub")
+    assert {"type": "url_host", "value": "www.ebay.com"} in task["checks"]
+    good = dict(
+        evidence(),
+        final_url="https://www.ebay.com/sch/i.html?_nkw=usb-c+hub",
+        answer_text="Hub A costs $25 (98% seller), Hub B costs $30 (99% seller).",
+    )
+    assert all(r["passed"] for r in bench.run_checks(task, good))
+    bing = dict(good, final_url="https://www.bing.com/search?q=usb-c+hub")
+    assert any(
+        r["check"]["type"] == "url_host" and not r["passed"]
+        for r in bench.run_checks(task, bing)
+    )
+
+
+def test_hotels_answer_reports_lisbon_nightly_prices():
+    task = _suite_task("hotels-lisbon")
+    assert {"type": "answer_contains_all", "values": ["lisbon", "per night"]} in task["checks"]
+    good = dict(
+        evidence(),
+        final_url="https://www.google.com/travel/hotels?q=lisbon",
+        final_text="Hotel X, Lisbon, $120 per night",
+        answer_text="Hotel X in Lisbon: $120 per night.",
+    )
+    assert all(r["passed"] for r in bench.run_checks(task, good))
+    thin = dict(good, answer_text="I found some hotels.")
+    assert any(
+        r["check"]["type"] == "answer_contains_all" and not r["passed"]
+        for r in bench.run_checks(task, thin)
+    )
+
+
+def test_clean_pass_needs_done_status_and_checks():
+    suite = {"tasks": [{"id": "a"}]}
+
+    def record(rep, reason, status):
+        return {
+            "task": "a", "rep": rep, "reason": reason, "status": status,
+            "wall_s": 1.0, "steps": 2, "decisions": 2, "tokens": 3, "cost_usd": 0.0,
+        }
+
+    records = [
+        record(1, None, "done"),
+        record(2, None, "blocked"),
+        record(3, "loop", "blocked"),
+    ]
+    assert bench.summarize(suite, records)["clean_pass"] == {"ok": 1, "total": 3}
+    text = bench.report(suite, records)
+    assert "Clean: 1/3" in text
+    assert "| a | 2/3 | 1/3 |" in text
+
+
 def test_bangkok_accepts_digit_form_population():
     import yaml
 

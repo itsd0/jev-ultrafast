@@ -203,20 +203,24 @@ def env_blocked(trace_events):
 
 
 def summarize(suite, records):
-    """Pass@1, pass@3 per task, and the env-excluded rate with excluded runs."""
+    """Pass@1, pass@3 per task, clean passes, and the env-excluded rate."""
     tasks = []
     for task in suite["tasks"]:
         runs = [r for r in records if r["task"] == task["id"]]
         if not runs:
             continue
         ok = sum(1 for r in runs if r["reason"] is None)
-        tasks.append({"task": task["id"], "runs": len(runs), "ok": ok, "pass_at_3": ok > 0})
+        clean = sum(1 for r in runs if r["reason"] is None and r.get("status") == "done")
+        tasks.append(
+            {"task": task["id"], "runs": len(runs), "ok": ok, "clean": clean, "pass_at_3": ok > 0}
+        )
     ok = sum(t["ok"] for t in tasks)
     total = sum(t["runs"] for t in tasks)
     excluded = [r for r in records if r.get("reason") is not None and r.get("env_blocked")]
     return {
         "tasks": tasks,
         "pass_at_1": {"ok": ok, "total": total},
+        "clean_pass": {"ok": sum(t["clean"] for t in tasks), "total": total},
         "pass_at_3": {"ok": sum(1 for t in tasks if t["pass_at_3"]), "total": len(tasks)},
         "env_excluded": {
             "ok": ok,
@@ -271,18 +275,22 @@ def git_info(root=None):
 
 
 def report(suite, records):
-    lines = ["| task | ok | pass@3 | median time | median steps | median decisions | median tokens | cost | failures |"]
-    lines.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- |")
+    lines = [
+        "| task | ok | clean | pass@3 | median time | median steps | median decisions"
+        " | median tokens | cost | failures |"
+    ]
+    lines.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
     for task in suite["tasks"]:
         runs = [r for r in records if r["task"] == task["id"]]
         if not runs:
             continue
         ok = sum(1 for r in runs if r["reason"] is None)
+        clean = sum(1 for r in runs if r["reason"] is None and r.get("status") == "done")
         failures = ", ".join(
             f"r{r['rep']}:{r['reason']}{'*' if r.get('partial') else ''}" for r in runs if r["reason"]
         ) or "-"
         lines.append(
-            f"| {task['id']} | {ok}/{len(runs)} | {'yes' if ok else 'no'}"
+            f"| {task['id']} | {ok}/{len(runs)} | {clean}/{len(runs)} | {'yes' if ok else 'no'}"
             f" | {med([r['wall_s'] for r in runs])}s"
             f" | {med([r['steps'] for r in runs])}"
             f" | {med([r['decisions'] for r in runs])}"
@@ -293,6 +301,10 @@ def report(suite, records):
     summary = summarize(suite, records)
     at1, at3, env = summary["pass_at_1"], summary["pass_at_3"], summary["env_excluded"]
     lines.append(f"\nTotal: {at1['ok']}/{at1['total']} passed. (* = partial answer attached)")
+    lines.append(
+        f"Clean: {summary['clean_pass']['ok']}/{summary['clean_pass']['total']}"
+        " (status done and all checks pass)."
+    )
     lines.append(f"pass@3: {at3['ok']}/{at3['total']} tasks passed at least once.")
     if env["excluded"]:
         listed = ", ".join(
