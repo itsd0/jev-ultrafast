@@ -6,6 +6,7 @@ import re
 import sys
 import time
 from pathlib import Path
+from urllib.parse import urlparse
 
 from .browser import Browser, StalePage
 from .config import resolve_config
@@ -19,10 +20,13 @@ from .model import (
     decompose_goal,
     field_context,
     field_text,
+    gate_context,
+    judge_progress,
     match_option,
     post_json,
+    track_context,
 )
-from .questions import ANSWER_VALUE, NAVIGATE_VALUE
+from .questions import ANSWER_VALUE, GATE_SYSTEM, NAVIGATE_VALUE, TRACK_SYSTEM
 from .vision import confirm_point, needs_vision, propose
 
 _RELOAD_WORDS = frozenset({"reload", "refresh"})
@@ -77,6 +81,7 @@ def loop_step(decision, action, page, progress):
         "identity": (page.get("url") or "", page.get("title") or ""),
         "id": action.get("id"),
         "label": action.get("label") or "?",
+        "kind": action.get("kind"),
         "progress": bool(progress),
     }
 
@@ -112,6 +117,122 @@ def hold_actions(holds, action_ids, steps=LOOP_HOLD_STEPS):
         if action_id:
             holds[action_id] = max(holds.get(action_id, 0), steps)
     return holds
+
+
+STALL_REPEATS = 3
+STALL_HOLD_STEPS = 5
+STALL_KINDS = {"click", "key", "select", "select_option", "navigate", "vision"}
+
+
+def detect_control_stall(window):
+    """The same control actuated 3x with no progress: the widget is not responding.
+
+    Typing and scrolling repeat legitimately, so only click-like actions stall.
+    """
+    if len(window) < STALL_REPEATS:
+        return None
+    tail = window[-STALL_REPEATS:]
+    if any(step.get("progress") for step in tail):
+        return None
+    if any(step.get("kind") not in STALL_KINDS for step in tail):
+        return None
+    keys = {step.get("key")[:2] for step in tail if step.get("key")}
+    if len(keys) != 1:
+        return None
+    return {"id": tail[0].get("id"), "label": tail[0].get("label") or "?"}
+
+
+def goal_page_target(goal):
+    """A counted page goal: 'page 3' or '3rd page'. None when the goal counts nothing."""
+    match = re.search(r"page\s+(\d+)", goal or "", re.IGNORECASE) or re.search(
+        r"(\d+)(?:st|nd|rd|th)\s+page", goal or "", re.IGNORECASE
+    )
+    return int(match.group(1)) if match else None
+
+
+def current_page_number(url, text):
+    """The current page from generic pagination markers: ?p=/page/N or 'Page N of'."""
+    match = re.search(r"[?&](?:p|page)=(\d+)", url or "") or re.search(r"/page/(\d+)", url or "")
+    if match:
+        return int(match.group(1))
+    match = re.search(r"[Pp]age\s+(\d+)\s+of\b", text or "")
+    return int(match.group(1)) if match else None
+
+
+SUBGOAL_ACTIVATE_STEPS = 8
+MEMO_CAP = 20
+
+
+def distinct_hosts(history):
+    hosts = set()
+    for item in history or []:
+        try:
+            host = urlparse(item.get("url") or "").hostname or ""
+        except ValueError:
+            host = ""
+        if host:
+            hosts.add(host.lower())
+    return hosts
+
+
+def should_activate_subgoals(state):
+    """Multi-site or long runs get sub-goal tracking; simple runs skip the overhead."""
+    if state.get("subgoals") is not None:
+        return False
+    if len(distinct_hosts(state.get("history"))) >= 2:
+        return True
+    return len(state.get("history") or []) >= SUBGOAL_ACTIVATE_STEPS
+
+
+def apply_judgment(state, judgment, source_url):
+    """Fold satisfied sub-goals (with evidence) and new facts into the run."""
+    subgoals = state.get("subgoals") or []
+    by_id = {item["id"]: item for item in subgoals}
+    for item in judgment.get("satisfied") or []:
+        target = by_id.get(item.get("id"))
+        if target is not None and not target.get("satisfied") and item.get("value"):
+            target["satisfied"] = True
+            target["value"] = item["value"]
+            target["source"] = source_url
+    memo = state.get("memo") or []
+    seen = {item["fact"] for item in memo}
+    for fact in judgment.get("facts") or []:
+        if fact and fact not in seen:
+            seen.add(fact)
+            memo.append({"fact": fact, "source": source_url})
+    state["memo"] = memo[-MEMO_CAP:]
+
+
+def add_event_note(state, text):
+    """One short-lived guidance note for the next few decisions."""
+    step = len(state.get("history") or [])
+    notes = [note for note in state.get("event_notes") or [] if step - note.get("step", 0) <= 4]
+    notes.append({"step": step, "text": text})
+    state["event_notes"] = notes[-2:]
+
+
+def compose_guidance(state):
+    """Derived run guidance for the decision model: sub-goals, facts, page count, budget."""
+    step = len(state.get("history") or [])
+    fresh = [note for note in state.get("event_notes") or [] if step - note.get("step", 0) <= 4]
+    state["event_notes"] = fresh
+    guidance = [note["text"] for note in fresh]
+    if state.get("winding_down"):
+        guidance.append("Budget nearly used: finish now with what you have.")
+    subgoals = state.get("subgoals") or []
+    if subgoals:
+        done = [f"{item['text']} ({item['value']})" for item in subgoals if item.get("satisfied")]
+        todo = [item["text"] for item in subgoals if not item.get("satisfied")]
+        if todo:
+            guidance.append(f"Done: {'; '.join(done) or 'nothing yet'}. Still need: {'; '.join(todo)}")
+    memo = state.get("memo") or []
+    if memo:
+        known = f"Known facts ({len(memo)}): " + "; ".join(item["fact"] for item in memo[-8:])
+        guidance.append(known[:400])
+    target, current = state.get("page_target"), state.get("page_current")
+    if target and current and current < target:
+        guidance.append(f"On page {current} of {target}: keep going to the next page.")
+    return guidance[:4]
 
 
 def control_unchanged(action, before, after):
@@ -253,7 +374,7 @@ class Agent:
     def _decide(self, state, page=None):
         page = page or state["page"]
         if decision_provider() != "mercury":
-            return choose(page, state["goal"], state["history"])
+            return choose(page, state["goal"], state["history"], guidance=compose_guidance(state))
         fresh_requirements = state.get("requirements_goal") != state["goal"]
         if fresh_requirements:
             state["requirements"] = decompose_goal(state["goal"])
@@ -328,15 +449,27 @@ class Agent:
                 if state["loop_fires"] >= LOOP_STOP_FIRES:
                     state["status"] = "blocked"
                     state["blocked_reason"] = "loop detected"
+                    self._partial_close(state)
                     state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
                     return self.snapshot()
+            self._stall_check(state)
+            if "page_target" not in state:
+                state["page_target"] = goal_page_target(state["goal"])
+            if state["page_target"]:
+                state["page_current"] = (
+                    current_page_number(state["page"].get("url"), state["page"].get("text")) or 1
+                )
             config = getattr(self, "config", None) or {}
             budget = config.get("max_decisions") or DEFAULT_MAX_DECISIONS
             if len(state["decisions"]) >= budget:
                 state["status"] = "blocked"
                 state["blocked_reason"] = "decision budget"
+                self._partial_close(state)
                 state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
                 return self.snapshot()
+            if len(state["decisions"]) >= budget * 0.75:
+                state["winding_down"] = True
+            self._track_progress(state)
             try:
                 state["decision"] = self._maybe_vision(state) or self._decide(state, page_for_choice(state))
             except ValueError as exc:
@@ -383,6 +516,14 @@ class Agent:
                     state["page"] = state["browser"].observe(screenshot=self.screenshots)
                     state["status"] = "ready"
                     return self.snapshot()
+                if selected == "DONE" and decision_provider() != "mercury":
+                    verdict = self._done_verdict(state, page)
+                    if not verdict["accept"]:
+                        state["done_rejections"] = state.get("done_rejections", 0) + 1
+                        add_event_note(state, f"Not done yet: still missing {verdict['missing'][:160]}.")
+                        state["status"] = "ready"
+                        return self.snapshot()
+                    state["partial"] = verdict["partial"]
                 state["status"] = "done" if selected == "DONE" else "blocked"
                 state["plan_index"] = int(selected == "DONE")
                 if selected == "DONE":
@@ -406,6 +547,7 @@ class Agent:
                 # run's decision budget instead of a smaller fixed number.
                 state["status"] = "blocked"
                 state["blocked_reason"] = "action budget"
+                self._partial_close(state)
                 state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
                 return self.snapshot()
             text, helper = None, None
@@ -588,9 +730,22 @@ class Agent:
 
     def _final_answer(self, state, page):
         """One best-effort summary of what the goal asked for. Never fails the run."""
+        evidence = [
+            {"subgoal": item["text"], "value": item.get("value"), "source": item.get("source")}
+            for item in state.get("subgoals") or []
+            if item.get("satisfied")
+        ]
         try:
             text, helper = field_text(
-                answer_context(state["goal"], page, state["history"]), system=ANSWER_VALUE
+                answer_context(
+                    state["goal"],
+                    page,
+                    state["history"],
+                    evidence,
+                    state.get("memo") or [],
+                    bool(state.get("partial")),
+                ),
+                system=ANSWER_VALUE,
             )
         except (ValueError, RuntimeError):
             print("[jev:answer] text helper failed; finishing without an answer", file=sys.stderr, flush=True)
@@ -643,6 +798,120 @@ class Agent:
         state["loop_window"] = window[-LOOP_WINDOW:]
         state["status"] = "ready"
         return True
+
+    def _stall_check(self, state):
+        stall = detect_control_stall(state.get("loop_window") or [])
+        if not stall or not stall["id"]:
+            return
+        notified = state.get("stall_notified") or {}
+        step = len(state.get("history") or [])
+        if notified.get("id") == stall["id"] and step - notified.get("step", 0) < 6:
+            return
+        state["stall_notified"] = {"id": stall["id"], "step": step}
+        state["held_actions"] = hold_actions(state.get("held_actions"), [stall["id"]], STALL_HOLD_STEPS)
+        add_event_note(state, self._stall_advice(state, stall))
+
+    def _stall_advice(self, state, stall):
+        actions = state["page"].get("actions", [])
+        action = next((item for item in actions if item.get("id") == stall["id"]), {})
+        sibling = next(
+            (
+                item
+                for item in actions
+                if item.get("kind") == "fill"
+                and item.get("node") is not None
+                and item.get("node") == action.get("node")
+            ),
+            None,
+        )
+        if sibling:
+            return (
+                f"{stall['label']} is not responding; try typing the value in "
+                f"{sibling.get('label') or 'the field'} and pressing Enter instead."
+            )
+        return f"{stall['label']} is not responding; try a different strategy instead of clicking it again."
+
+    def _track_progress(self, state):
+        if should_activate_subgoals(state):
+            state["subgoals"] = [
+                {"id": index, "text": text} for index, text in enumerate(decompose_goal(state["goal"]))
+            ]
+            state["text_calls"].append(
+                {
+                    "model": os.environ.get("TEXT_MODEL", "mercury-2.5"),
+                    "latency_ms": 0,
+                    "usage": getattr(decompose_goal, "last_usage", {}) or {},
+                    "field": "sub-goal decomposition",
+                    "value": None,
+                }
+            )
+        if state.get("subgoals") is None:
+            return
+        url = state["page"].get("url") or ""
+        if url == state.get("judged_url"):
+            return
+        step = len(state.get("history") or [])
+        if step - state.get("judged_step", -9) < 3:
+            return
+        state["judged_url"] = url
+        state["judged_step"] = step
+        try:
+            judgment, helper = judge_progress(
+                track_context(
+                    state["goal"], state["subgoals"], state.get("memo") or [], state["page"], state["history"]
+                ),
+                TRACK_SYSTEM,
+            )
+        except (ValueError, RuntimeError):
+            print("[jev:track] judgment failed; keeping previous progress", file=sys.stderr, flush=True)
+            return
+        state["text_calls"].append({**helper, "field": "progress judgment", "value": None})
+        apply_judgment(state, judgment, url)
+
+    def _done_verdict(self, state, page):
+        """Accept DONE only when pagination and every sub-goal check out. Bounded: two
+        rejections, then accept as partial so a strict judge cannot trap the run."""
+        target, current = state.get("page_target"), state.get("page_current")
+        if target and current != target:
+            missing = f"page {target} (now on page {current or '?'})"
+        else:
+            try:
+                judgment, helper = judge_progress(
+                    gate_context(
+                        state["goal"], state.get("subgoals"), state.get("memo") or [], page, state["history"]
+                    ),
+                    GATE_SYSTEM,
+                )
+            except (ValueError, RuntimeError):
+                print("[jev:gate] judgment failed; treating DONE as unverified", file=sys.stderr, flush=True)
+                judgment, helper = None, None
+            if helper is not None:
+                state["text_calls"].append({**helper, "field": "done gate", "value": None})
+            if judgment is not None:
+                apply_judgment(state, judgment, page.get("url") or "")
+            if state.get("subgoals") is not None:
+                todo = [item["text"] for item in state["subgoals"] if not item.get("satisfied")]
+                missing = "; ".join(todo) if todo else ""
+            elif judgment is not None and judgment.get("complete"):
+                missing = ""
+            else:
+                missing = (judgment or {}).get("missing") or "unverified completion"
+        if not missing:
+            return {"accept": True, "partial": False, "missing": ""}
+        if state.get("done_rejections", 0) >= 2:
+            return {"accept": True, "partial": True, "missing": missing}
+        return {"accept": False, "partial": False, "missing": missing}
+
+    def _partial_close(self, state):
+        """Finish blocked-but-informed: keep collected evidence and facts as a partial answer."""
+        if state.get("answer") is not None:
+            return
+        memo = state.get("memo") or []
+        evidence = [item for item in state.get("subgoals") or [] if item.get("satisfied")]
+        if not memo and not evidence:
+            return
+        state["partial"] = True
+        state["answer"] = self._final_answer(state, state["page"])
 
     def _skip_text_step(self, state, page, action, decision, selected, note="text helper failed"):
         """A bad text response skips this step. The run keeps going."""

@@ -364,12 +364,12 @@ def operation_catalog(targets, controls):
     }
 
 
-def choose(state, goal, history, requirements=None, progress=None):
+def choose(state, goal, history, requirements=None, progress=None, guidance=None):
     if decision_provider() == "mercury":
         return choose_mercury(state, goal, history, requirements or [goal], progress or {})
     elements, targets, controls = action_space(state["actions"])
     operations = operation_catalog(targets, controls)
-    body = typesafe_body(state, goal, history, elements, targets, operations)
+    body = typesafe_body(state, goal, history, elements, targets, operations, tuple(guidance or ()))
     url = os.environ.get("TYPESAFE_URL", "https://api.typesafe.ai/v1/systemone")
     started = time.perf_counter()
     result = post_json(url, os.environ["TYPESAFE_API_KEY"], body)
@@ -829,7 +829,7 @@ def choose_mercury(state, goal, history, requirements, progress):
     return decision
 
 
-def typesafe_body(state, goal, history, elements, targets, operations):
+def typesafe_body(state, goal, history, elements, targets, operations, guidance=()):
     questions = {
         "operation": {"type": "choice", "criteria": operations, "instructions": {"goal": goal, "rules": NEXT_ACTION}}
     }
@@ -846,12 +846,17 @@ def typesafe_body(state, goal, history, elements, targets, operations):
             },
             "instructions": {"goal": goal, "operation": operation, "rules": [NEXT_ACTION, TARGET]},
         }
+    recent = recent_actions(history)
+    recent.extend(
+        {"action": "(guidance)", "kind": "guidance", "text": None, "page_changed": None, "note": item}
+        for item in guidance
+    )
     return {
         "model": os.environ.get("TYPESAFE_MODEL", "jev-latest"),
         "state": {
             "page": {k: state[k] for k in ("url", "title", "text")},
             "elements": elements,
-            "recent_actions": recent_actions(history),
+            "recent_actions": recent,
         },
         "questions": questions,
     }
@@ -901,17 +906,95 @@ def field_context(goal, action, page, history):
     }
 
 
-def answer_context(goal, page, history):
+def answer_context(goal, page, history, evidence=(), memo=(), partial=False):
     return {
         "goal": goal,
         "page": {"url": page.get("url"), "title": page.get("title"), "text": (page.get("text") or "")[:6000]},
+        "evidence": [
+            {"subgoal": item["subgoal"], "value": item["value"], "source": item["source"]} for item in evidence
+        ],
+        "facts": [item["fact"] for item in memo],
+        "partial": partial,
         "recent_actions": [
             {k: h.get(k) for k in ("action", "text", "url")} for h in history[-10:]
         ],
     }
 
 
-def field_text(context, system=TEXT_VALUE):
+def track_context(goal, subgoals, memo, page, history):
+    return {
+        "goal": goal,
+        "subgoals": [
+            {"id": item["id"], "text": item["text"], "satisfied": bool(item.get("satisfied"))}
+            for item in subgoals
+        ],
+        "known_facts": [item["fact"] for item in memo][-12:],
+        "page": {"url": page.get("url"), "title": page.get("title"), "text": (page.get("text") or "")[:4000]},
+        "recent_actions": [
+            {k: h.get(k) for k in ("action", "text", "url")} for h in history[-6:]
+        ],
+    }
+
+
+def gate_context(goal, subgoals, memo, page, history):
+    context = track_context(goal, subgoals or [], memo, page, history)
+    context["done_claimed"] = True
+    return context
+
+
+JUDGE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "satisfied": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {"id": {"type": "integer"}, "value": {"type": "string"}},
+                "required": ["id", "value"],
+                "additionalProperties": False,
+            },
+        },
+        "facts": {"type": "array", "items": {"type": "string"}},
+        "complete": {"type": "boolean"},
+        "missing": {"type": "string"},
+    },
+    "required": ["satisfied", "facts", "complete", "missing"],
+    "additionalProperties": False,
+}
+
+
+def parse_judge(result):
+    output = json.loads(result["choices"][0]["message"]["content"])
+    if (
+        not isinstance(output, dict)
+        or not isinstance(output.get("satisfied"), list)
+        or not isinstance(output.get("facts"), list)
+        or not isinstance(output.get("complete"), bool)
+        or not isinstance(output.get("missing"), str)
+    ):
+        raise ValueError("invalid judgment")
+    satisfied = []
+    for item in output["satisfied"][:8]:
+        if (
+            isinstance(item, dict)
+            and isinstance(item.get("id"), int)
+            and isinstance(item.get("value"), str)
+            and item["value"].strip()
+        ):
+            satisfied.append({"id": item["id"], "value": item["value"].strip()[:500]})
+    facts = [item.strip()[:300] for item in output["facts"][:8] if isinstance(item, str) and item.strip()]
+    return {"satisfied": satisfied, "facts": facts, "complete": output["complete"], "missing": output["missing"][:500]}
+
+
+def judge_progress(context, system):
+    """One structured progress judgment. Raises ValueError when unusable; the caller decides."""
+    return field_text(
+        context, system=system, schema=JUDGE_SCHEMA, name="Progress", parse=parse_judge, label="judgment"
+    )
+
+
+def field_text(context, system=TEXT_VALUE, schema=None, name="FieldText", parse=None, label=None):
+    parse = parse or parse_field_text
     base = os.environ.get("TEXT_MODEL_BASE_URL", "https://api.inceptionlabs.ai/v1").rstrip("/")
     model_name = os.environ.get("TEXT_MODEL", "mercury-2.5")
     inception = "api.inceptionlabs.ai" in base or model_name.startswith("mercury")
@@ -944,9 +1027,10 @@ def field_text(context, system=TEXT_VALUE):
     text_schema = {
         "type": "json_schema",
         "json_schema": {
-            "name": "FieldText",
+            "name": name,
             "strict": True,
-            "schema": {
+            "schema": schema
+            or {
                 "type": "object",
                 "properties": {"text": {"type": "string"}},
                 "required": ["text"],
@@ -1015,19 +1099,21 @@ def field_text(context, system=TEXT_VALUE):
                 raise ValueError("Text helper was content-filtered; nothing typed.") from None
             raise
         try:
-            value = parse_field_text(result)
+            value = parse(result)
         except (ValueError, KeyError, TypeError, json.JSONDecodeError):
             latency_ms = round((time.perf_counter() - started) * 1000)
             logged = result if isinstance(result, dict) else {}
-            log_model_call(
-                "text", endpoint, payload, logged, latency_ms, "error=no valid field value"
-            )
+            problem = f"error=no valid {label}" if label else "error=no valid field value"
+            log_model_call("text", endpoint, payload, logged, latency_ms, problem)
             if attempt:
+                if label:
+                    print(f"[jev:text] {problem}; skipped", file=sys.stderr, flush=True)
+                    raise ValueError(f"Text helper returned no valid {label}.") from None
                 print("[jev:text] error=no valid field value; step skipped", file=sys.stderr, flush=True)
                 raise ValueError("Text helper returned no valid field value; nothing typed.") from None
             continue
         latency_ms = round((time.perf_counter() - started) * 1000)
-        log_model_call("text", endpoint, payload, result, latency_ms, f"value={value!r}")
+        log_model_call("text", endpoint, payload, result, latency_ms, f"value={value!r}"[:300])
         return value, {
             "model": model_name,
             "latency_ms": latency_ms,

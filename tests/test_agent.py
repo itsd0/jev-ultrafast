@@ -131,6 +131,15 @@ def test_loop_detector_fires_twice_then_blocks(runner, monkeypatch):
         return {**decision(ids[index % 2]), "operation": "CLICK"}
 
     monkeypatch.setattr(loop, "choose", lambda *_args, **_kwargs: click(len(runner.state["history"])))
+    monkeypatch.setattr(loop, "decompose_goal", lambda goal: ["goal"])
+    monkeypatch.setattr(
+        loop,
+        "judge_progress",
+        lambda context, system: (
+            {"satisfied": [], "facts": [], "complete": True, "missing": ""},
+            {"model": "t", "latency_ms": 1, "usage": {}},
+        ),
+    )
     rerenders = {"n": 0}
 
     def rerender(*_args, **_kwargs):
@@ -1145,6 +1154,14 @@ def test_done_records_final_answer(runner, monkeypatch):
         return "The answer.", {"model": "test", "latency_ms": 3, "usage": {}}
 
     monkeypatch.setattr(loop, "field_text", fake_field_text)
+    monkeypatch.setattr(
+        loop,
+        "judge_progress",
+        lambda context, system: (
+            {"satisfied": [], "facts": [], "complete": True, "missing": ""},
+            {"model": "t", "latency_ms": 1, "usage": {}},
+        ),
+    )
     runner.state["decision"] = decision("DONE")
     runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
     assert runner.state["status"] == "done"
@@ -1159,6 +1176,14 @@ def test_done_without_answer_when_helper_fails(runner, monkeypatch):
         raise ValueError("invalid field text")
 
     monkeypatch.setattr(loop, "field_text", boom)
+    monkeypatch.setattr(
+        loop,
+        "judge_progress",
+        lambda context, system: (
+            {"satisfied": [], "facts": [], "complete": True, "missing": ""},
+            {"model": "t", "latency_ms": 1, "usage": {}},
+        ),
+    )
     runner.state["decision"] = decision("DONE")
     runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
     assert runner.state["status"] == "done"
@@ -1235,3 +1260,248 @@ def test_observe_backs_off_through_navigation(monkeypatch):
     assert browser.observe(screenshot=False) == {"ok": True}
     assert [round(s, 3) for s in sleeps] == [0.05, 0.1]
     assert len(calls) == 3
+
+
+def _stall_step(operation, label, kind="click", progress=False, step_id="e9"):
+    return {
+        "key": (operation, label, "u", "t"),
+        "identity": ("u", "t"),
+        "id": step_id,
+        "label": label,
+        "kind": kind,
+        "progress": progress,
+    }
+
+
+def test_detect_control_stall_rules():
+    from jev_ultrafast.agent import detect_control_stall
+
+    stuck = [_stall_step("CLICK", "Open Return")] * 3
+    assert detect_control_stall(stuck)["id"] == "e9"
+    moving = [_stall_step("CLICK", "Open Return"), _stall_step("CLICK", "Open Return", progress=True)]
+    assert detect_control_stall(moving + [_stall_step("CLICK", "Open Return")]) is None
+    assert detect_control_stall([_stall_step("TYPE_TEXT", "Departure", kind="fill")] * 3) is None
+    assert detect_control_stall([_stall_step("SCROLL_DOWN", "Scroll down", kind="scroll")] * 3) is None
+    mixed = [_stall_step("CLICK", "A"), _stall_step("CLICK", "B"), _stall_step("CLICK", "A")]
+    assert detect_control_stall(mixed) is None
+    assert detect_control_stall([_stall_step("CLICK", "A")] * 2) is None
+
+
+def test_stall_check_holds_and_advises_typing(runner, monkeypatch):
+    seen = {}
+    runner.state["loop_window"] = [_stall_step("CLICK", "Open Search", step_id="e2")] * 3
+    runner.state["history"] = [{"action": "x", "url": "https://example.test/"}]
+
+    def fake_choose(*args, **kwargs):
+        seen["guidance"] = kwargs.get("guidance")
+        return decision("e3")
+
+    monkeypatch.setattr(loop, "choose", fake_choose)
+    runner.command("predict", {})
+    assert runner.state["held_actions"]["e2"] == 4  # Held for 5, decayed once by this predict.
+    assert any("typing the value in Search" in item for item in seen["guidance"])
+
+
+def test_date_rule_reaches_the_model():
+    from jev_ultrafast.questions import NEXT_ACTION
+
+    assert "TYPE the date" in NEXT_ACTION and "press Enter" in NEXT_ACTION
+
+
+def _judgment(complete=True, missing="", satisfied=(), facts=()):
+    return (
+        {"satisfied": list(satisfied), "facts": list(facts), "complete": complete, "missing": missing},
+        {"model": "t", "latency_ms": 1, "usage": {}},
+    )
+
+
+def test_subgoals_activate_on_second_host(runner, monkeypatch):
+    calls = []
+    runner.state["history"] = [
+        {"action": "a", "url": "https://one.test/"},
+        {"action": "b", "url": "https://two.test/"},
+    ]
+    monkeypatch.setattr(loop, "decompose_goal", lambda goal: calls.append(goal) or ["one", "two"])
+    monkeypatch.setattr(loop, "judge_progress", lambda context, system: _judgment())
+    monkeypatch.setattr(loop, "choose", lambda *_args, **_kwargs: decision("e3"))
+    runner.command("predict", {})
+    assert [item["text"] for item in runner.state["subgoals"]] == ["one", "two"]
+    assert runner.state["judged_url"] == "https://example.test/"
+    assert calls == ["Find a book"]
+
+
+def test_subgoals_skip_simple_runs(runner, monkeypatch):
+    def boom(goal):
+        raise AssertionError("must not decompose a simple run")
+
+    monkeypatch.setattr(loop, "decompose_goal", boom)
+    monkeypatch.setattr(loop, "choose", lambda *_args, **kwargs: decision("e3"))
+    runner.command("predict", {})
+    assert runner.state.get("subgoals") is None
+
+
+def test_apply_judgment_folds_evidence_and_memo():
+    from jev_ultrafast.agent import apply_judgment
+
+    state = {
+        "subgoals": [{"id": 0, "text": "population"}, {"id": 1, "text": "temperature"}],
+        "memo": [{"fact": "old", "source": "u"}],
+    }
+    judgment = {
+        "satisfied": [{"id": 0, "value": "8.9M"}, {"id": 9, "value": "bogus"}],
+        "facts": ["Bangkok is hot", "Bangkok is hot", ""],
+    }
+    apply_judgment(state, judgment, "https://example.test/w")
+    assert state["subgoals"][0]["value"] == "8.9M"
+    assert state["subgoals"][0]["source"] == "https://example.test/w"
+    assert "satisfied" not in state["subgoals"][1]
+    assert [item["fact"] for item in state["memo"]] == ["old", "Bangkok is hot"]
+
+
+def test_done_gate_rejects_twice_then_partial_accepts(runner, monkeypatch):
+    monkeypatch.setattr(
+        loop, "judge_progress", lambda context, system: _judgment(False, missing="the temperature")
+    )
+    monkeypatch.setattr(loop, "field_text", lambda context, system=None: ("answer", {"model": "t"}))
+    for _ in range(2):
+        runner.state["decision"] = decision("DONE")
+        runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+        assert runner.state["status"] == "ready"
+    assert runner.state["done_rejections"] == 2
+    assert any("temperature" in note["text"] for note in runner.state["event_notes"])
+    runner.state["decision"] = decision("DONE")
+    runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    assert runner.state["status"] == "done"
+    assert runner.state["partial"] is True
+    assert runner.state["answer"] == "answer"
+
+
+def test_done_gate_accepts_complete(runner, monkeypatch):
+    monkeypatch.setattr(loop, "judge_progress", lambda context, system: _judgment(True))
+    monkeypatch.setattr(loop, "field_text", lambda context, system=None: ("answer", {"model": "t"}))
+    runner.state["decision"] = decision("DONE")
+    runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    assert runner.state["status"] == "done"
+    assert runner.state["partial"] is False
+
+
+def test_done_gate_trusts_subgoal_evidence_over_model(runner, monkeypatch):
+    runner.state["subgoals"] = [{"id": 0, "text": "all", "satisfied": True, "value": "v", "source": "u"}]
+    monkeypatch.setattr(loop, "judge_progress", lambda context, system: _judgment(False, missing="x"))
+    monkeypatch.setattr(loop, "field_text", lambda context, system=None: ("answer", {"model": "t"}))
+    runner.state["decision"] = decision("DONE")
+    runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    assert runner.state["status"] == "done"
+    assert runner.state["partial"] is False
+
+
+def test_parse_judge_rules():
+    from jev_ultrafast.model import parse_judge
+
+    def result(content):
+        return {"choices": [{"message": {"content": json.dumps(content)}}]}
+
+    good = parse_judge(result({"satisfied": [{"id": 1, "value": " 29C "}], "facts": [" hot "],
+                               "complete": True, "missing": ""}))
+    assert good == {"satisfied": [{"id": 1, "value": "29C"}], "facts": ["hot"], "complete": True, "missing": ""}
+    with pytest.raises(ValueError, match="invalid judgment"):
+        parse_judge(result({"satisfied": [], "facts": []}))
+    dropped = parse_judge(result({"satisfied": [{"id": "x", "value": ""}, {"id": 2}],
+                                  "facts": ["", 7], "complete": False, "missing": "y"}))
+    assert dropped["satisfied"] == [] and dropped["facts"] == []
+
+
+def test_judge_progress_uses_structured_schema(monkeypatch):
+    from jev_ultrafast import model as model_mod
+
+    seen = {}
+
+    def fake_field_text(context, system=None, **kwargs):
+        seen.update(kwargs)
+        return {}, {}
+
+    monkeypatch.setattr(model_mod, "field_text", fake_field_text)
+    model_mod.judge_progress({}, system="sys")
+    assert seen["schema"] == model_mod.JUDGE_SCHEMA
+    assert seen["name"] == "Progress"
+    assert seen["parse"] == model_mod.parse_judge
+    assert seen["label"] == "judgment"
+
+
+def test_guidance_reaches_typesafe_body():
+    elements, targets, _controls = model.action_space(page()["actions"])
+    operations = model.operation_catalog(targets, {})
+    body = model.typesafe_body(page(), "goal", [], elements, targets, operations, guidance=["stay left"])
+    assert body["state"]["recent_actions"][-1] == {
+        "action": "(guidance)", "kind": "guidance", "text": None, "page_changed": None, "note": "stay left",
+    }
+
+
+def test_winding_down_flags_at_75_percent(runner, monkeypatch):
+    runner.config = {"max_decisions": 4}
+    runner.state["decisions"] = [{}, {}, {}]
+    monkeypatch.setattr(loop, "choose", lambda *_args, **_kwargs: decision("e3"))
+    runner.command("predict", {})
+    assert runner.state["winding_down"] is True
+    assert runner.state["status"] == "predicted"
+
+
+def test_budget_stop_attaches_partial_answer(runner, monkeypatch):
+    runner.config = {"max_decisions": 2}
+    runner.state["decisions"] = [{}, {}]
+    runner.state["memo"] = [{"fact": "Mercury has 0 moons", "source": "https://example.test/"}]
+    seen = {}
+
+    def fake_field_text(context, system=None):
+        seen["ctx"] = context
+        return "partial answer", {"model": "t"}
+
+    monkeypatch.setattr(loop, "field_text", fake_field_text)
+    runner.command("predict", {})
+    assert runner.state["status"] == "blocked"
+    assert runner.state["blocked_reason"] == "decision budget"
+    assert runner.state["partial"] is True
+    assert runner.state["answer"] == "partial answer"
+    assert seen["ctx"]["partial"] is True
+    assert seen["ctx"]["facts"] == ["Mercury has 0 moons"]
+
+
+def test_goal_page_target_rules():
+    from jev_ultrafast.agent import goal_page_target
+
+    assert goal_page_target("On HN, go to the 3rd page of stories") == 3
+    assert goal_page_target("go to page 3 and report the author") == 3
+    assert goal_page_target("list the top 5 stories with points") is None
+    assert goal_page_target("report the price of the first 3 results") is None
+    assert goal_page_target("find the population of Bangkok") is None
+
+
+def test_current_page_number_rules():
+    from jev_ultrafast.agent import current_page_number
+
+    assert current_page_number("https://news.ycombinator.com/?p=3", "") == 3
+    assert current_page_number("https://quotes.toscrape.com/page/2/", "") == 2
+    assert current_page_number("https://example.test/", "Results Page 4 of 12") == 4
+    assert current_page_number("https://example.test/", "no marker here") is None
+
+
+def test_done_gate_rejects_wrong_page_without_judge(runner, monkeypatch):
+    def boom(context, system):
+        raise AssertionError("pagination needs no judge call")
+
+    monkeypatch.setattr(loop, "judge_progress", boom)
+    runner.state["page_target"] = 3
+    runner.state["page_current"] = 2
+    runner.state["decision"] = decision("DONE")
+    runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    assert runner.state["status"] == "ready"
+    assert any("page 3" in note["text"] for note in runner.state["event_notes"])
+
+
+def test_page_counter_guidance():
+    from jev_ultrafast.agent import compose_guidance
+
+    state = {"history": [], "page_target": 3, "page_current": 1}
+    assert compose_guidance(state) == ["On page 1 of 3: keep going to the next page."]
+    state["page_current"] = 3
+    assert compose_guidance(state) == []
