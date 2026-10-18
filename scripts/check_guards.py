@@ -106,7 +106,7 @@ def main():
         page = browser.observe(screenshot=False)
         actions = page["actions"]
         for role in ("checkbox", "radio"):
-            assert {a["kind"] for a in actions if a.get("role") == role} == {"click"}
+            assert {a["kind"] for a in actions if a.get("role") == role} == {"check"}
         assert {a["kind"] for a in actions if a["label"] == "Read only"} == {"click"}
         assert not any(a["label"] == "Disabled" or a.get("value") == "never expose this" for a in actions)
         assert [a["value"] for a in actions if a["kind"] == "select"] == ["Design"]
@@ -223,6 +223,52 @@ def main():
         browser.act(chosen, page)
         assert browser.evaluate("document.querySelector('#countries').value") == "42"
         passed.append("long select is one target and selects an observed value")
+
+        browser.call("Page.navigate", url="data:text/html," + quote((FIXTURES / "widgets.html").read_text()))
+        browser.wait_until_ready()
+        page = browser.observe(screenshot=False)
+        painted = next(a for a in page["actions"] if a.get("label") == "Painted popup")
+        browser.act(painted, page)
+        assert browser.evaluate("window.paintedClicks") == 1
+        passed.append("aria-hidden control that paints on top is indexed and clicked")
+        nav_link = next(a for a in page["actions"] if a.get("label") == "Menu link")
+        assert nav_link.get("nav") is True
+        passed.append("nav-region link is flagged")
+
+        opener = next(a for a in page["actions"] if a["label"] == "Open dialog")
+        browser.act(opener, page)
+        page = browser.observe(screenshot=False)
+        labels = [a["label"] for a in page["actions"]]
+        assert "Background" not in labels and "Painted popup" not in labels, labels
+        assert "Close" in labels, labels
+        passed.append("open modal scopes choices to its own controls")
+        nonstop = next(a for a in page["actions"] if a["label"] == "Set Nonstop only (Stops)")
+        assert nonstop["kind"] == "check" and nonstop.get("checked") == "false"
+        business = next(a for a in page["actions"] if a["label"] == "Set Business (Class)")
+        assert business.get("checked") == "false"
+        clear_any = next(a for a in page["actions"] if a["label"] == "Clear Any stops (Stops)")
+        assert clear_any.get("desired") is False
+        passed.append("transparent radios index with names, groups, states, and Clear")
+        day = next(a for a in page["actions"] if a["label"] == "13")
+        assert day.get("in_grid") is True
+        passed.append("calendar day indexes with its grid flag")
+
+        before = browser.evaluate("document.querySelectorAll('input[name=stops]:checked').length")
+        browser.act(nonstop, page)
+        after = browser.evaluate("document.querySelector(\"#r2\").checked")
+        assert (before, after) == (1, True)
+        passed.append("SET_CHECKED flips a transparent radio and verifies")
+        page = browser.observe(screenshot=False)
+        economy = next(a for a in page["actions"] if a["label"] == "Set Economy (Class)")
+        result = browser.act(economy, page)
+        assert result.get("already_set") is True
+        assert browser.evaluate("window.roleClicks || 0") == 0
+        passed.append("already-set checkable is a verified no-op")
+        page = browser.observe(screenshot=False)
+        day = next(a for a in page["actions"] if a["label"] == "13")
+        browser.act(day, page)
+        assert browser.evaluate("window.pickedDay") == "13"
+        passed.append("calendar day click selects the day")
     finally:
         browser.close()
     print("\n".join(passed))

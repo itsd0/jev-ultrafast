@@ -176,6 +176,18 @@
   const safe = e => !['password','hidden'].includes(e.type);
   const visible = e => !e.closest('[aria-hidden="true"],[inert]') &&
     e.checkVisibility({checkOpacity:true,checkVisibilityCSS:true});
+  const CHECKABLE = e => (e.tagName==='INPUT' && ['checkbox','radio'].includes(e.type)) ||
+    ['checkbox','radio','switch'].includes(e.getAttribute('role'));
+  // An aria-hidden element that still paints on top (a popup its site forgot to
+  // unhide) is usable: hit-testing, not the attribute, decides for actions.
+  // Native checkables are transparent by design; their opacity never disqualifies them.
+  const shown = (e, keepOpacity=true) => {
+    if (e.closest('[inert]')) return false;
+    if (!e.checkVisibility({checkVisibilityCSS:true})) return false;
+    if (!e.closest('[aria-hidden="true"]')) return !keepOpacity || e.checkVisibility({checkOpacity:true});
+    const raw=e.getBoundingClientRect();
+    return owns(e, resolveHit(e.ownerDocument||document, raw.x+raw.width/2, raw.y+raw.height/2));
+  };
   const name = (e,seen=new Set()) => {
     if (!e || seen.has(e)) return '';
     seen.add(e);
@@ -240,7 +252,8 @@
   const actions=[];
   const seenNodes=new Set();
   function consider(e, frameId, ox, oy) {
-    if (!safe(e) || !visible(e) || e.matches(':disabled') || e.closest('[aria-disabled="true"]')) return;
+    if (!safe(e) || e.matches(':disabled') || e.closest('[aria-disabled="true"]')) return;
+    if (!shown(e, !CHECKABLE(e))) return;
     const raw=e.getBoundingClientRect();
     const rect={x:raw.x+ox, y:raw.y+oy, w:raw.width, h:raw.height};
     const x=rect.x+rect.w/2, y=rect.y+rect.h/2, rname=role(e);
@@ -255,6 +268,14 @@
       if (value!==null) base[key]=value;
     }
     if (['checkbox','radio'].includes(e.type)) base.checked=String(e.checked);
+    if (['checkbox','radio','switch','option'].includes(rname)) {
+      const group=e.closest('fieldset,[role="radiogroup"],[role="group"],[role="listbox"],[role="menu"]');
+      const legend=group && group.tagName==='FIELDSET' ? group.querySelector('legend') : null;
+      const glabel=((legend && legend.innerText) || (group && group.getAttribute('aria-label')) || '').trim();
+      if (glabel) base.label=`${base.label} (${glabel.slice(0,40)})`;
+    }
+    if (e.closest('[role="grid"],[role="treegrid"]')) base.in_grid=true;
+    if (e.closest('nav,header,footer,[role="navigation"],[role="banner"],[role="contentinfo"]')) base.nav=true;
     if (e.tagName==='INPUT' && e.type==='file') {
       actions.push({...base, kind:'upload', value:''});
       return;
@@ -269,6 +290,10 @@
         for (const o of enabled) if (!o.selected)
           actions.push({...base,kind:'select',value:o.value,current_value:current,label:base.label+' → '+o.label});
       }
+    } else if (['checkbox','radio','switch'].includes(rname)) {
+      actions.push({...base, kind:'check', desired:true, value:'', label:'Set '+base.label});
+      if (base.checked==='true')
+        actions.push({...base, kind:'check', desired:false, value:'', label:'Clear '+base.label});
     } else {
       const editable=!e.readOnly && e.getAttribute('aria-readonly')!=='true' &&
         (['textbox','searchbox','spinbutton'].includes(rname) ||
@@ -282,7 +307,7 @@
   function collectClosed(doc, frameId, ox, oy) {
     if (!cfg().shadow) return;
     for (const e of queryAllDeep(doc, '*')) {
-      if (!possibleClosedShadow(e) || !visible(e) || e.matches(':disabled') || e.querySelector(selector)) continue;
+      if (!possibleClosedShadow(e) || !shown(e) || e.matches(':disabled') || e.querySelector(selector)) continue;
       const label=(name(e)||'').trim();
       if (!label || label.length>80) continue;
       const raw=e.getBoundingClientRect();
@@ -311,6 +336,31 @@
     for (const e of queryAllDeep(entry.doc, selector)) consider(e, entry.id, entry.rect.x, entry.rect.y);
     collectClosed(entry.doc, entry.id, entry.rect.x, entry.rect.y);
   }
+  // A genuinely open overlay sorts first; a true modal scopes choices to itself.
+  // Background stays available for non-modal popups (the field behind autocomplete).
+  let modal=null;
+  for (const d of queryAllDeep(document, 'dialog,[role="dialog"],[role="alertdialog"]')) {
+    if (d.closest('[inert]')) continue;
+    const r=d.getBoundingClientRect();
+    if (r.width<=0 || r.height<=0) continue;
+    const x=r.x+r.width/2, y=r.y+r.height/2;
+    if (x<0 || y<0 || x>=innerWidth || y>=innerHeight) continue;
+    if (d.closest('[aria-hidden="true"]') && !owns(d, resolveHit(document,x,y))) continue;
+    modal=d;
+  }
+  if (modal) {
+    const scoped=modal.tagName==='DIALOG' ? !!modal.open : modal.getAttribute('aria-modal')==='true';
+    const sameDoc=action=>!action.frame || action.frame===rootFrame;
+    const inside=action=>{
+      const n=cache.nodes.get(action.node);
+      return n && (n===modal || modal.contains(n));
+    };
+    const first=[], rest=[];
+    for (const action of actions) ((action.kind==='scroll'||action.kind==='wait'||!sameDoc(action)||inside(action)) ? first : rest).push(action);
+    actions.length=0;
+    actions.push(...first);
+    if (!scoped) actions.push(...rest);
+  }
   const words=[]; let length=0;
   function addText(scope, ox, oy) {
     if (!scope || length>=6000) return;
@@ -322,7 +372,7 @@
     let node;
     while ((node=walker.nextNode()) && length<6000) {
       const value=node.textContent.trim(), parent=node.parentElement;
-      if (!value || !parent || parent.closest('script,style,noscript,template') || !visible(parent)) continue;
+      if (!value || !parent || parent.closest('script,style,noscript,template') || !shown(parent)) continue;
       range.selectNodeContents(node); const raw=range.getBoundingClientRect();
       const top=raw.top+oy, bottom=raw.bottom+oy, left=raw.left+ox, right=raw.right+ox;
       if (raw.width>0 && raw.height>0 && bottom>0 && top<innerHeight && right>0 && left<innerWidth) {

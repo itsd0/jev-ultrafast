@@ -1,0 +1,59 @@
+<!doctype html>
+<title>Widget checks</title>
+<style>
+  body{margin:20px;font-family:sans-serif}
+  #app button{margin:4px;padding:8px 16px}
+  dialog{border:1px solid #888;padding:16px}
+  .native{opacity:0;width:40px;height:40px;position:absolute}
+  .day{width:44px;height:44px;border:1px solid #bbb;display:inline-block;text-align:center;line-height:44px}
+  nav a{margin-right:12px}
+</style>
+<nav aria-label="Site"><a href="/menu">Menu link</a></nav>
+<div id="app">
+  <button id="background" onclick="window.bgClicks=(window.bgClicks||0)+1">Background</button>
+  <button id="opener">Open dialog</button>
+</div>
+<dialog id="dlg" aria-label="Filters">
+  <fieldset>
+    <legend>Stops</legend>
+    <label><input class="native" id="r1" type="radio" name="stops" value="any" checked>Any stops</label>
+    <label><input class="native" id="r2" type="radio" name="stops" value="nonstop">Nonstop only</label>
+  </fieldset>
+  <div role="radiogroup" aria-label="Class">
+    <div role="radio" id="c1" aria-checked="true" tabindex="0">Economy</div>
+    <div role="radio" id="c2" aria-checked="false" tabindex="0">Business</div>
+  </div>
+  <div role="grid" aria-label="Calendar">
+    <div role="row">
+      <div role="gridcell"><div role="button" id="d1" tabindex="0">12</div></div>
+      <div role="gridcell"><div role="button" id="d2" tabindex="0">13</div></div>
+    </div>
+  </div>
+  <button id="closer">Close</button>
+</dialog>
+<div aria-hidden="true">
+  <button id="painted" onclick="window.paintedClicks=(window.paintedClicks||0)+1">Painted popup</button>
+</div>
+<script>
+  const dlg = document.querySelector('#dlg');
+  document.querySelector('#opener').onclick = () => dlg.showModal();
+  document.querySelector('#closer').onclick = () => dlg.close();
+  for (const day of document.querySelectorAll('[role="button"]')) {
+    if (!day.id.startsWith('d')) continue;
+    day.onclick = () => {
+      document.querySelectorAll('[role="button"]').forEach(d => d.setAttribute('aria-selected', 'false'));
+      day.setAttribute('aria-selected', 'true');
+      window.pickedDay = day.textContent;
+    };
+  }
+  for (const radio of document.querySelectorAll('[role="radio"]')) {
+    radio.onclick = () => {
+      window.roleClicks = (window.roleClicks || 0) + 1;
+      document.querySelectorAll('[role="radio"]').forEach(r => r.setAttribute('aria-checked', 'false'));
+      radio.setAttribute('aria-checked', 'true');
+    };
+    radio.onkeydown = event => {
+      if (event.key === ' ') { event.preventDefault(); radio.click(); }
+    };
+  }
+</script>

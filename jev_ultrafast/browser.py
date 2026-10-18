@@ -403,6 +403,11 @@ class Browser:
         self.after_input = None
         return {"executed": "navigate", "url": target}
 
+    def go_back(self):
+        """One step back in session history. A no-op with no history behind."""
+        self.evaluate("history.back()")
+        self.after_input = None
+
     def act(self, action, page, text=None):
         cloud_mode = (getattr(self, "config", None) or {}).get("browser") == "cloud"
         probe = None
@@ -656,6 +661,78 @@ def dispatch_char(call, character):
     # Text goes on keyDown only. A char event with the same text inserts a second copy.
     call("Input.dispatchKeyEvent", type="keyDown", key=character, text=character, code="")
     call("Input.dispatchKeyEvent", type="keyUp", key=character, code="")
+
+
+_CHECK_RESOLVE = """(action => {
+  const fast=window.__jevFast;
+  const e=fast?.resolve ? fast.resolve(action) : fast?.nodes.get(action.node);
+  if (!e?.isConnected || e.matches(':disabled') || e.closest('[aria-disabled="true"],[inert]') ||
+      !e.checkVisibility({checkVisibilityCSS:true})) return null;
+  const r=e.getBoundingClientRect();
+  if (!r.width || !r.height) return null;
+  const x=r.x+r.width/2, y=r.y+r.height/2;
+  if (x<0 || y<0 || x>=innerWidth || y>=innerHeight) return null;
+  const native=(e.tagName==='INPUT' && ['checkbox','radio'].includes(e.type)) ? e.checked : null;
+  const aria=e.getAttribute('aria-checked');
+  const checked=native!==null ? native : (aria==='true' ? true : aria==='false' ? false : null);
+  const lab=(e.labels && e.labels[0]) || e.closest('label');
+  let lx=null, ly=null;
+  if (lab && lab!==e) {
+    const q=lab.getBoundingClientRect();
+    if (q.width && q.height && q.x+q.width/2>=0 && q.y+q.height/2>=0 &&
+        q.x+q.width/2<innerWidth && q.y+q.height/2<innerHeight) { lx=q.x+q.width/2; ly=q.y+q.height/2; }
+  }
+  return {x, y, lx, ly, checked};
+})"""
+
+_CHECK_FOCUS = """(action => {
+  const fast=window.__jevFast;
+  const e=fast?.resolve ? fast.resolve(action) : fast?.nodes.get(action.node);
+  if (!e?.isConnected) return false;
+  e.focus();
+  return document.activeElement===e;
+})"""
+
+
+def act_check(call, evaluate, action):
+    """Set a checkbox/radio/switch to its desired state, verifying after each strategy.
+
+    Transparent native inputs and painted overlays are expected here, so there
+    is no coverage gate: the flipped state is the proof. Each strategy runs once:
+    input center, label center, then focus plus Space.
+    """
+    if type(action.get("node")) is not int:
+        raise ValueError("Invalid observed node")
+    locator = json.dumps({k: action[k] for k in ("node", "frame", "kind") if k in action})
+    desired = bool(action.get("desired", True))
+
+    def read():
+        return evaluate(_CHECK_RESOLVE + "(" + locator + ")")
+
+    state = read()
+    if state is None:
+        raise StalePage("Target changed. Observe again.")
+    if state.get("checked") is not None and bool(state["checked"]) == desired:
+        return {"executed": action["id"], "already_set": True, "checked": state["checked"]}
+    points = [(state["x"], state["y"])]
+    if state.get("lx") is not None and (state["lx"], state["ly"]) != (state["x"], state["y"]):
+        points.append((state["lx"], state["ly"]))
+    for x, y in points:
+        for event in ("mousePressed", "mouseReleased"):
+            call("Input.dispatchMouseEvent", type=event, x=x, y=y, button="left", clickCount=1)
+        state = read()
+        if state is None:
+            raise StalePage("Target changed after input. Observe again.")
+        if state.get("checked") == desired:
+            return {"executed": action["id"], "verified": True, "checked": state["checked"]}
+    if evaluate(_CHECK_FOCUS + "(" + locator + ")"):
+        dispatch_key(call, "Space")
+        state = read()
+        if state is None:
+            raise StalePage("Target changed after input. Observe again.")
+        if state.get("checked") == desired:
+            return {"executed": action["id"], "verified": True, "checked": state["checked"]}
+    return {"executed": action["id"], "verified": False, "checked": state.get("checked")}
 
 
 def bind_keys(state, enabled):
@@ -1014,6 +1091,8 @@ def browser_operation(request):
                     pass
         elif kind == "key":
             dispatch_key(call, action.get("key"))
+        elif kind == "check":
+            return act_check(call, evaluate, action)
         elif kind != "wait":
             if type(action["node"]) is not int:
                 raise ValueError("Invalid observed node")
