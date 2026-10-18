@@ -690,7 +690,10 @@ class Browser:
         return tab
 
     def new_tab(self):
-        """Open a blank tab and switch to it. The five-tab cap still holds."""
+        """Switch to an idle blank tab, else open one. The five-tab cap still holds."""
+        for key, tab in self.tabs.items():
+            if key != self.active and (tab.get("url") or "") == "about:blank":
+                return self.activate(key)
         if len(self.tabs) >= 5:
             raise StalePage("Tab limit reached. Close one first.")
         params = {"url": "about:blank", "background": True, "newWindow": False}

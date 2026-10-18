@@ -969,6 +969,18 @@ def search_fallback(todo, engines, state, goal=""):
     return None
 
 
+_GOAL_NEW_TAB_RE = re.compile(
+    r"\b(new tab|another tab|separate tab|other tab|second tab|"
+    r"keep (this|the|that) (page|tab|site) open|side by side)\b",
+    re.IGNORECASE,
+)
+
+
+def goal_wants_new_tab(goal):
+    """True when the goal asks for a new tab in general wording. No site rules."""
+    return bool(_GOAL_NEW_TAB_RE.search(goal or ""))
+
+
 def suppression_reasons(state, page):
     """Suppressed noop_key -> reason. Forced-NAVIGATE keeps only navigate;
     otherwise zero-signal nav links and tried detours are hidden while choices remain."""
@@ -978,6 +990,10 @@ def suppression_reasons(state, page):
         for action in actions:
             if action.get("kind") == "save_file":
                 drop[noop_key(action)] = "nothing collected yet"
+    if not goal_wants_new_tab(state.get("goal")):
+        for action in actions:
+            if action.get("kind") == "new_tab":
+                drop[noop_key(action)] = "goal needs no new tab"
     if state.get("force_navigate"):
         return {**drop, **{noop_key(a): "forced NAVIGATE" for a in actions if a.get("kind") != "navigate"}}
     if state.get("subgoals") is None or state.get("page_target"):

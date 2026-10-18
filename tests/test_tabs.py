@@ -215,3 +215,97 @@ def test_tabs_default_on(monkeypatch):
     monkeypatch.setenv("JEV_TABS", "0")
     assert resolve_config()["tabs"] is False
     assert resolve_config(tabs=True)["tabs"] is True
+
+
+def test_new_tab_reuses_idle_blank(monkeypatch):
+    import jev_ultrafast.browser as browser_module
+
+    calls = []
+    monkeypatch.setattr(browser_module, "cdp", lambda method, **kw: calls.append(method) or {})
+    browser = _tab_browser()
+    browser._register_tab("cdp-1", "s1", "https://example.test/a")
+    browser._register_tab("cdp-2", "s2", "about:blank")
+    browser.active = "t1"
+    browser.session = "s1"
+    browser.target = "cdp-1"
+    browser.new_tab()
+    assert browser.active == "t2"
+    assert browser.session == "s2"
+    assert calls == []
+
+
+def test_new_tab_opens_when_no_blank(monkeypatch):
+    import jev_ultrafast.browser as browser_module
+
+    calls = []
+
+    def fake_cdp(method, **params):
+        calls.append(method)
+        if method == "Target.createTarget":
+            return {"targetId": "cdp-new"}
+        if method == "Target.attachToTarget":
+            return {"sessionId": "s-new"}
+        return {}
+
+    monkeypatch.setattr(browser_module, "cdp", fake_cdp)
+    browser = _tab_browser()
+    browser._register_tab("cdp-1", "s1", "https://example.test/a")
+    browser.active = "t1"
+    browser.session = "s1"
+    browser.target = "cdp-1"
+    browser.new_tab()
+    assert browser.active == "t2"
+    assert browser.tabs["t2"]["url"] == "about:blank"
+    assert "Target.createTarget" in calls
+
+
+def test_new_tab_skips_the_active_blank(monkeypatch):
+    import jev_ultrafast.browser as browser_module
+
+    def fake_cdp(method, **params):
+        if method == "Target.createTarget":
+            return {"targetId": "cdp-new"}
+        if method == "Target.attachToTarget":
+            return {"sessionId": "s-new"}
+        return {}
+
+    monkeypatch.setattr(browser_module, "cdp", fake_cdp)
+    browser = _tab_browser()
+    browser._register_tab("cdp-1", "s1", "about:blank")
+    browser.active = "t1"
+    browser.session = "s1"
+    browser.target = "cdp-1"
+    browser.new_tab()
+    assert browser.active == "t2"
+
+
+def _tab_gate_page():
+    return {
+        "url": "https://example.test/",
+        "actions": [
+            {"id": "new_tab", "kind": "new_tab", "label": "Open a new tab"},
+            {"id": "e1", "kind": "click", "node": 1, "label": "Go"},
+        ],
+    }
+
+
+def test_new_tab_gate_suppresses_without_goal_words():
+    from jev_ultrafast.agent import goal_wants_new_tab, noop_key, suppression_reasons
+
+    assert not goal_wants_new_tab("open x.com")
+    assert not goal_wants_new_tab("find the population of Bangkok on Wikipedia")
+    reasons = suppression_reasons({"goal": "open x.com"}, _tab_gate_page())
+    key = noop_key({"kind": "new_tab", "label": "Open a new tab"})
+    assert reasons[key] == "goal needs no new tab"
+
+
+def test_new_tab_gate_keeps_for_tab_goals():
+    from jev_ultrafast.agent import goal_wants_new_tab, noop_key, suppression_reasons
+
+    assert goal_wants_new_tab("now open the weather for Bangkok in a new tab")
+    assert goal_wants_new_tab("keep this page open and compare prices")
+    reasons = suppression_reasons(
+        {"goal": "now open the weather for Bangkok in a new tab"}, _tab_gate_page()
+    )
+    key = noop_key({"kind": "new_tab", "label": "Open a new tab"})
+    assert key not in reasons
