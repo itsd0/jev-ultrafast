@@ -482,6 +482,8 @@ class BeamAgent:
             "agent_memory": memories,
             "compacted_verified": self.transcript.summary[-2000:],
             "final_page_text": self._page_text(page)[:8000],
+            # Tab state lets the judge verify "in a new tab" style goals.
+            "open_tabs": format_tabs(self._tabs(state)),
         }
 
     def _run_judge(self, state, page, text, step_no):
@@ -1047,7 +1049,7 @@ class BeamAgent:
             return {"ok": False, "operation": "TYPE_TEXT", "kind": "fill",
                     "label": f"Typed into '{_clean(label, 80)}'",
                     "target": self._target_desc(element), "note": error}
-        result = state["browser"].act({**element, "value": value}, page)
+        result = state["browser"].act(element, page, text=value)
         verified = not isinstance(result, dict) or result.get("text_verified", True) is not False
         self.trace.emit("verify", step=len(state.get("history") or []) + 1,
                         control=_clean(label, 80), verified=bool(verified))

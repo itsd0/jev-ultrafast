@@ -60,8 +60,13 @@ class FakeBrowser:
         self.calls.append(("observe", self.href))
         return dict(self.page)
 
-    def act(self, action, page, **extra):
+    def act(self, action, page, text=None, **extra):
         self.calls.append(("act", action.get("id"), action.get("kind")))
+        if action.get("kind") == "fill":
+            # Mirror the real contract: the typed value arrives as text=,
+            # and the executor fails on anything but a string.
+            assert isinstance(text, str), f"fill got text={text!r}"
+            self.calls.append(("fill_text", text))
         return {"executed": action.get("id"), "text_verified": True}
 
     def navigate(self, url):
@@ -319,9 +324,9 @@ def test_secret_placeholder_substitutes_only_on_allowed_host(monkeypatch, tmp_pa
     seen = {}
     real_act = browser.act
 
-    def capture(action, observed, **extra):
-        seen["value"] = action.get("value")
-        return real_act(action, observed, **extra)
+    def capture(action, observed, text=None, **extra):
+        seen["value"] = text
+        return real_act(action, observed, text=text, **extra)
 
     browser.act = capture
     agent.command("tick")
@@ -473,6 +478,15 @@ def test_judge_context_includes_final_page_text():
     context = agent._judge_context(agent.state, page, "10,722,000 residents")
     assert "10,722,000" in context["final_page_text"]
     assert context["claimed_answer"] == "10,722,000 residents"
+
+
+def test_judge_context_includes_open_tabs():
+    page = _page([])
+    agent, browser = _agent(page, [])
+    browser.tabs["t2"] = {"url": "https://duckduckgo.com/?q=Bangkok+weather", "title": "weather"}
+    context = agent._judge_context(agent.state, page, "opened weather in a new tab")
+    assert "weather" in context["open_tabs"]
+    assert "Example" in context["open_tabs"]
 
 
 def test_executor_exception_records_failed_step_without_crashing():
