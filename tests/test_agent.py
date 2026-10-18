@@ -788,23 +788,58 @@ def test_blocked_stops_after_three_retries(runner):
     runner.state["browser"].settled.assert_not_called()
 
 
-def test_closed_shadow_strike_explains_blocked(runner):
+def test_closed_shadow_strike_holds_before_blocking(runner):
     action = next(item for item in runner.state["page"]["actions"] if item["id"] == "e3")
     action["possible_closed_shadow"] = True
     for _ in range(3):
         runner.state["decision"] = {**decision("e3"), "operation": "CLICK"}
         runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    assert runner.state["status"] == "ready"  # other controls remain
+    key = loop.noop_key(action)
+    assert runner.state["held_actions"][key] == loop.STALL_HOLD_STEPS
+    assert runner.state["hold_reasons"][key] == "stall"
+    assert any("held" in note["text"] for note in runner.state["event_notes"])
+    assert runner.state["history"][-1]["possible_closed_shadow"] is True
+
+
+def test_legacy_stall_blocks_only_when_nothing_unheld_remains(runner):
+    others = [
+        loop.noop_key(item)
+        for item in runner.state["page"]["actions"]
+        if item["id"] in {"e1", "e2"}
+    ]
+    runner.state["held_actions"] = loop.hold_actions({}, others, loop.STALL_HOLD_STEPS)
+    for _ in range(3):
+        runner.state["decision"] = {**decision("e3"), "operation": "CLICK"}
+        runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    assert runner.state["status"] == "blocked"
+    assert runner.state["blocked_reason"] == "stall"
+
+
+def test_legacy_stall_keeps_the_shadow_reason_when_exhausted(runner):
+    action = next(item for item in runner.state["page"]["actions"] if item["id"] == "e3")
+    action["possible_closed_shadow"] = True
+    others = [
+        loop.noop_key(item)
+        for item in runner.state["page"]["actions"]
+        if item["id"] in {"e1", "e2"}
+    ]
+    runner.state["held_actions"] = loop.hold_actions({}, others, loop.STALL_HOLD_STEPS)
+    for _ in range(3):
+        runner.state["decision"] = {**decision("e3"), "operation": "CLICK"}
+        runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
     assert runner.state["status"] == "blocked"
     assert runner.state["blocked_reason"] == "possible closed shadow root"
-    assert runner.state["history"][-1]["possible_closed_shadow"] is True
 
 
 def test_no_progress_stop_has_no_shadow_reason(runner):
     for _ in range(3):
         runner.state["decision"] = {**decision("e3"), "operation": "CLICK"}
         runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
-    assert runner.state["status"] == "blocked"
+    assert runner.state["status"] == "ready"  # other controls remain
     assert "blocked_reason" not in runner.state
+    key = loop.noop_key({"kind": "click", "label": "Go", "role": "button"})
+    assert runner.state["held_actions"][key] == loop.STALL_HOLD_STEPS
 
 
 def test_new_tab_is_recorded_on_the_action(runner):

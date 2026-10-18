@@ -2039,15 +2039,18 @@ class Agent:
             stalled = len(repeated) == 3 and all(
                 h["page_changed"] is False and h["kind"] != "wait" for h in repeated
             )
-            state["status"] = "blocked" if stalled else "ready"
             if stalled:
-                if any(h.get("possible_closed_shadow") for h in repeated):
-                    state["blocked_reason"] = "possible closed shadow root"
+                shadow = any(h.get("possible_closed_shadow") for h in repeated)
+                exhausted = self._legacy_stall_hold(state, repeated)
                 self.trace.emit(
                     "guard", step=len(state["history"]), type="stall",
                     evidence=[h.get("action") for h in repeated],
+                    exhausted=exhausted,
                 )
-                return self._terminal(state, state.get("blocked_reason"), len(state["history"]))
+                if exhausted:
+                    reason = "possible closed shadow root" if shadow else "stall"
+                    return self._terminal(state, reason, len(state["history"]))
+            state["status"] = "ready"
         else:
             raise ValueError("Unknown command")
         return self.snapshot()
@@ -2208,6 +2211,42 @@ class Agent:
         self.trace.emit(
             "guard", step=step, type="stall", key=stall["key"], label=stall["label"],
             evidence=f"same control {STALL_REPEATS}x with no progress; {advice}"[:200],
+        )
+
+    def _legacy_stall_hold(self, state, repeated):
+        """Three unchanged steps: hold the repeated controls and note it.
+
+        The page is unchanged, so the controls are still there: match them by
+        kind and label and hold by noop_key. Returns True when no unheld,
+        non-wait action remains and the run must stop.
+        """
+        live = (state.get("page") or {}).get("actions") or []
+        keys = []
+        for entry in repeated:
+            match = next(
+                (
+                    action
+                    for action in live
+                    if action.get("kind") == entry.get("kind")
+                    and norm_label(action.get("label")) == norm_label(entry.get("action"))
+                ),
+                None,
+            )
+            if match is not None:
+                key = noop_key(match)
+                if key not in keys:
+                    keys.append(key)
+        if keys:
+            reasons = dict(state.get("hold_reasons") or {})
+            state["held_actions"] = hold_actions(
+                state.get("held_actions"), keys, STALL_HOLD_STEPS, reasons, "stall"
+            )
+            state["hold_reasons"] = reasons
+            names = "; ".join(sorted({entry.get("action") or "?" for entry in repeated}))
+            add_event_note(state, f"No page change in 3 steps; '{names}' held, try another control.")
+        held = state.get("held_actions") or {}
+        return not any(
+            action.get("kind") != "wait" and noop_key(action) not in held for action in live
         )
 
     def _stall_advice(self, state, stall):

@@ -92,10 +92,17 @@ def test_blocked_streak_keeps_the_memo(runner, memo_answer):
 
 def test_stall_keeps_the_memo(runner, memo_answer):
     runner.state["memo"] = [{"fact": FACT}]
+    others = [
+        loop.noop_key(item)
+        for item in runner.state["page"]["actions"]
+        if item["id"] in {"e1", "e2"}
+    ]
+    runner.state["held_actions"] = loop.hold_actions({}, others, loop.STALL_HOLD_STEPS)
     for _ in range(3):
         runner.state["decision"] = {**decision("e3"), "operation": "CLICK"}
         runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
     assert runner.state["status"] == "blocked"
+    assert runner.state["blocked_reason"] == "stall"
     assert runner.state["answer"] == ANSWER
     assert runner.state["partial"] is True
     assert memo_answer["facts"] == [FACT]
