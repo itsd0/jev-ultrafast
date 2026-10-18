@@ -682,7 +682,13 @@ def control_unchanged(action, before, after):
     if not label:
         return None
     match = next(
-        (item for item in (after.get("actions") or []) if item.get("kind") == "click" and item.get("label") == label),
+        (
+            item
+            for item in (after.get("actions") or [])
+            if item.get("kind") == "click"
+            and item.get("label") == label
+            and (item.get("role") or None) == (action.get("role") or None)
+        ),
         None,
     )
     if match is None:
@@ -728,11 +734,19 @@ def pending_locator(page, choice):
     }
 
 
+def _labels_similar(first, second):
+    """Renamed-control similarity: one normalized label contains the other."""
+    left, right = norm_label(first), norm_label(second)
+    return bool(left) and bool(right) and (left in right or right in left)
+
+
 def retarget_action(page, locator):
     """Re-resolve a stale target in a fresh page by kind+role+label+frame.
 
     Returns (action, candidate_count). Only a unique match retargets; zero or
     several candidates mean the page genuinely changed, so the run re-decides.
+    A renamed control retargets by the same kind+role+frame when its label is
+    similar and unique; cross-role lookalikes never unify.
     """
     if not locator:
         return None, 0
@@ -747,7 +761,19 @@ def retarget_action(page, locator):
     ]
     if len(matches) == 1:
         return matches[0], 1
-    return None, len(matches)
+    if matches:
+        return None, len(matches)
+    similar = [
+        action
+        for action in (page.get("actions") or [])
+        if action.get("kind") == locator.get("kind")
+        and (action.get("role") or None) == (locator.get("role") or None)
+        and _labels_similar(action.get("label"), locator.get("label"))
+        and (action.get("frame") or "f0") == (locator.get("frame") or "f0")
+    ]
+    if len(similar) == 1:
+        return similar[0], 1
+    return None, len(similar)
 
 
 def page_entity_match(page, todo):
@@ -1289,7 +1315,9 @@ class Agent:
             (
                 item
                 for item in (after_page.get("actions") or [])
-                if item.get("label") == label and item.get("kind") == action.get("kind")
+                if item.get("label") == label
+                and item.get("kind") == action.get("kind")
+                and (item.get("role") or None) == (action.get("role") or None)
             ),
             None,
         )

@@ -226,6 +226,7 @@
       e.getAttribute('title') || svgTitle(e) || e.getAttribute('placeholder') ||
       describedBy(e,doc) || hrefTail(e) || '';
   };
+  // @test-export-start: role-mapping
   const roles=['button','link','checkbox','radio','switch','tab','menuitem','menuitemradio',
     'option','gridcell','combobox','textbox','searchbox','spinbutton'];
   const selector='a[href],button,input,textarea,select,summary,[contenteditable="true"],'+
@@ -247,6 +248,7 @@
     }
     return null;
   };
+  // @test-export-end: role-mapping
   function documentKey(doc) {
     const win = doc.defaultView || window;
     return [win.performance.timeOrigin, doc.location.href];

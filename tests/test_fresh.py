@@ -108,6 +108,35 @@ def test_retarget_rejects_ambiguous_missing_and_cross_frame():
     assert loop.retarget_action({"actions": [twin]}, None) == (None, 0)
 
 
+def test_retarget_renamed_control_picks_the_same_role_first():
+    locator = {"kind": "fill", "role": "searchbox", "label": "Search", "frame": "f0"}
+    renamed = {"id": "e9", "kind": "fill", "role": "searchbox", "label": "Search products",
+               "node": 30, "frame": "f0"}
+    match, count = loop.retarget_action({"actions": [renamed]}, locator)
+    assert (match["id"], count) == ("e9", 1)
+    other_role = {"id": "e2", "kind": "fill", "role": "textbox", "label": "Search the shop",
+                  "node": 31, "frame": "f0"}
+    assert loop.retarget_action({"actions": [other_role]}, locator) == (None, 0)
+    assert loop.retarget_action({"actions": [renamed, other_role]}, locator)[0]["id"] == "e9"
+    second = {"id": "e3", "kind": "fill", "role": "searchbox", "label": "Search brands",
+              "node": 32, "frame": "f0"}
+    assert loop.retarget_action({"actions": [renamed, second]}, locator) == (None, 2)
+
+
+def test_post_act_matching_unifies_only_same_role_twins():
+    action = {"id": "e1", "kind": "fill", "role": "searchbox", "label": "Search", "value": "x"}
+    before = {"fingerprint": "fp1", "actions": [action]}
+    other_role = {"id": "e2", "kind": "fill", "role": "textbox", "label": "Search", "value": ""}
+    same_role = {"id": "e3", "kind": "fill", "role": "searchbox", "label": "Search", "value": "x"}
+    after = {"fingerprint": "fp2", "actions": [other_role, same_role]}
+    info = loop.Agent._verify_info(action, before, after, {"text_verified": True})
+    assert info["after"]["value"] == "x"  # matched the searchbox, not the first label twin
+    click = {"id": "c1", "kind": "click", "role": "button", "label": "Search", "value": "x"}
+    wrong = {"id": "c2", "kind": "click", "role": "textbox", "label": "Search", "value": "x"}
+    right = {"id": "c3", "kind": "click", "role": "button", "label": "Search", "value": "y"}
+    assert loop.control_unchanged(click, before, {"actions": [wrong, right]}) is None
+
+
 def test_pending_locator_skips_terminal_and_coordinate_choices():
     assert loop.pending_locator(page(), "DONE") is None
     assert loop.pending_locator(page(), "BLOCKED") is None
