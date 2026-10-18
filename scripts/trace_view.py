@@ -79,9 +79,11 @@ def one_line(event):
             f" {item.get('duration_ms')}ms cdp={item.get('cdp_calls')}/{item.get('cdp_ms')}ms"
         )
     if kind == "verify":
+        commit = item.get("commit") or {}
         return (
             f"{head} verify {item.get('kind')} {'ok' if item.get('success') else 'FAIL'}"
             f" {item.get('before')} -> {item.get('after')}"
+            + (f" commit={commit.get('strategy')}/{commit.get('picked')}" if commit else "")
             + (f" next: {item.get('next_strategy')}" if item.get("next_strategy") else "")
         )
     if kind == "guard":

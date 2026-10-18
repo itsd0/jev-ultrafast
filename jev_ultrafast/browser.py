@@ -3,6 +3,7 @@
 import hashlib
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -855,6 +856,152 @@ def _verify_value(call, evaluate, action, expected, previous, actual, fallback):
     return {"text_verified": actual == expected, "typed": actual}
 
 
+def match_combobox_option(typed, options):
+    """Best listbox option for typed text: exact, prefix, all-tokens, any-token.
+
+    Ties go to the first option. Empty labels never match, and a list with no
+    match returns None: committing a wrong value is worse than no commit.
+    """
+    words = {word for word in re.findall(r"[a-z0-9]+", (typed or "").lower()) if len(word) > 1}
+    target = (typed or "").strip().lower()
+    best, best_score = None, 0
+    for option in options or []:
+        label = (option.get("label") or "").strip()
+        if not label:
+            continue
+        low = label.lower()
+        if target and low == target:
+            score = 3
+        elif target and low.startswith(target):
+            score = 2
+        elif words:
+            held = set(re.findall(r"[a-z0-9]+", low))
+            if words <= held:
+                score = 1
+            elif words & held:
+                score = 0.5
+            else:
+                continue
+        else:
+            continue
+        if score > best_score:
+            best, best_score = option, score
+    return best
+
+
+def combo_state_expression(action):
+    """One read: is this field a combobox, its expansion, and its value."""
+    locator = {k: action[k] for k in ("node", "frame") if k in action}
+    return (
+        "/*__jevComboState*/(action => { const fast=window.__jevFast; "
+        "const e=fast?.resolve ? fast.resolve(action) : fast?.nodes.get(action.node); "
+        "if (!e || !e.isConnected) return null; "
+        "const list=(e.getAttribute('aria-controls')||e.getAttribute('aria-owns')||'')"
+        ".split(/\\s+/).filter(Boolean); "
+        "return {combo: e.getAttribute('role')==='combobox' || !!e.getAttribute('aria-autocomplete')"
+        " || list.length>0, expanded: e.getAttribute('aria-expanded'), "
+        "value: ('value' in e) ? String(e.value) : (e.innerText||'')}; })(" + json.dumps(locator) + ")"
+    )
+
+
+def combo_options_expression():
+    """Visible listbox options with labels and centers. Capped at twelve."""
+    return (
+        "/*__jevComboOptions*/(() => { const out=[]; "
+        "for (const box of document.querySelectorAll('[role=\"listbox\"]')) { "
+        "const r=box.getBoundingClientRect(); if (!r.width || !r.height) continue; "
+        "for (const o of box.querySelectorAll('[role=\"option\"]')) { "
+        "const q=o.getBoundingClientRect(); "
+        "if (!q.width || !q.height || q.bottom<=0 || q.top>=innerHeight) continue; "
+        "const label=(o.innerText||'').trim().slice(0,80); if (!label) continue; "
+        "out.push({label, x:q.x+q.width/2, y:q.y+q.height/2}); if (out.length>=12) break; } } "
+        "return out; })()"
+    )
+
+
+def combo_focus_expression(action):
+    locator = {k: action[k] for k in ("node", "frame") if k in action}
+    return (
+        "/*__jevComboFocus*/(action => { const fast=window.__jevFast; "
+        "const e=fast?.resolve ? fast.resolve(action) : fast?.nodes.get(action.node); "
+        "if (!e || !e.isConnected) return false; e.focus(); return true; })(" + json.dumps(locator) + ")"
+    )
+
+
+def commit_combobox(call, evaluate, action, typed, previous=None):
+    """Commit a combobox value after typing. Plain fields return {}.
+
+    An uncommitted combobox reverts on blur, so typing alone is not done: wait
+    for the listbox and click the best-matching option, or press ArrowDown and
+    Enter when no listbox appears. Blur once to detect a revert, then retry a
+    single time with an explicit option click. Each stage is a distinct
+    strategy, never a repeated mutation.
+    """
+    if action.get("role") not in {"combobox", "textbox", "searchbox"}:
+        return {}
+    state = evaluate(combo_state_expression(action))
+    if not isinstance(state, dict):
+        return {"commit": "stale", "committed": False}
+    options = []
+    for _ in range(6 if state.get("combo") else 1):
+        options = [o for o in (evaluate(combo_options_expression()) or []) if isinstance(o, dict)]
+        if options or not state.get("combo"):
+            break
+        time.sleep(0.1)
+    commit, picked = None, None
+    if options:
+        picked = match_combobox_option(typed, options)
+        if picked is not None:
+            for event in ("mousePressed", "mouseReleased"):
+                call("Input.dispatchMouseEvent", type=event, x=picked["x"], y=picked["y"],
+                     button="left", clickCount=1)
+            commit = "option-click"
+        else:
+            commit = "no-match"
+    elif state.get("combo"):
+        dispatch_key(call, "ArrowDown")
+        dispatch_key(call, "Enter")
+        commit = "arrow-enter"
+    else:
+        return {}
+    time.sleep(0.15)
+    first = evaluate(field_value_expression(action))
+    dispatch_key(call, "Tab")
+    time.sleep(0.15)
+    final = evaluate(field_value_expression(action))
+    reverted = first != previous and final == previous and first != final
+    committed = bool(final) and bool((typed or "").strip()) and (typed or "").strip().lower() in str(final).lower()
+    retried = False
+    if not committed:
+        # One explicit retry: refocus, reopen, click the match if one exists.
+        retried = True
+        if evaluate(combo_focus_expression(action)):
+            dispatch_key(call, "ArrowDown")
+            for _ in range(4):
+                options = [o for o in (evaluate(combo_options_expression()) or []) if isinstance(o, dict)]
+                if options:
+                    break
+                time.sleep(0.1)
+            retry_pick = match_combobox_option(typed, options) if options else None
+            if retry_pick is not None:
+                picked = retry_pick
+                for event in ("mousePressed", "mouseReleased"):
+                    call("Input.dispatchMouseEvent", type=event, x=picked["x"], y=picked["y"],
+                         button="left", clickCount=1)
+                commit = "option-click"
+                time.sleep(0.15)
+                final = evaluate(field_value_expression(action))
+                committed = bool(final) and (typed or "").strip().lower() in str(final).lower()
+    return {
+        "commit": commit or "none",
+        "picked": (picked or {}).get("label"),
+        "committed": bool(committed),
+        "committed_value": final,
+        "reverted": bool(reverted),
+        "retried": retried,
+    }
+
+
 def _upload_key_ok(key):
     return isinstance(key, str) and bool(key) and "/" not in key and "\\" not in key and ".." not in key
 
@@ -1201,6 +1348,9 @@ def browser_operation(request):
                                 fallback=bool(request.get("verify_active")),
                                 wait_ready=bool(request.get("verify_wait")),
                             )
+                        )
+                        extra.update(
+                            commit_combobox(call, evaluate, action, request.get("text") or "", previous)
                         )
         return {"executed": action["id"], **extra}
 

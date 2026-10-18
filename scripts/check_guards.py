@@ -269,6 +269,27 @@ def main():
         browser.act(day, page)
         assert browser.evaluate("window.pickedDay") == "13"
         passed.append("calendar day click selects the day")
+
+        browser.call("Page.navigate", url="data:text/html," + quote((FIXTURES / "widgets.html").read_text()))
+        browser.wait_until_ready()
+        page = browser.observe(screenshot=False)
+        city = next(a for a in page["actions"] if a.get("kind") == "fill" and a.get("label") == "Destination")
+        assert city.get("role") == "combobox"
+        result = browser.act(city, page, text="Lisbon")
+        assert result.get("commit") == "option-click", result
+        assert result.get("picked") == "Lisbon, Portugal", result
+        assert result.get("committed") is True, result
+        assert browser.evaluate("document.querySelector('#city').value") == "Lisbon, Portugal"
+        passed.append("combobox typing commits the best-matching option and survives blur")
+        page = browser.observe(screenshot=False)
+        city = next(a for a in page["actions"] if a.get("kind") == "fill" and a.get("label") == "Destination")
+        result = browser.act(city, page, text="Xyz")
+        assert result.get("commit") == "arrow-enter", result
+        assert result.get("committed") is False, result
+        assert result.get("reverted") is True, result
+        assert result.get("retried") is True, result
+        assert browser.evaluate("document.querySelector('#city').value") == "Lisbon, Portugal"
+        passed.append("unmatched typing reverts on blur without committing a wrong option")
     finally:
         browser.close()
     print("\n".join(passed))

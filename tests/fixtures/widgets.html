@@ -34,6 +34,8 @@
 <div aria-hidden="true">
   <button id="painted" onclick="window.paintedClicks=(window.paintedClicks||0)+1">Painted popup</button>
 </div>
+<label>Destination <input id="city" role="combobox" aria-controls="cities" aria-expanded="false" aria-autocomplete="list" value="Porto" autocomplete="off"></label>
+<div role="listbox" id="cities" hidden></div>
 <script>
   const dlg = document.querySelector('#dlg');
   document.querySelector('#opener').onclick = () => dlg.showModal();
@@ -56,4 +58,30 @@
       if (event.key === ' ') { event.preventDefault(); radio.click(); }
     };
   }
+  const city = document.querySelector('#city'), cities = document.querySelector('#cities');
+  const PLACES = ['Lisbon, Portugal', 'Lisbon Falls, Maine', 'Lismore, Australia'];
+  let committed = true, lastGood = 'Porto';
+  city.addEventListener('input', () => {
+    committed = false;
+    const query = city.value.toLowerCase();
+    const matches = PLACES.filter(place => place.toLowerCase().includes(query));
+    cities.innerHTML = matches.map(place => `<div role="option" tabindex="-1">${place}</div>`).join('');
+    cities.hidden = matches.length === 0;
+    city.setAttribute('aria-expanded', matches.length ? 'true' : 'false');
+    for (const option of cities.querySelectorAll('[role="option"]')) {
+      // mousedown beats the field's blur, like production autocompletes.
+      option.onmousedown = () => {
+        city.value = option.textContent;
+        committed = true;
+        lastGood = city.value;
+        cities.hidden = true;
+        city.setAttribute('aria-expanded', 'false');
+      };
+    }
+  });
+  city.addEventListener('blur', () => {
+    if (!committed) city.value = lastGood;
+    cities.hidden = true;
+    city.setAttribute('aria-expanded', 'false');
+  });
 </script>
