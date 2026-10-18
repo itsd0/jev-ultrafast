@@ -251,6 +251,7 @@ def action_space(actions):
         "select": "SELECT",
         "select_option": "SELECT_OPTION",
         "upload": "UPLOAD_FILE",
+        "check": "SET_CHECKED",
     }
     for action in actions:
         kind = action["kind"]
@@ -349,6 +350,7 @@ def operation_catalog(targets, controls):
         "SELECT": "Select an observed dropdown value.",
         "SELECT_OPTION": "Choose one option in a long dropdown. A small LLM will name the option.",
         "UPLOAD_FILE": "Upload an allowlisted file. Choose the offered key. A key is not a filesystem path.",
+        "SET_CHECKED": "Set or clear an offered checkbox, radio, or switch. The state is verified after.",
         "SWITCH_TAB": "Switch to another tab opened by this task. Choose an offered tab id.",
         "SCROLL_DOWN": "Scroll down the document or an offered container.",
         "SCROLL_UP": "Scroll up the document or an offered container.",
@@ -957,8 +959,9 @@ JUDGE_SCHEMA = {
         "facts": {"type": "array", "items": {"type": "string"}},
         "complete": {"type": "boolean"},
         "missing": {"type": "string"},
+        "leave_site": {"type": "boolean"},
     },
-    "required": ["satisfied", "facts", "complete", "missing"],
+    "required": ["satisfied", "facts", "complete", "missing", "leave_site"],
     "additionalProperties": False,
 }
 
@@ -971,6 +974,7 @@ def parse_judge(result):
         or not isinstance(output.get("facts"), list)
         or not isinstance(output.get("complete"), bool)
         or not isinstance(output.get("missing"), str)
+        or not isinstance(output.get("leave_site"), bool)
     ):
         raise ValueError("invalid judgment")
     satisfied = []
@@ -983,7 +987,13 @@ def parse_judge(result):
         ):
             satisfied.append({"id": item["id"], "value": item["value"].strip()[:500]})
     facts = [item.strip()[:300] for item in output["facts"][:8] if isinstance(item, str) and item.strip()]
-    return {"satisfied": satisfied, "facts": facts, "complete": output["complete"], "missing": output["missing"][:500]}
+    return {
+        "satisfied": satisfied,
+        "facts": facts,
+        "complete": output["complete"],
+        "missing": output["missing"][:500],
+        "leave_site": output["leave_site"],
+    }
 
 
 def judge_progress(context, system):

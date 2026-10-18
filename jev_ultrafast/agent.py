@@ -121,7 +121,41 @@ def hold_actions(holds, action_ids, steps=LOOP_HOLD_STEPS):
 
 STALL_REPEATS = 3
 STALL_HOLD_STEPS = 5
-STALL_KINDS = {"click", "key", "select", "select_option", "navigate", "vision"}
+STALL_KINDS = {"click", "key", "select", "select_option", "navigate", "vision", "check"}
+MAX_BACKS = 3
+
+_SCORE_STOPWORDS = frozenset(
+    "the a an to of and for on in with or by from click open link page more next result results show all".split()
+)
+
+
+def _score_words(text):
+    return {
+        word
+        for word in re.findall(r"[a-z0-9]+", (text or "").lower())
+        if word not in _SCORE_STOPWORDS and len(word) > 1
+    }
+
+
+def normalize_link_url(url):
+    try:
+        parsed = urlparse(url or "")
+    except ValueError:
+        return ""
+    if not parsed.hostname:
+        return ""
+    return (parsed.hostname.lower() + (parsed.path or "").rstrip("/")).rstrip("/")
+
+
+def score_link(label, url, nav, todo_words, tried):
+    """Rank a link for the current sub-goal. Result items win by word overlap;
+    nav chrome and already-tried detours lose."""
+    score = 2 * len(todo_words & _score_words(label)) + len(todo_words & _score_words(url))
+    if nav:
+        score -= 4
+    if normalize_link_url(url) in tried:
+        score -= 10
+    return score
 
 
 def detect_control_stall(window):
@@ -201,6 +235,8 @@ def apply_judgment(state, judgment, source_url):
             seen.add(fact)
             memo.append({"fact": fact, "source": source_url})
     state["memo"] = memo[-MEMO_CAP:]
+    state["leave_site"] = bool(judgment.get("leave_site"))
+    state["leave_site_url"] = source_url
 
 
 def add_event_note(state, text):
@@ -232,6 +268,29 @@ def compose_guidance(state):
     target, current = state.get("page_target"), state.get("page_current")
     if target and current and current < target:
         guidance.append(f"On page {current} of {target}: keep going to the next page.")
+    if state.get("force_navigate") and current_todo(state):
+        guidance.append(f"Leave this site now: NAVIGATE for the next step ({current_todo(state)[:80]}).")
+    elif state.get("subgoals") is not None and not target:
+        todo_words = _score_words(current_todo(state))
+        tried = set(state.get("tried_links") or [])
+        ranked = sorted(
+            (
+                a
+                for a in (state.get("page") or {}).get("actions", [])
+                if a.get("kind") == "click" and a.get("role") == "link"
+            ),
+            key=lambda a: score_link(
+                a.get("label"), action_url(state["page"], a), a.get("nav"), todo_words, tried
+            ),
+            reverse=True,
+        )
+        top = [
+            a for a in ranked
+            if score_link(a.get("label"), action_url(state["page"], a), a.get("nav"), todo_words, tried) > 0
+        ][:3]
+        if top:
+            names = "; ".join((a.get("label") or "?")[:40] for a in top)
+            guidance.append(f"For '{current_todo(state)[:60]}': consider {names}.")
     return guidance[:4]
 
 
@@ -260,11 +319,65 @@ def control_unchanged(action, before, after):
     return None
 
 
+GUARD_HREF_INDEX = 12
+
+
+def action_url(page, action):
+    guards = page.get("guards") or {}
+    guard = guards.get(f"{action.get('frame') or 'f0'}:{action.get('node')}")
+    if isinstance(guard, list) and len(guard) > GUARD_HREF_INDEX:
+        return guard[GUARD_HREF_INDEX] or ""
+    return ""
+
+
+def current_todo(state):
+    subgoals = state.get("subgoals") or []
+    todo = [item["text"] for item in subgoals if not item.get("satisfied")]
+    return todo[0] if todo else ""
+
+
+def compute_suppressed(state, page):
+    """Action ids to hide on this page: forced-NAVIGATE keeps only navigate;
+    otherwise zero-signal nav links and tried detours are hidden while choices remain."""
+    actions = page.get("actions") or []
+    if state.get("force_navigate"):
+        return {a.get("id") for a in actions if a.get("kind") != "navigate"}
+    if state.get("subgoals") is None or state.get("page_target"):
+        # Pagination runs follow the page counter, not link scores.
+        return set()
+    todo_words = _score_words(current_todo(state))
+    if not todo_words:
+        return set()
+    tried = set(state.get("tried_links") or [])
+    links = [a for a in actions if a.get("kind") == "click" and a.get("role") == "link"]
+    if not links:
+        return set()
+    drop = {
+        a.get("id")
+        for a in links
+        if a.get("nav") and score_link(a.get("label"), action_url(page, a), True, todo_words, tried) <= 0
+    }
+    drop |= {
+        a.get("id")
+        for a in links
+        if normalize_link_url(action_url(page, a)) in tried and normalize_link_url(action_url(page, a))
+    }
+    if drop >= {a.get("id") for a in links}:
+        return set()
+    return drop
+
+
 def page_for_choice(state):
     holds = state.get("held_actions") or {}
-    if not holds:
+    actions = state["page"]["actions"]
+    if holds:
+        actions = offered_actions(actions, holds)
+    suppressed = state.get("suppressed_ids") or set()
+    if suppressed and state.get("suppressed_fp") == state["page"].get("fingerprint"):
+        actions = [a for a in actions if a.get("id") not in suppressed]
+    if actions == state["page"]["actions"]:
         return state["page"]
-    return {**state["page"], "actions": offered_actions(state["page"]["actions"], holds)}
+    return {**state["page"], "actions": actions}
 
 
 class Agent:
@@ -470,6 +583,7 @@ class Agent:
             if len(state["decisions"]) >= budget * 0.75:
                 state["winding_down"] = True
             self._track_progress(state)
+            self._update_suppression(state)
             try:
                 state["decision"] = self._maybe_vision(state) or self._decide(state, page_for_choice(state))
             except ValueError as exc:
@@ -619,6 +733,15 @@ class Agent:
                     switched = f"switched to new tab {url or opened[-1]}"
             state["browser"].wait_until_ready()
             state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
+            check_set = (
+                action["kind"] == "check" and isinstance(result, dict) and result.get("already_set")
+            )
+            check_failed = (
+                action["kind"] == "check"
+                and isinstance(result, dict)
+                and not result.get("already_set")
+                and not result.get("verified", False)
+            )
             # Record execution before observing. A stale post-action observation must not erase the action.
             state["history"].append(
                 {
@@ -641,6 +764,8 @@ class Agent:
                         "text entry failed" if text_failed else None,
                         "no matching option" if unmatched_option else None,
                         "coordinate-based" if action.get("kind") == "vision" else None,
+                        "already selected" if check_set else None,
+                        "value unchanged" if check_failed else None,
                     ) if part) or None,
                     "page_changed": None,
                     "url": page["url"],
@@ -678,6 +803,17 @@ class Agent:
                 progress = bool(switched) or not same_page(window, state["page"])
                 window.append(loop_step(decision, action, state["page"], progress))
                 state["loop_window"] = window[-LOOP_WINDOW:]
+            if (
+                action.get("kind") == "click"
+                and state.get("subgoals") is not None
+                and state["page"].get("url") != page.get("url")
+            ):
+                state["excursion"] = {
+                    "from": page.get("url") or "",
+                    "at": state["page"].get("url") or "",
+                    "label": action.get("label") or "?",
+                    "page": state.get("page_current"),
+                }
             if state["record"]:
                 (self.record_dir / f"{state['elapsed_ms']:06d}.jpg").write_bytes(
                     base64.b64decode(state["page"]["screenshot"])
@@ -814,6 +950,11 @@ class Agent:
     def _stall_advice(self, state, stall):
         actions = state["page"].get("actions", [])
         action = next((item for item in actions if item.get("id") == stall["id"]), {})
+        if action.get("in_grid"):
+            return (
+                f"{stall['label'][:60]} is not responding; focus a day and use the Arrow keys "
+                "to move, Enter to select."
+            )
         sibling = next(
             (
                 item
@@ -866,7 +1007,64 @@ class Agent:
             print("[jev:track] judgment failed; keeping previous progress", file=sys.stderr, flush=True)
             return
         state["text_calls"].append({**helper, "field": "progress judgment", "value": None})
+        had = sum(1 for item in state.get("subgoals") or [] if item.get("satisfied"))
+        memo_before = len(state.get("memo") or [])
         apply_judgment(state, judgment, url)
+        gained = sum(1 for item in state.get("subgoals") or [] if item.get("satisfied")) > had
+        new_facts = [item["fact"] for item in (state.get("memo") or [])[memo_before:]]
+        self._maybe_go_back(state, url, gained, new_facts)
+
+    def _maybe_go_back(self, state, url, gained, new_facts):
+        """A click that lands nowhere new is a detour: go BACK once and mark it tried."""
+        excursion = state.get("excursion")
+        if not excursion or url != excursion.get("at"):
+            if excursion:
+                state["excursion"] = None
+            return
+        if gained:
+            state["excursion"] = None
+            return
+        if state.get("page_target") and state.get("page_current") != excursion.get("page"):
+            state["excursion"] = None
+            return
+        todo_words = _score_words(current_todo(state))
+        if todo_words and any(todo_words & _score_words(fact) for fact in new_facts):
+            state["excursion"] = None
+            return
+        if (state.get("backs_used") or 0) >= MAX_BACKS:
+            state["excursion"] = None
+            return
+        try:
+            state["browser"].go_back()
+            state["browser"].wait_until_ready()
+            state["page"] = state["browser"].observe(screenshot=self.screenshots)
+        except (StalePage, RuntimeError) as error:
+            print(f"[jev:back] could not go back ({error}); continuing", file=sys.stderr, flush=True)
+            state["excursion"] = None
+            return
+        state["backs_used"] = (state.get("backs_used") or 0) + 1
+        tried = state.get("tried_links") or []
+        norm = normalize_link_url(excursion.get("at"))
+        if norm and norm not in tried:
+            tried.append(norm)
+        state["tried_links"] = tried[-20:]
+        state["excursion"] = None
+        add_event_note(state, f"Went back; '{excursion.get('label')}' led nowhere new.")
+        state["judged_url"] = state["page"].get("url") or ""
+        state["judged_step"] = len(state.get("history") or [])
+
+    def _update_suppression(self, state):
+        subgoals = state.get("subgoals") or []
+        todo = any(not item.get("satisfied") for item in subgoals)
+        held_nav = (state.get("held_actions") or {}).get("navigate", 0) > 0
+        state["force_navigate"] = bool(
+            todo
+            and state.get("leave_site")
+            and state.get("leave_site_url") == state["page"].get("url")
+            and not held_nav
+        )
+        state["suppressed_fp"] = state["page"].get("fingerprint")
+        state["suppressed_ids"] = compute_suppressed(state, state["page"])
 
     def _done_verdict(self, state, page):
         """Accept DONE only when pagination and every sub-goal check out. Bounded: two
@@ -898,6 +1096,18 @@ class Agent:
                 missing = (judgment or {}).get("missing") or "unverified completion"
         if not missing:
             return {"accept": True, "partial": False, "missing": ""}
+        todo_remain = state.get("subgoals") is not None and any(
+            not item.get("satisfied") for item in state["subgoals"]
+        )
+        if todo_remain and not state.get("winding_down"):
+            # Sub-goals remain: no DONE or partial until the wind-down, unless the
+            # same verdict repeats and the run would only spin on it.
+            streak = state.get("gate_same_missing", 0) + 1 if missing == state.get("gate_missing") else 1
+            state["gate_missing"] = missing
+            state["gate_same_missing"] = streak
+            if streak >= 4:
+                return {"accept": True, "partial": True, "missing": missing}
+            return {"accept": False, "partial": False, "missing": missing}
         if state.get("done_rejections", 0) >= 2:
             return {"accept": True, "partial": True, "missing": missing}
         return {"accept": False, "partial": False, "missing": missing}

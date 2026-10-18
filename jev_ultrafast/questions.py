@@ -41,7 +41,8 @@ what is missing instead of guessing. No commentary or browser actions."""
 TRACK_SYSTEM = """Track progress on a multi-part browser goal. Given the ordered sub-goals, the current
 page, and recent actions, return which sub-goals are now satisfied WITH the exact value seen (numbers,
 names, prices: copy them exactly), plus any other durable facts for the goal worth remembering. Never
-invent values: only report what the page or actions show. If nothing new, return empty lists."""
+invent values: only report what the page or actions show. If nothing new, return empty lists. Also say
+whether the next unsatisfied sub-goal needs leaving this site (true) or can be done here (false)."""
 
 GATE_SYSTEM = """The browser agent declares the goal DONE. Confirm ONLY if the current page, the satisfied
 sub-goals, and the collected facts show every part of the goal is complete. If any part is missing or

@@ -1308,9 +1308,15 @@ def test_date_rule_reaches_the_model():
     assert "TYPE the date" in NEXT_ACTION and "press Enter" in NEXT_ACTION
 
 
-def _judgment(complete=True, missing="", satisfied=(), facts=()):
+def _judgment(complete=True, missing="", satisfied=(), facts=(), leave_site=False):
     return (
-        {"satisfied": list(satisfied), "facts": list(facts), "complete": complete, "missing": missing},
+        {
+            "satisfied": list(satisfied),
+            "facts": list(facts),
+            "complete": complete,
+            "missing": missing,
+            "leave_site": leave_site,
+        },
         {"model": "t", "latency_ms": 1, "usage": {}},
     )
 
@@ -1402,12 +1408,16 @@ def test_parse_judge_rules():
         return {"choices": [{"message": {"content": json.dumps(content)}}]}
 
     good = parse_judge(result({"satisfied": [{"id": 1, "value": " 29C "}], "facts": [" hot "],
-                               "complete": True, "missing": ""}))
-    assert good == {"satisfied": [{"id": 1, "value": "29C"}], "facts": ["hot"], "complete": True, "missing": ""}
+                               "complete": True, "missing": "", "leave_site": True}))
+    assert good == {"satisfied": [{"id": 1, "value": "29C"}], "facts": ["hot"], "complete": True,
+                    "missing": "", "leave_site": True}
     with pytest.raises(ValueError, match="invalid judgment"):
         parse_judge(result({"satisfied": [], "facts": []}))
+    with pytest.raises(ValueError, match="invalid judgment"):
+        parse_judge(result({"satisfied": [], "facts": [], "complete": True, "missing": "", "leave_site": "x"}))
     dropped = parse_judge(result({"satisfied": [{"id": "x", "value": ""}, {"id": 2}],
-                                  "facts": ["", 7], "complete": False, "missing": "y"}))
+                                  "facts": ["", 7], "complete": False, "missing": "y",
+                                  "leave_site": False}))
     assert dropped["satisfied"] == [] and dropped["facts"] == []
 
 
@@ -1505,3 +1515,201 @@ def test_page_counter_guidance():
     assert compose_guidance(state) == ["On page 1 of 3: keep going to the next page."]
     state["page_current"] = 3
     assert compose_guidance(state) == []
+
+
+def _link_page():
+    guards = {}
+    actions = []
+    for index, (label, href, nav) in enumerate(
+        [
+            ("USB-C Hub 8-in-1", "https://shop.test/itm/hub-8in1", False),
+            ("Electronics", "https://shop.test/categories/electronics", True),
+            ("Help", "https://shop.test/help", True),
+            ("USB-C Hub Pro", "https://shop.test/itm/hub-pro", False),
+            ("navigate", "", False),
+        ]
+    ):
+        node = 100 + index
+        actions.append(
+            {
+                "id": f"e{index}",
+                "kind": "click" if label != "navigate" else "navigate",
+                "role": "link" if label != "navigate" else None,
+                "label": label,
+                "node": node,
+                "frame": "f0",
+                **({"nav": True} if nav else {}),
+            }
+        )
+        guard = [None] * 14
+        guard[12] = href
+        guards[f"f0:{node}"] = guard
+    return {"url": "https://shop.test/search", "title": "", "text": "", "fingerprint": "fp",
+            "actions": actions, "guards": guards}
+
+
+def test_score_link_rules():
+    from jev_ultrafast.agent import _score_words, score_link
+
+    todo = _score_words("report the price of usb-c hub results")
+    assert todo == {"report", "price", "usb", "hub"}
+    item = score_link("USB-C Hub 8-in-1", "https://shop.test/itm/hub-8in1", False, todo, set())
+    category = score_link("Electronics", "https://shop.test/categories", True, todo, set())
+    assert item > 0 and category < 0
+    assert score_link("USB-C Hub", "https://shop.test/itm/1", False, todo, {"shop.test/itm/1"}) < 0
+
+
+def test_compute_suppressed_rules():
+    from jev_ultrafast.agent import compute_suppressed
+
+    page = _link_page()
+    assert compute_suppressed({"page": page}, page) == set()  # No sub-goals: no scoring.
+    state = {
+        "subgoals": [{"id": 0, "text": "price of usb-c hub", "satisfied": True, "value": "1",
+                      "source": "u"},
+                     {"id": 1, "text": "seller rating of usb-c hub"}],
+        "page_target": None,
+    }
+    dropped = compute_suppressed(state, page)
+    assert dropped == {"e1", "e2"}  # Zero-signal nav links hidden; result item and navigate kept.
+    state["tried_links"] = ["shop.test/itm/hub-8in1"]
+    # The tried item joins the drop set, but one untried result link remains, so no strand guard.
+    assert compute_suppressed(state, page) == {"e0", "e1", "e2"}
+    state["tried_links"] = ["shop.test/itm/hub-8in1", "shop.test/itm/hub-pro"]
+    assert compute_suppressed(state, page) == set()  # All links would drop: keep all instead.
+    state["page_target"] = 3
+    assert compute_suppressed(state, page) == set()  # Pagination follows the counter.
+    state["page_target"] = None
+    state["force_navigate"] = True
+    assert compute_suppressed(state, page) == {"e0", "e1", "e2", "e3"}
+
+
+def test_page_for_choice_suppression_by_fingerprint(runner):
+    runner.state["suppressed_fp"] = runner.state["page"]["fingerprint"]
+    runner.state["suppressed_ids"] = {"e3"}
+    offered = loop.page_for_choice(runner.state)
+    assert [a["id"] for a in offered["actions"]] == ["e1", "e2", "wait"]
+    runner.state["suppressed_fp"] = "other"
+    assert loop.page_for_choice(runner.state) is runner.state["page"]
+
+
+def test_force_navigate_updates_suppression(runner):
+    runner.state["subgoals"] = [{"id": 0, "text": "population", "satisfied": True, "value": "9M",
+                                 "source": "https://one.test/"},
+                                {"id": 1, "text": "temperature"}]
+    runner.state["leave_site"] = True
+    runner.state["leave_site_url"] = runner.state["page"]["url"]
+    runner._update_suppression(runner.state)
+    assert runner.state["force_navigate"] is True
+    assert runner.state["suppressed_ids"] == {"e1", "e2", "e3", "wait"}
+    runner.state["held_actions"] = {"navigate": 2}
+    runner._update_suppression(runner.state)
+    assert runner.state["force_navigate"] is False
+
+
+def test_excursion_recorded_on_navigating_click(runner):
+    runner.state["subgoals"] = [{"id": 0, "text": "something"}]
+    moved = page()
+    moved["url"] = "https://example.test/other"
+    moved["fingerprint"] = fingerprint(moved)
+    runner.state["browser"].observe = Mock(return_value=moved)
+    runner.state["browser"].act = Mock(return_value={"executed": "e3"})
+    runner.state["decision"] = decision("e3")
+    runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    assert runner.state["excursion"]["at"] == "https://example.test/other"
+    assert runner.state["excursion"]["label"] == "Go"
+
+
+def test_maybe_go_back_rules(runner):
+    browser = runner.state["browser"]
+    browser.go_back = Mock()
+    browser.wait_until_ready = Mock()
+    browser.observe = Mock(return_value=page())
+    runner.state["subgoals"] = [{"id": 0, "text": "price of usb-c hub"}]
+    runner.state["excursion"] = {"from": "https://shop.test/s", "at": "https://shop.test/itm/9",
+                                 "label": "Gadget", "page": None}
+    runner._maybe_go_back(runner.state, "https://shop.test/itm/9", False, ["unrelated story"])
+    assert browser.go_back.call_count == 1
+    assert runner.state["tried_links"] == ["shop.test/itm/9"]
+    assert runner.state["excursion"] is None
+    assert any("Went back" in note["text"] for note in runner.state["event_notes"])
+
+    browser.go_back.reset_mock()
+    runner.state["excursion"] = {"from": "a", "at": "https://shop.test/itm/9", "label": "G", "page": None}
+    runner._maybe_go_back(runner.state, "https://shop.test/itm/9", True, [])
+    assert browser.go_back.call_count == 0  # New evidence: stay.
+
+    runner.state["excursion"] = {"from": "a", "at": "https://shop.test/itm/9", "label": "G", "page": None}
+    runner._maybe_go_back(runner.state, "https://shop.test/itm/9", False, ["usb-c hub price 100"])
+    assert browser.go_back.call_count == 0  # On-topic facts: stay.
+
+    runner.state["excursion"] = {"from": "a", "at": "https://else.test/", "label": "G", "page": None}
+    runner.state["backs_used"] = 3
+    runner._maybe_go_back(runner.state, "https://else.test/", False, [])
+    assert browser.go_back.call_count == 0  # Back budget spent.
+    assert runner.state["excursion"] is None
+
+
+def test_gate_holds_done_until_wind_down_with_todo(runner, monkeypatch):
+    runner.state["subgoals"] = [{"id": 0, "text": "population", "satisfied": True, "value": "9M",
+                                 "source": "u"},
+                                {"id": 1, "text": "temperature"}]
+    monkeypatch.setattr(loop, "judge_progress", lambda context, system: _judgment(True))
+    monkeypatch.setattr(loop, "field_text", lambda context, system=None: ("answer", {"model": "t"}))
+    for _ in range(3):
+        runner.state["decision"] = decision("DONE")
+        runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+        assert runner.state["status"] == "ready"
+    runner.state["decision"] = decision("DONE")
+    runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    assert runner.state["status"] == "done"  # Same verdict 4x: spin-breaker accepts partial.
+    assert runner.state["partial"] is True
+
+
+def test_gate_partial_accepts_at_wind_down(runner, monkeypatch):
+    runner.state["subgoals"] = [{"id": 0, "text": "temperature"}]
+    runner.state["winding_down"] = True
+    runner.state["done_rejections"] = 2
+    monkeypatch.setattr(loop, "judge_progress", lambda context, system: _judgment(False, "temperature"))
+    monkeypatch.setattr(loop, "field_text", lambda context, system=None: ("answer", {"model": "t"}))
+    runner.state["decision"] = decision("DONE")
+    runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    assert runner.state["status"] == "done"
+    assert runner.state["partial"] is True
+
+
+def test_stall_advice_prefers_keyboard_in_grids(runner):
+    runner.state["page"]["actions"].append(
+        {"id": "e9", "kind": "click", "role": "gridcell", "label": "Thursday, June 18, 2027",
+         "node": 99, "frame": "f0", "in_grid": True}
+    )
+    advice = runner._stall_advice(runner.state, {"id": "e9", "label": "Thursday, June 18, 2027"})
+    assert "Arrow keys" in advice and "Enter" in advice
+
+
+def test_check_act_records_verification(runner):
+    check = {"id": "e9", "kind": "check", "role": "checkbox", "label": "Set Wifi", "desired": True,
+             "node": 99, "frame": "f0"}
+    runner.state["page"]["actions"].append(check)
+    results = [
+        {"executed": "e9", "verified": True, "checked": True},
+        {"executed": "e9", "already_set": True, "checked": True},
+        {"executed": "e9", "verified": False, "checked": False},
+    ]
+    runner.state["browser"].act = Mock(side_effect=results)
+    runner.state["browser"].wait_until_ready = Mock()
+    for _ in results:
+        runner.state["decision"] = decision("e9")
+        runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    assert [h.get("note") for h in runner.state["history"]] == [None, "already selected", "value unchanged"]
+
+
+def test_set_checked_operation_mapping():
+    actions = [{"kind": "check", "label": "Set Wifi", "node": 7, "frame": "f0"}]
+    elements, targets, controls = model.action_space(actions)
+    operations = model.operation_catalog(targets, controls)
+    assert operations["SET_CHECKED"] == (
+        "Set or clear an offered checkbox, radio, or switch. The state is verified after."
+    )
+    assert targets["SET_CHECKED"] == {"1": actions[0]}
+    assert elements[0]["operations"] == ["SET_CHECKED"]
