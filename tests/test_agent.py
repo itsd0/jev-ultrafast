@@ -1638,10 +1638,33 @@ def test_required_cue_verbs_mark_strict_items():
     assert any("Must still: must find the price" in line for line in guidance)
 
 
+def test_outcome_requirements_drop_procedural_goals():
+    mdn = [{"id": 0, "text": "Open MDN Web Docs website"}, {"id": 1, "text": "Report the flatMap syntax"}]
+    assert [item["text"] for item in loop.outcome_requirements(mdn, {})] == ["Report the flatMap syntax"]
+    pages = [
+        {"id": 0, "text": "Open the Hacker News homepage"},
+        {"id": 1, "text": "Click the 'More' link to navigate to the second page of stories."},
+    ]
+    home = {"title": "Hacker News", "url": "https://news.test/", "text": "1. Story one 2. Story two"}
+    assert [item["text"] for item in loop.outcome_requirements(pages, home)] == [pages[1]["text"]]
+    assert loop.outcome_requirements(pages, {"title": "", "url": "", "text": ""}) == pages
+    assert loop.outcome_requirements(mdn, {}) != []
+
+
+def test_decompose_filters_procedural_before_subgoals(runner, monkeypatch):
+    monkeypatch.setattr(loop, "decompose_goal", lambda goal: ["Open the shop", "Report the price"])
+    monkeypatch.setattr(loop, "choose", lambda *_args, **kwargs: decision("e3"))
+    runner.command("predict", {})
+    assert runner.state["_decomposed"] == ["Open the shop", "Report the price"]
+    assert runner.state.get("subgoals") is None  # one outcome left: single-goal mode
+
+
 def test_evidence_rules_survive_in_prompts():
     from jev_ultrafast.questions import DECOMPOSE_SYSTEM, TRACK_SYSTEM
 
-    assert "neutral imperative" in DECOMPOSE_SYSTEM
+    assert "facts to report" in DECOMPOSE_SYSTEM
+    assert "states to reach" in DECOMPOSE_SYSTEM
+    assert "Never emit navigation steps" in DECOMPOSE_SYSTEM
     assert "no nested sub-plans" in DECOMPOSE_SYSTEM
     assert "copied" in TRACK_SYSTEM and "exact page URL" in TRACK_SYSTEM
     assert "must match the sub-goal's item" in TRACK_SYSTEM

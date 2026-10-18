@@ -408,6 +408,10 @@ _REQUIRED_CUE = re.compile(r"\b(must|needs?|requires?|required)\b", re.IGNORECAS
 _GOAL_VERBS = frozenset({"find", "get", "search", "look", "show", "list", "report", "give", "tell",
                           "open", "visit", "go", "see", "check"})
 _AND_SPLIT = re.compile(r"\s+and\s+|\s*;\s*|\s+then\s+|\s*&\s*", re.IGNORECASE)
+_PROCEDURAL_LEAD = re.compile(
+    r"^(?:open|navigate|go\s+to|visit|search\s+for|search|click|locate|browse|load)\b",
+    re.IGNORECASE,
+)
 
 
 def split_requirements(text, existing=()):
@@ -427,6 +431,27 @@ def split_requirements(text, existing=()):
     for item in existing:
         union |= _score_words(item)
     return [part for part in parts if _score_words(part) and not _score_words(part) <= union]
+
+
+def _procedure_object(text):
+    """The named thing after a leading procedural verb ("Open MDN" -> {mdn})."""
+    return _score_words(_PROCEDURAL_LEAD.sub("", text or "").strip()) - _GOAL_VERBS
+
+
+def outcome_requirements(items, page):
+    """Drop procedural sub-goals when an outcome goal exists, or when the start
+    page already shows the named thing. Never drops everything."""
+    kept = [
+        item for item in items
+        if not _PROCEDURAL_LEAD.match((item.get("text") or "").strip())
+    ]
+    if kept:
+        return kept
+    words = _score_words(" ".join(
+        part for part in (page.get("title"), page.get("url"), page.get("text")) if part
+    ))
+    rest = [item for item in items if not (_procedure_object(item.get("text")) & words)]
+    return rest or items
 
 
 def _grounding_haystack(state, source_url):
@@ -2057,6 +2082,7 @@ class Agent:
                         "required": bool(_REQUIRED_CUE.search(part)),
                     })
             state["_decomposed"] = [item["text"] for item in items]
+            items = outcome_requirements(items, state.get("page") or {})
             if len(items) > 1:
                 state["subgoals"] = items
             state["text_calls"].append(

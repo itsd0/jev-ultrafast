@@ -67,9 +67,10 @@ matching visible page is enough."""
 MAX_STEPS = 60
 
 DECOMPOSE_SYSTEM = (
-    "Split the browser task into atomic, independently checkable requirements. "
-    "Each filter, field value, toggle, selection, and final page/result is its own requirement. "
-    "Phrase each as a neutral imperative end-state (e.g. 'Find the population of Bangkok'). "
+    "Split the browser task into the facts to report or the states to reach. "
+    "Each fact (a price, population, syntax, title) and each end-state (a filter set, "
+    "a sorted list, a page reached) is its own requirement. "
+    "Never emit navigation steps (open, search for, go to, click, locate): only the outcomes. "
     "One flat list, no nested sub-plans. No commentary."
 )
 
