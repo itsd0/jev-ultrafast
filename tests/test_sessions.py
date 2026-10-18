@@ -182,6 +182,10 @@ def test_compose_reply_is_plain_sentences():
     reply = hosted.compose_reply({"blocked_reason": "gave up", "partial": 1, "answer": "X. Y."}, "blocked", None)
     assert reply.startswith("I couldn't fully finish (gave up). So far: X.")
     assert "{" not in hosted.compose_reply({}, "blocked", "stopped by user")
+    reply = hosted.compose_reply(
+        {"blocked_reason": "gave up; hit CAPTCHA walls on wall.test"}, "blocked", None
+    )
+    assert reply == "I couldn't finish (gave up; hit CAPTCHA walls on wall.test)."
 
 
 def test_tabs_event_published_on_tab_change(tmp_path):
@@ -313,6 +317,132 @@ def test_ensure_browser_routes_downloads(tmp_path):
     _wait_done(runner, sid, mid)
     assert made[0].download_path == runner.session_files_dir(sid)
     assert made[0].config["files_dir"] == str(runner.session_files_dir(sid))
+
+
+class WallAgent(FakeAgent):
+    def __init__(self, url, goal, browser=None):
+        super().__init__(url, goal, browser=browser)
+        self.state = {
+            "history": [], "browser": browser,
+            "page": {"url": "https://wall.test/sorry"},
+        }
+        self.ticks = 0
+
+    def command(self, name, body=None):
+        assert name == "tick"
+        self.ticks += 1
+        if self.ticks == 1:
+            self.state["cloud_restart_wanted"] = "wall.test"
+        self.state["history"].append({
+            "step": len(self.state["history"]) + 1,
+            "action": "Blocked by a CAPTCHA on wall.test",
+            "kind": "captcha",
+            "operation": "CAPTCHA",
+            "url": "https://wall.test/sorry",
+            "elapsed_ms": 5,
+            "note": "captcha path",
+        })
+        if self.ticks == 1:
+            return {
+                "status": "running", "history": self.state["history"],
+                "page": {"url": "https://wall.test/sorry"},
+            }
+        return {
+            "status": "done", "history": self.state["history"],
+            "answer": "Got through.", "page": {"url": "https://example.test/"},
+        }
+
+
+def test_cloud_restart_swaps_browser_once(tmp_path, monkeypatch):
+    monkeypatch.delenv("JEV_CLOUD_FALLBACK_COUNTRY", raising=False)
+    monkeypatch.delenv("JEV_CLOUD_PROXY_COUNTRY", raising=False)
+    made = []
+    seen_agents = []
+
+    def agent_factory(url, goal, browser=None):
+        agent = WallAgent(url, goal, browser=browser)
+        seen_agents.append(agent)
+        return agent
+
+    runner = _runner(
+        tmp_path, agent_factory=agent_factory,
+        browser_factory=lambda url: made.append(FakeBrowser(cloud=True)) or made[-1],
+    )
+    sid = runner.create_session("cloud")
+    mid = runner.submit_message(sid, "search the walled site")
+    assert _wait_done(runner, sid, mid)["status"] == "done"
+    assert len(made) == 2
+    assert made[0].closed is True and made[0].cloud_stopped is True
+    assert runner._sessions[sid]["browser"] is made[1]
+    agent = seen_agents[-1]
+    assert agent.browser is made[1] and agent.state["browser"] is made[1]
+    assert agent.state["cloud_restarted"] is True
+    assert agent.state["cloud_restart_wanted"] is None
+    operations = [step["operation"] for step in runner.task_view(mid)["steps"]]
+    assert operations == ["CAPTCHA", "RESTART", "CAPTCHA"]
+    restarts = [event for _, event in runner.replay(sid) if event["type"] == "restart"]
+    assert len(restarts) == 1
+    assert restarts[0]["host"] == "wall.test" and restarts[0]["country"] is None
+
+
+def test_cloud_restart_uses_fallback_country(tmp_path, monkeypatch):
+    monkeypatch.setenv("JEV_CLOUD_FALLBACK_COUNTRY", "de")
+    monkeypatch.delenv("JEV_CLOUD_PROXY_COUNTRY", raising=False)
+    countries = []
+
+    def factory(url):
+        import os
+
+        countries.append(os.environ.get("JEV_CLOUD_PROXY_COUNTRY"))
+        return FakeBrowser(cloud=True)
+
+    runner = _runner(tmp_path, agent_factory=WallAgent, browser_factory=factory)
+    sid = runner.create_session("cloud")
+    mid = runner.submit_message(sid, "search the walled site")
+    _wait_done(runner, sid, mid)
+    assert countries == [None, "de"]
+    import os
+
+    assert os.environ.get("JEV_CLOUD_PROXY_COUNTRY") is None
+    restarts = [event for _, event in runner.replay(sid) if event["type"] == "restart"]
+    assert restarts[0]["country"] == "de"
+
+
+def test_second_wall_does_not_restart_again(tmp_path):
+    runner = _runner(tmp_path, agent_factory=FakeAgent)
+    sid = runner.create_session("cloud")
+    browser = FakeBrowser(cloud=True)
+    _inject(runner, sid, browser)
+    entry = runner._sessions[sid]
+    agent = FakeAgent("about:blank", "hi", browser=browser)
+    agent.state = {"history": [], "browser": browser}
+    agent.state["cloud_restart_wanted"] = "wall.test"
+    agent.state["cloud_restarted"] = True
+    assert runner._maybe_restart_cloud(sid, "m1", entry, agent) is False
+    assert runner._sessions[sid]["browser"] is browser
+    assert browser.closed is False
+
+
+def test_local_wall_never_restarts(tmp_path):
+    made = []
+    seen_agents = []
+
+    def agent_factory(url, goal, browser=None):
+        agent = WallAgent(url, goal, browser=browser)
+        seen_agents.append(agent)
+        return agent
+
+    runner = _runner(
+        tmp_path, agent_factory=agent_factory,
+        browser_factory=lambda url: made.append(FakeBrowser()) or made[-1],
+    )
+    sid = runner.create_session("local")
+    mid = runner.submit_message(sid, "search the walled site")
+    assert _wait_done(runner, sid, mid)["status"] == "done"
+    assert len(made) == 1
+    assert seen_agents[-1].state["cloud_restart_wanted"] is None
+    kinds = [event["type"] for _, event in runner.replay(sid)]
+    assert "restart" not in kinds
 
 
 def test_bus_replays_events(tmp_path):

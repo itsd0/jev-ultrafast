@@ -1125,6 +1125,113 @@ class SessionRunner:
                 self._release_slot()
                 entry["last_active"] = time.time()
 
+    def _record_and_publish_steps(self, session_id, message_id, run_id, snapshot, recorded):
+        history = snapshot.get("history") or []
+        new_entries = history[recorded:]
+        recorded = self._record_new_steps(run_id, snapshot, recorded)
+        self._publish(session_id, {
+            "type": "step", "message_id": message_id,
+            "steps": [
+                {"n": item.get("step"), "operation": item.get("operation"),
+                 "target_label": item.get("action"), "url": item.get("url"),
+                 "ms": item.get("elapsed_ms"), "note": item.get("note")}
+                for item in new_entries
+            ],
+        })
+        return recorded
+
+    def _maybe_restart_cloud(self, session_id, message_id, entry, agent):
+        """One fresh cloud browser per run after a wall. False when not wanted."""
+        state = getattr(agent, "state", None)
+        if not isinstance(state, dict):
+            return False
+        host = state.get("cloud_restart_wanted")
+        if not host or state.get("cloud_restarted"):
+            return False
+        session = self.store.get_session(session_id, with_steps=False)
+        if session is None or session["browser"] != "cloud":
+            state["cloud_restart_wanted"] = None
+            return False
+        old = entry.get("browser")
+        if old is not None:
+            try:
+                old.close()
+            except Exception:
+                pass
+        try:
+            stopper = getattr(old, "stop_cloud", None)
+            if callable(stopper):
+                stopper()
+        except Exception:
+            pass
+        viewer, entry["viewer"] = entry.get("viewer"), None
+        if viewer is not None:
+            try:
+                viewer.shutdown()
+            except Exception:
+                pass
+        entry["browser"] = None
+        fallback = (os.environ.get("JEV_CLOUD_FALLBACK_COUNTRY") or "").strip()
+        previous = os.environ.get("JEV_CLOUD_PROXY_COUNTRY")
+        if fallback:
+            os.environ["JEV_CLOUD_PROXY_COUNTRY"] = fallback
+        try:
+            browser = self._ensure_browser(session_id, "cloud")
+        finally:
+            if fallback:
+                if previous is None:
+                    os.environ.pop("JEV_CLOUD_PROXY_COUNTRY", None)
+                else:
+                    os.environ["JEV_CLOUD_PROXY_COUNTRY"] = previous
+        try:
+            agent.browser = browser
+        except Exception:
+            pass
+        state["browser"] = browser
+        state["cloud_restarted"] = True
+        state["cloud_restart_wanted"] = None
+        history = state.get("history")
+        if isinstance(history, list):
+            label = "Switched to a fresh cloud browser"
+            if fallback:
+                label += f" ({fallback} proxy)"
+            history.append({
+                "step": len(history) + 1,
+                "action": label,
+                "kind": "restart",
+                "choice": "restart",
+                "probability": None,
+                "confidence": None,
+                "latency_ms": 0,
+                "text": None,
+                "text_helper": None,
+                "text_latency_ms": 0,
+                "operation": "RESTART",
+                "target": None,
+                "possible_closed_shadow": False,
+                "note": f"CAPTCHA wall on {host}",
+                "page_changed": False,
+                "url": self._browser_url(browser),
+                "usage": {},
+                "executed_ms": state.get("elapsed_ms") or 0,
+                "elapsed_ms": state.get("elapsed_ms") or 0,
+            })
+        trace = getattr(agent, "trace", None)
+        if trace is not None:
+            try:
+                trace.emit(
+                    "guard", step=len(history) if isinstance(history, list) else 0,
+                    type="cloud_restart", host=host, country=fallback or None,
+                )
+            except Exception:
+                pass
+        self._publish(session_id, {
+            "type": "restart", "message_id": message_id, "host": host,
+            "country": fallback or None,
+        })
+        LOG.info(f"[jev:server] session {session_id[:8]} cloud restart after wall on {host}")
+        return True
+
     @staticmethod
     def _close_turn_agent(entry, agent):
         """Release the turn's agent before its terminal status is visible. Idempotent."""
@@ -1166,18 +1273,9 @@ class SessionRunner:
             last_files = files_signature(files_dir)
             while True:
                 snapshot = agent.command("tick")
-                history = snapshot.get("history") or []
-                new_entries = history[recorded:]
-                recorded = self._record_new_steps(run_id, snapshot, recorded)
-                self._publish(session_id, {
-                    "type": "step", "message_id": message_id,
-                    "steps": [
-                        {"n": item.get("step"), "operation": item.get("operation"),
-                         "target_label": item.get("action"), "url": item.get("url"),
-                         "ms": item.get("elapsed_ms"), "note": item.get("note")}
-                        for item in new_entries
-                    ],
-                })
+                recorded = self._record_and_publish_steps(
+                    session_id, message_id, run_id, snapshot, recorded
+                )
                 tabs_now = tabs_signature(browser)
                 if tabs_now != last_tabs:
                     last_tabs = tabs_now
@@ -1206,6 +1304,11 @@ class SessionRunner:
                         trace, started, browser,
                     )
                     return
+                if self._maybe_restart_cloud(session_id, message_id, entry, agent):
+                    browser = entry.get("browser") or browser
+                    recorded = self._record_and_publish_steps(
+                        session_id, message_id, run_id, snapshot, recorded
+                    )
         except Exception as error:
             try:
                 snapshot = agent.snapshot() if agent is not None else {}

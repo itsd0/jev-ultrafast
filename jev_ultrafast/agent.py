@@ -1296,6 +1296,9 @@ class Agent:
         """The single blocked stop: keeps the memo as a partial answer, then the evidence bundle."""
         state["status"] = "blocked"
         if reason is not None:
+            walls = [host for host in state.get("wall_hosts") or [] if host]
+            if walls and "captcha" not in reason.lower():
+                reason = f"{reason}; hit CAPTCHA walls on {', '.join(walls[-3:])}"
             state["blocked_reason"] = reason
         self._partial_close(state)
         state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
@@ -2740,6 +2743,35 @@ class Agent:
         block_host(state, host)
         self.trace.emit("guard", step=step, type="captcha", host=host, reason=reason, url=url)
         state["force_navigate"] = True
+        state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
+        wall = {"id": "captcha", "kind": "captcha", "label": f"Blocked by a CAPTCHA on {host or 'this page'}"}
+        state["history"].append({
+            "step": step,
+            "action": wall["label"],
+            "kind": "captcha",
+            "choice": "captcha",
+            "probability": None,
+            "confidence": None,
+            "latency_ms": 0,
+            "text": None,
+            "text_helper": None,
+            "text_latency_ms": 0,
+            "operation": "CAPTCHA",
+            "target": None,
+            "possible_closed_shadow": False,
+            "note": (reason or "")[:200],
+            "page_changed": False,
+            "url": url,
+            "usage": {},
+            "executed_ms": state["elapsed_ms"],
+            "elapsed_ms": state["elapsed_ms"],
+        })
+        append_loop_step(state, loop_step({"operation": "CAPTCHA"}, wall, state["page"], False))
+        if host:
+            state["wall_hosts"] = [h for h in state.get("wall_hosts") or [] if h != host][-4:] + [host]
+        cloud_mode = (getattr(state["browser"], "config", None) or {}).get("browser") == "cloud"
+        if cloud_mode and host and not state.get("cloud_restarted") and not state.get("cloud_restart_wanted"):
+            state["cloud_restart_wanted"] = host
         try:
             state["browser"].go_back()
             state["browser"].wait_until_ready()

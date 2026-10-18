@@ -158,6 +158,58 @@ def test_captcha_page_blocks_backs_and_forces_without_a_decision(runner, isolate
     assert len(captcha) == 1 and captcha[0]["host"] == "wall.test"
 
 
+def test_captcha_records_a_red_step(runner, isolated_hosts, monkeypatch):
+    monkeypatch.setattr(loop, "choose", Mock(return_value=decision("e1")))
+    sorry = page(url="https://wall.test/sorry/index", text="Sorry, unusual traffic")
+    sorry["captcha_reason"] = detect_captcha(sorry)
+    runner.state["page"] = sorry
+    runner.state["browser"].observe.return_value = page(url="https://wall.test/search")
+    runner.command("predict")
+    assert len(runner.state["history"]) == 1
+    entry = runner.state["history"][0]
+    assert entry["step"] == 1
+    assert entry["operation"] == "CAPTCHA"
+    assert entry["action"] == "Blocked by a CAPTCHA on wall.test"
+    assert entry["url"] == "https://wall.test/sorry/index"
+    assert entry["kind"] == "captcha"
+    assert runner.state["wall_hosts"] == ["wall.test"]
+    assert runner.state["loop_window"][-1]["kind"] == "captcha"
+
+
+def test_cloud_restart_wanted_once_per_run(runner, isolated_hosts, monkeypatch):
+    monkeypatch.setattr(loop, "choose", Mock(return_value=decision("e1")))
+    runner.state["browser"].config = {"browser": "cloud"}
+    sorry = page(url="https://wall.test/sorry/index", text="Sorry, unusual traffic")
+    sorry["captcha_reason"] = detect_captcha(sorry)
+    runner.state["page"] = sorry
+    runner.command("predict")
+    assert runner.state["cloud_restart_wanted"] == "wall.test"
+    runner.state["cloud_restarted"] = True
+    runner.state["cloud_restart_wanted"] = None
+    runner.state["force_navigate"] = False
+    runner.state["page"] = sorry
+    runner.command("predict")
+    assert runner.state.get("cloud_restart_wanted") is None
+
+
+def test_local_wall_wants_no_restart(runner, isolated_hosts, monkeypatch):
+    monkeypatch.setattr(loop, "choose", Mock(return_value=decision("e1")))
+    sorry = page(url="https://wall.test/sorry/index", text="Sorry, unusual traffic")
+    sorry["captcha_reason"] = detect_captcha(sorry)
+    runner.state["page"] = sorry
+    runner.command("predict")
+    assert runner.state.get("cloud_restart_wanted") is None
+
+
+def test_terminal_reason_names_the_walls(runner):
+    runner.state["wall_hosts"] = ["a.test", "b.test"]
+    runner._terminal(runner.state, "gave up", 1)
+    assert runner.state["blocked_reason"] == "gave up; hit CAPTCHA walls on a.test, b.test"
+    runner.state["wall_hosts"] = []
+    runner._terminal(runner.state, "gave up", 1)
+    assert runner.state["blocked_reason"] == "gave up"
+
+
 def test_captcha_handler_is_skipped_while_forcing(runner, isolated_hosts, monkeypatch):
     choose = Mock(return_value=decision("e1"))
     monkeypatch.setattr(loop, "choose", choose)

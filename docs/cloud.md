@@ -7,6 +7,7 @@ that `Browser` uses unless `JEV_BROWSER=cloud` is set.
 | --- | --- | --- |
 | `JEV_BROWSER` | `local` | `cloud` provisions one Browser Use Cloud browser per run. Invalid values stay local. |
 | `JEV_CLOUD_PROXY_COUNTRY` | `us` | Managed proxy country. `none` sends `proxyCountryCode: null`. |
+| `JEV_CLOUD_FALLBACK_COUNTRY` | empty | Proxy country for the one fresh cloud browser after a CAPTCHA wall. Empty keeps the session country. |
 | `JEV_CLOUD_TIMEOUT_MIN` | `15` | Session minutes, clamped to 1-240. |
 | `JEV_CLOUD_PROFILE_ID` | empty | Cloud profile UUID. |
 | `JEV_CLOUD_RECORD` | `0` | `enableRecording`. |
