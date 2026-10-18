@@ -17,11 +17,13 @@ const S = {
 
 const OP_ICON = {
   NAVIGATE: "\u2192", CLICK: "\u25cf", TYPE_TEXT: "\u270e", SELECT: "\u25be",
-  SELECT_OPTION: "\u25be", UPLOAD_FILE: "\u21ea", SET_CHECKED: "\u2611",
+  SELECT_OPTION: "\u25be", UPLOAD_FILE: "\u21ea", UPLOAD: "\u21ea", SET_CHECKED: "\u2611",
   PRESS_KEY: "\u2328", SCROLL_DOWN: "\u2193", SCROLL_UP: "\u2191",
   SCROLL_LEFT: "\u2190", SCROLL_RIGHT: "\u2192", SWITCH_TAB: "\u21c4",
   NEW_TAB: "+", CLOSE_TAB: "\u2715", SAVE_FILE: "\u25a3", CAPTCHA: "\u26a0", RESTART: "\u21bb",
-  DONE: "\u2713", BLOCKED: "\u25a0", WAIT: "\u2026",
+  DONE: "\u2713", BLOCKED: "\u25a0", WAIT: "\u2026", SEARCH: "\u2315", GO_BACK: "\u21a9",
+  READ_OPTIONS: "\u2630", FIND_TEXT: "\u00b6", SEARCH_PAGE: "\u00a7", EXTRACT: "\u275d",
+  READ_FILE: "\u25a4",
 };
 
 const $ = (id) => document.getElementById(id);
@@ -232,9 +234,11 @@ function renderTurn(message) {
   const head = document.createElement("div");
   head.className = "turn-head";
   const worked = message.duration_ms != null ? fmtDur(message.duration_ms) : null;
+  const engine = [message.model, message.effort].filter(Boolean).join(" ");
   head.innerHTML =
     (worked ? `Worked for ${esc(worked)} · ` : "") +
-    `${steps.length} steps · ${esc(fmtTurnCost(message))} ` +
+    `${steps.length} steps · ${esc(fmtTurnCost(message))}` +
+    (engine ? ` · ${esc(engine)}` : "") + " " +
     `<span class="status ${esc(message.status)}">${esc(message.status)}</span>`;
   div.appendChild(head);
   if (steps.length) {
@@ -280,9 +284,36 @@ function renderStep(step) {
   const ms = step.ms != null ? Math.round(step.ms) + "ms" : "";
   li.innerHTML = `<span class="op">${esc(icon)}</span>` +
     `<span><span>${esc(step.target_label || step.operation || "")}</span>` +
-    (step.note ? `<span class="note">${esc(step.note)}</span>` : "") + `</span>` +
+    (step.note ? `<span class="note">${esc(step.note)}</span>` : "") +
+    stepDetailHtml(step.detail) + `</span>` +
     `<span class="ms">${esc(ms)}</span>`;
   return li;
+}
+
+function stepDetailHtml(detail) {
+  if (!detail) return "";
+  let parsed = detail;
+  if (typeof parsed === "string") {
+    try {
+      parsed = JSON.parse(parsed);
+    } catch (e) {
+      return "";
+    }
+  }
+  if (!parsed || typeof parsed !== "object") return "";
+  const think = parsed.thinking_ms != null ? `thought ${Math.round(parsed.thinking_ms)}ms` : "";
+  const model = [parsed.model, parsed.effort].filter(Boolean).join(" ");
+  const head = [think, model].filter(Boolean).join(" · ");
+  const actions = Array.isArray(parsed.actions) ? parsed.actions : [];
+  const acted = actions.map((item) =>
+    `${item.name || "?"}${item.target ? " " + item.target : ""} ${item.ok ? "✓" : "✗"}`
+  ).join(", ");
+  let html = "";
+  if (head) html += `<span class="note">${esc(head)}</span>`;
+  if (parsed.evaluation) html += `<span class="note">eval: ${esc(parsed.evaluation)}</span>`;
+  if (parsed.next_goal) html += `<span class="note">next: ${esc(parsed.next_goal)}</span>`;
+  if (acted) html += `<span class="note">plan: ${esc(acted)}</span>`;
+  return html;
 }
 
 function updateRunning(running) {
@@ -512,7 +543,12 @@ async function sendMessage(text) {
       S.current = await api("GET", "/api/sessions/" + created.id);
       streamSession(created.id);
     }
-    await api("POST", `/api/sessions/${S.current.id}/messages`, {text});
+    const body = {text};
+    const model = $("model-picker").value.trim();
+    const effort = $("effort-picker").value;
+    if (model) body.model = model;
+    if (effort) body.effort = effort;
+    await api("POST", `/api/sessions/${S.current.id}/messages`, body);
     $("message-box").value = "";
     S.current = await api("GET", "/api/sessions/" + S.current.id);
     renderSession();
@@ -653,6 +689,19 @@ async function renderConfig() {
           <option value="typesafe"${config.decision_provider === "typesafe" ? " selected" : ""}>typesafe</option>
           <option value="mercury"${config.decision_provider === "mercury" ? " selected" : ""}>mercury</option>
         </select></label>
+       <label>Agent core
+        <select name="agent">
+          <option value="new"${config.agent === "new" ? " selected" : ""}>new (Beam)</option>
+          <option value="classic"${config.agent === "classic" ? " selected" : ""}>classic (TypeSafe+Mercury)</option>
+        </select></label>
+       <label>Default model (empty = provider default)
+        <input name="model_default" value="${esc(config.model_default || "")}" /></label>
+       <label>Default reasoning effort
+        <select name="effort_default">
+          ${["low", "medium", "high", "xhigh", "max"].map((level) =>
+            `<option value="${level}"${config.effort_default === level ? " selected" : ""}>${level}</option>`
+          ).join("")}
+        </select></label>
        <label>Server token ${config.server_token_set ? "(set — enter a new one to rotate)" : "(not set)"}
         <input name="server_token" type="password" autocomplete="off" placeholder="unchanged" /></label>
        <button type="submit" class="primary">Save</button>`;
@@ -667,6 +716,9 @@ async function saveConfig(form) {
     browser_default: data.get("browser_default"),
     decision_provider: data.get("decision_provider"),
     text_model: String(data.get("text_model") || "").trim(),
+    agent: data.get("agent"),
+    model_default: String(data.get("model_default") || "").trim(),
+    effort_default: data.get("effort_default"),
   };
   const maxDecisions = String(data.get("max_decisions_default") || "").trim();
   body.max_decisions_default = maxDecisions === "" ? null : Number(maxDecisions);

@@ -24,10 +24,11 @@ from urllib.parse import unquote, urlparse
 from browser_harness import admin as harness_admin
 from browser_harness import helpers as harness_helpers
 
-from .agent import Agent
+from .agents import default_agent_factory
 from .browser import Browser, full_text_expression
 from .config import env_bool
 from .demo import load_environment
+from .llm.reflection import DEFAULT_MODEL, EFFORTS
 from .model import (
     cloud_rate_per_hour,
     priced_cost,
@@ -74,7 +75,8 @@ CREATE TABLE IF NOT EXISTS steps (
     target_label TEXT,
     url TEXT,
     ms INTEGER,
-    note TEXT
+    note TEXT,
+    detail TEXT
 );
 CREATE INDEX IF NOT EXISTS steps_task ON steps(task_id, n);
 CREATE TABLE IF NOT EXISTS events (
@@ -126,7 +128,9 @@ CREATE TABLE IF NOT EXISTS messages (
     final_text TEXT,
     answer_text TEXT,
     decisions_count INTEGER,
-    start_url TEXT
+    start_url TEXT,
+    model TEXT,
+    effort TEXT
 );
 CREATE INDEX IF NOT EXISTS messages_session ON messages(session_id, n);
 """
@@ -153,11 +157,14 @@ class Store:
                     ("priced", "INTEGER"),
                     ("cloud_seconds", "REAL"),
                     ("cloud_cost_usd", "REAL"),
+                    ("model", "TEXT"),
+                    ("effort", "TEXT"),
                 ),
                 "sessions": (
                     ("total_cloud_seconds", "REAL"),
                     ("total_cloud_cost_usd", "REAL"),
                 ),
+                "steps": (("detail", "TEXT"),),
             }
             for table, columns in migrations.items():
                 have = {r[1] for r in self.conn.execute(f"PRAGMA table_info({table})")}
@@ -184,7 +191,7 @@ class Store:
                 return None
             task = dict(row)
             task["steps"] = [dict(r) for r in self.conn.execute(
-                "SELECT n, operation, target_label, url, ms, note FROM steps"
+                "SELECT n, operation, target_label, url, ms, note, detail FROM steps"
                 " WHERE task_id = ? ORDER BY n",
                 (task_id,),
             )]
@@ -212,12 +219,12 @@ class Store:
             self.conn.execute(f"UPDATE tasks SET {names} WHERE id = ?", (*fields.values(), task_id))
             self.conn.commit()
 
-    def add_step(self, task_id, n, operation, target_label, url, ms, note):
+    def add_step(self, task_id, n, operation, target_label, url, ms, note, detail=None):
         with self.lock:
             self.conn.execute(
-                "INSERT INTO steps (task_id, n, operation, target_label, url, ms, note)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (task_id, n, operation, target_label, url, ms, note),
+                "INSERT INTO steps (task_id, n, operation, target_label, url, ms, note, detail)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (task_id, n, operation, target_label, url, ms, note, detail),
             )
             self.conn.commit()
 
@@ -278,7 +285,7 @@ class Store:
                 for message in messages:
                     run_id = message.get("run_id")
                     message["steps"] = [dict(r) for r in self.conn.execute(
-                        "SELECT n, operation, target_label, url, ms, note FROM steps"
+                        "SELECT n, operation, target_label, url, ms, note, detail FROM steps"
                         " WHERE task_id = ? ORDER BY n",
                         (run_id,),
                     )] if run_id else []
@@ -922,8 +929,9 @@ class SessionBus:
 class SessionRunner:
     """Chat sessions. One browser per session, reused across messages.
 
-    Each message runs an Agent against the session browser with the goal set
-    to the message plus session context. Idle browsers close after
+    Each message runs an agent against the session browser with the goal set
+    to the message plus session context. Beam is the default agent;
+    JEV_AGENT=classic keeps TypeSafe+Mercury. Idle browsers close after
     JEV_SESSION_IDLE_MIN minutes; cloud browsers always stop on close.
     """
 
@@ -931,7 +939,7 @@ class SessionRunner:
                  files_root=None, idle_min=None, browser_factory=None):
         self.store = store
         self.max_concurrent = max(1, int(max_concurrent))
-        self.agent_factory = agent_factory or Agent
+        self.agent_factory = agent_factory or default_agent_factory
         self.browser_factory = browser_factory or Browser
         self.pump = FramePump(daemon_name or os.environ.get("BU_NAME", "default"))
         self.files_root = Path(files_root) if files_root else Path.cwd() / "artifacts" / "sessions"
@@ -981,6 +989,30 @@ class SessionRunner:
         decision_provider = values.get("decision_provider")
         if decision_provider in {"typesafe", "mercury"}:
             os.environ["DECISION_PROVIDER"] = decision_provider
+        model_default = values.get("model_default")
+        if model_default is None:
+            pass
+        elif isinstance(model_default, str) and len(model_default.strip()) <= 200:
+            if model_default.strip():
+                os.environ["JEV_MODEL"] = model_default.strip()
+            else:
+                os.environ.pop("JEV_MODEL", None)
+        else:
+            raise ValueError("model_default must be a short string")
+        effort_default = values.get("effort_default")
+        if effort_default is None:
+            pass
+        elif effort_default in EFFORTS:
+            os.environ["JEV_REASONING_EFFORT"] = effort_default
+        else:
+            raise ValueError("effort_default must be low, medium, high, xhigh, or max")
+        agent = values.get("agent")
+        if agent is None:
+            pass
+        elif agent in {"new", "classic"}:
+            os.environ["JEV_AGENT"] = agent
+        else:
+            raise ValueError("agent must be new or classic")
         return self.config_view()
 
     def save_config(self, values):
@@ -1006,6 +1038,9 @@ class SessionRunner:
             "max_decisions_default": self.default_max_decisions,
             "text_model": os.environ.get("TEXT_MODEL", "mercury-2.5"),
             "decision_provider": os.environ.get("DECISION_PROVIDER", "typesafe"),
+            "model_default": os.environ.get("JEV_MODEL", DEFAULT_MODEL),
+            "effort_default": os.environ.get("JEV_REASONING_EFFORT", "low"),
+            "agent": os.environ.get("JEV_AGENT", "new"),
             "idle_min": self.idle_min,
         }
 
@@ -1153,7 +1188,7 @@ class SessionRunner:
     def _message_steps(self, run_id):
         with self.store.lock:
             return self.store.conn.execute(
-                "SELECT n, operation, target_label, url, ms, note FROM steps"
+                "SELECT n, operation, target_label, url, ms, note, detail FROM steps"
                 " WHERE task_id = ? ORDER BY n",
                 (run_id,),
             ).fetchall()
@@ -1212,7 +1247,7 @@ class SessionRunner:
                 return None, status
             time.sleep(0.2)
 
-    def submit_message(self, session_id, text, max_decisions=None, url=None):
+    def submit_message(self, session_id, text, max_decisions=None, url=None, model=None, effort=None):
         text = (text or "").strip()
         if not text or len(text) > 4000:
             raise ValueError("Enter a message of 1-4,000 characters")
@@ -1225,10 +1260,18 @@ class SessionRunner:
             parsed = urlparse(url)
             if parsed.scheme not in {"http", "https"} or not parsed.hostname:
                 raise ValueError("Enter an http(s) start URL")
+        model = (model or "").strip() or None
+        if model is not None and len(model) > 200:
+            raise ValueError("model must be a short string")
+        effort = (effort or "").strip() or None
+        if effort is not None and effort not in EFFORTS:
+            raise ValueError("effort must be low, medium, high, xhigh, or max")
         entry = self._entry(session_id)
         if entry is None:
             return None
         message_id = self.store.create_message(session_id, text)
+        if model is not None or effort is not None:
+            self.store.update_message(message_id, model=model, effort=effort)
         session = self.store.get_session(session_id, with_steps=False)
         if session is not None and len(session["messages"]) == 1:
             self.store.update_session(session_id, title=session_title(text))
@@ -1377,6 +1420,12 @@ class SessionRunner:
         if isinstance(config, dict):
             if max_decisions is not None:
                 config["max_decisions"] = max_decisions
+            message = self.store.get_message(run_id)
+            if message is not None:
+                if message.get("model"):
+                    config["model"] = message["model"]
+                if message.get("effort"):
+                    config["effort"] = message["effort"]
             files_dir = self.session_files_dir(session_id)
             config["files_dir"] = str(files_dir)
             allowed = config.setdefault("files", {})
@@ -1414,7 +1463,8 @@ class SessionRunner:
             "steps": [
                 {"n": item.get("step"), "operation": item.get("operation"),
                  "target_label": item.get("action"), "url": item.get("url"),
-                 "ms": item.get("elapsed_ms"), "note": item.get("note")}
+                 "ms": item.get("elapsed_ms"), "note": item.get("note"),
+                 "detail": item.get("detail")}
                 for item in new_entries
             ],
         })
@@ -1641,6 +1691,9 @@ class SessionRunner:
     def _record_new_steps(self, run_id, snapshot, recorded):
         history = snapshot.get("history") or []
         for entry in history[recorded:]:
+            detail = entry.get("detail")
+            if isinstance(detail, dict):
+                detail = json.dumps(detail)
             self.store.add_step(
                 run_id,
                 entry.get("step", recorded + 1),
@@ -1649,6 +1702,7 @@ class SessionRunner:
                 entry.get("url"),
                 entry.get("elapsed_ms"),
                 entry.get("note"),
+                detail if isinstance(detail, str) else None,
             )
         return len(history)
 
@@ -2010,7 +2064,8 @@ class Handler(BaseHTTPRequestHandler):
             key: body[key]
             for key in (
                 "browser_default", "max_decisions_default", "text_model",
-                "decision_provider", "server_token",
+                "decision_provider", "model_default", "effort_default",
+                "agent", "server_token",
             )
             if key in body
         })
@@ -2224,7 +2279,8 @@ class Handler(BaseHTTPRequestHandler):
             if path.startswith("/api/sessions/") and path.endswith("/messages"):
                 session_id = path.removeprefix("/api/sessions/").removesuffix("/messages")
                 message_id = self.RUNNER.submit_message(
-                    session_id, body.get("text"), body.get("max_decisions")
+                    session_id, body.get("text"), body.get("max_decisions"), None,
+                    body.get("model"), body.get("effort"),
                 )
                 if message_id is None:
                     return self.send(404, json.dumps({"error": "Unknown session"}))

@@ -45,6 +45,15 @@
                 <option value="local">local</option>
                 <option value="cloud">cloud</option>
               </select>
+              <input id="model-picker" title="Model for this turn (empty = default)" placeholder="model" size="22" />
+              <select id="effort-picker" title="Reasoning effort for this turn">
+                <option value="">effort</option>
+                <option value="low">low</option>
+                <option value="medium">medium</option>
+                <option value="high">high</option>
+                <option value="xhigh">xhigh</option>
+                <option value="max">max</option>
+              </select>
               <span id="composer-cost"></span>
               <span class="spacer"></span>
               <button id="send-btn" type="submit" class="primary">Send</button>
@@ -73,6 +82,8 @@
               <li><code>JEV_SERVER_TOKEN</code> requires a bearer token on every API call.</li>
               <li><code>JEV_SESSION_IDLE_MIN</code> (default 10) closes idle session browsers.</li>
               <li><code>JEV_CLOUD_SHOW_LIVE_URL=1</code> embeds the cloud live view.</li>
+              <li><code>JEV_AGENT=new</code> (default) runs the Beam loop; <code>classic</code> keeps TypeSafe+Mercury.</li>
+              <li><code>JEV_MODEL</code> (default Beam-1.0-501B-A23B) and <code>JEV_REASONING_EFFORT</code> (low–max).</li>
             </ul>
             <p>Keys stay in <code>.env</code> on the server. They are never shown here.</p>
           </div>
