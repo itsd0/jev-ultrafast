@@ -177,6 +177,33 @@ def score_link(label, url, nav, todo_words, tried):
     return score
 
 
+_CONFIRM_WORDS = frozenset({"done", "apply", "search", "submit", "save", "ok", "update", "show"})
+
+
+def is_confirm_label(label):
+    """A commit control (Done/Apply/Search/...), not a detour link."""
+    words = re.findall(r"[a-z0-9]+", (label or "").lower())
+    return any(word in _CONFIRM_WORDS for word in words)
+
+
+def excursion_for(action, before, after):
+    """A link click that left the page (host+path changed) is a detour candidate.
+
+    Query/fragment-only changes, submits, in-dialog clicks, and confirm-like
+    labels commit in-app state; backing those out reverts real work.
+    """
+    if action.get("kind") != "click" or action.get("role") != "link":
+        return None
+    from_url, at_url = before.get("url") or "", after.get("url") or ""
+    if normalize_link_url(from_url) == normalize_link_url(at_url):
+        return None
+    if is_confirm_label(action.get("label")):
+        return None
+    if before.get("modal_scoped"):
+        return None
+    return {"from": from_url, "at": at_url, "label": action.get("label") or "?"}
+
+
 def detect_control_stall(window):
     """The same control actuated 3x with no progress: the widget is not responding.
 
@@ -1411,17 +1438,10 @@ class Agent:
                 progress = (bool(switched) or not same_page(window, state["page"])) and not off_topic
                 window.append(loop_step(decision, action, state["page"], progress))
                 state["loop_window"] = window[-LOOP_WINDOW:]
-            if (
-                action.get("kind") == "click"
-                and state.get("subgoals") is not None
-                and state["page"].get("url") != page.get("url")
-            ):
-                state["excursion"] = {
-                    "from": page.get("url") or "",
-                    "at": state["page"].get("url") or "",
-                    "label": action.get("label") or "?",
-                    "page": state.get("page_current"),
-                }
+            if action.get("kind") == "click" and state.get("subgoals") is not None:
+                outing = excursion_for(action, page, state["page"])
+                if outing is not None:
+                    state["excursion"] = {**outing, "page": state.get("page_current")}
             if state["record"]:
                 (self.record_dir / f"{state['elapsed_ms']:06d}.jpg").write_bytes(
                     base64.b64decode(state["page"]["screenshot"])
@@ -1717,6 +1737,60 @@ class Agent:
         )
         self._maybe_go_back(state, url, gained, new_facts, step)
 
+    def _rejudge_after_back(self, state, step, left_url):
+        """A BACK can revert committed state: un-satisfy sub-goals whose evidence is gone.
+
+        Only evidence scoped to the page we are on, or the one we just left, is
+        checked. Evidence from other sites stays: leaving a site is not a revert.
+        """
+        page = state.get("page") or {}
+        here = normalize_link_url(page.get("url"))
+        left = normalize_link_url(left_url)
+        hay = " ".join(
+            " ".join(str(part).split())
+            for part in (page.get("title"), page.get("url"), page.get("text"))
+            if part
+        ).casefold()
+        reopened = []
+        for item in state.get("subgoals") or []:
+            if not item.get("satisfied"):
+                continue
+            source = normalize_link_url(item.get("source"))
+            if not source or source not in {here, left}:
+                continue
+            needle = " ".join(str(item.get("value") or "").split()).casefold()
+            if needle and needle not in hay:
+                item["satisfied"] = False
+                item.pop("value", None)
+                item.pop("source", None)
+                reopened.append(item["text"])
+        if reopened:
+            subgoals = state.get("subgoals") or []
+            self.trace.emit(
+                "progress", step=step,
+                satisfied=[item["text"] for item in subgoals if item.get("satisfied")],
+                todo=[item["text"] for item in subgoals if not item.get("satisfied")],
+                unsatisfied=reopened,
+            )
+
+    @staticmethod
+    def _release_reverted_control(state, label):
+        """The BACK undid a page change, not the control: keep it usable for the redo."""
+        want = norm_label(label)
+        if not want:
+            return
+
+        def live(key):
+            return key.split("\u0000")[1:2] != [want]
+
+        for store in ("held_actions", "hold_reasons", "noop_streak"):
+            kept = {key: value for key, value in (state.get(store) or {}).items() if live(key)}
+            if len(kept) != len(state.get(store) or {}):
+                state[store] = kept
+        for keys in (state.get("noop_page") or {}).values():
+            keys[:] = [key for key in keys if live(key)]
+        state["noop_noted"] = [key for key in state.get("noop_noted") or [] if live(key)]
+
     def _maybe_go_back(self, state, url, gained, new_facts, step=None):
         """A click that lands nowhere new is a detour: go BACK once and mark it tried."""
         step = len(state.get("history") or []) if step is None else step
@@ -1760,6 +1834,8 @@ class Agent:
         if norm and norm not in tried:
             tried.append(norm)
         state["tried_links"] = tried[-20:]
+        self._rejudge_after_back(state, step, excursion.get("at"))
+        self._release_reverted_control(state, excursion.get("label"))
         state["excursion"] = None
         add_event_note(state, f"Went back; '{excursion.get('label')}' led nowhere new.")
         self.trace.emit(
@@ -1791,6 +1867,8 @@ class Agent:
             state["page"] = state["browser"].observe(screenshot=self.screenshots)
         except (StalePage, RuntimeError) as error:
             self.log.info(f"[jev:captcha] could not go back ({error}); forcing navigation instead")
+        else:
+            self._rejudge_after_back(state, step, url)
         add_event_note(state, f"Captcha wall on {host or 'this page'}; leaving it alone.")
 
     def _validated_navigate_url(self, state, text, todo, step):

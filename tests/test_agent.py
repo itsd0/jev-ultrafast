@@ -1667,8 +1667,11 @@ def test_force_navigate_updates_suppression(runner):
     assert runner.state["force_navigate"] is False
 
 
-def test_excursion_recorded_on_navigating_click(runner):
+def test_excursion_recorded_on_navigating_link(runner):
     runner.state["subgoals"] = [{"id": 0, "text": "something"}]
+    go = next(a for a in runner.state["page"]["actions"] if a["id"] == "e3")
+    go["role"] = "link"
+    runner.state["page"]["fingerprint"] = fingerprint(runner.state["page"])
     moved = page()
     moved["url"] = "https://example.test/other"
     moved["fingerprint"] = fingerprint(moved)
@@ -1678,6 +1681,56 @@ def test_excursion_recorded_on_navigating_click(runner):
     runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
     assert runner.state["excursion"]["at"] == "https://example.test/other"
     assert runner.state["excursion"]["label"] == "Go"
+
+
+def test_excursion_ignores_commits_and_query_only_changes():
+    link = {"kind": "click", "role": "link", "label": "Gadget"}
+    before = {"url": "https://shop.test/s?q=1"}
+    assert loop.excursion_for(link, before, {"url": "https://shop.test/s?q=2"}) is None
+    assert loop.excursion_for(link, before, {"url": "https://shop.test/s?q=1#reviews"}) is None
+    button = {"kind": "click", "role": "button", "label": "Gadget"}
+    assert loop.excursion_for(button, before, {"url": "https://shop.test/itm/9"}) is None
+    done = {"kind": "click", "role": "link", "label": "Done"}
+    assert loop.excursion_for(done, before, {"url": "https://shop.test/itm/9"}) is None
+    show = {"kind": "click", "role": "link", "label": "Show details"}
+    assert loop.excursion_for(show, before, {"url": "https://shop.test/itm/9"}) is None
+    dialog = {"url": "https://shop.test/s?q=1", "modal_scoped": True}
+    assert loop.excursion_for(link, dialog, {"url": "https://shop.test/itm/9"}) is None
+    outing = loop.excursion_for(link, before, {"url": "https://shop.test/itm/9"})
+    assert (outing["from"], outing["at"], outing["label"]) == (
+        "https://shop.test/s?q=1", "https://shop.test/itm/9", "Gadget",
+    )
+
+
+def test_dialog_done_click_sets_no_excursion(runner):
+    runner.state["subgoals"] = [{"id": 0, "text": "something"}]
+    link = {"id": "e3", "kind": "click", "role": "link", "label": "Done", "node": 20}
+    runner.state["page"]["actions"] = [link, {"id": "wait", "kind": "wait", "label": "Wait"}]
+    runner.state["page"]["modal_scoped"] = True
+    runner.state["page"]["fingerprint"] = fingerprint(runner.state["page"])
+    moved = page()
+    moved["url"] = "https://example.test/other"
+    moved["fingerprint"] = fingerprint(moved)
+    runner.state["browser"].observe = Mock(return_value=moved)
+    runner.state["browser"].act = Mock(return_value={"executed": "e3"})
+    runner.state["decision"] = decision("e3")
+    runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    assert "excursion" not in runner.state
+
+
+def test_query_only_click_sets_no_excursion(runner):
+    runner.state["subgoals"] = [{"id": 0, "text": "something"}]
+    go = next(a for a in runner.state["page"]["actions"] if a["id"] == "e3")
+    go["role"] = "link"
+    runner.state["page"]["fingerprint"] = fingerprint(runner.state["page"])
+    moved = page()
+    moved["url"] = "https://example.test/?q=2"
+    moved["fingerprint"] = fingerprint(moved)
+    runner.state["browser"].observe = Mock(return_value=moved)
+    runner.state["browser"].act = Mock(return_value={"executed": "e3"})
+    runner.state["decision"] = decision("e3")
+    runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    assert "excursion" not in runner.state
 
 
 def test_maybe_go_back_rules(runner):
@@ -1714,6 +1767,57 @@ def test_maybe_go_back_rules(runner):
     runner._maybe_go_back(runner.state, "https://else.test/", False, [])
     assert browser.go_back.call_count == 1  # Back budget spent.
     assert runner.state["excursion"] is None
+
+
+def test_back_un_satisfies_only_reverted_evidence(runner):
+    browser = runner.state["browser"]
+    browser.go_back = Mock()
+    browser.wait_until_ready = Mock()
+    reverted = page()
+    reverted.update(url="https://fly.test/search", title="Search", text="1 adult, economy")
+    browser.observe = Mock(return_value=reverted)
+    runner.state["subgoals"] = [
+        {"id": 0, "text": "passengers", "satisfied": True, "value": "2 adults",
+         "source": "https://fly.test/search?a=1"},
+        {"id": 1, "text": "cabin", "satisfied": True, "value": "economy",
+         "source": "https://fly.test/search?a=1"},
+        {"id": 2, "text": "weather", "satisfied": True, "value": "31C",
+         "source": "https://other.test/wx"},
+    ]
+    runner.state["excursion"] = {"from": "https://fly.test/search", "at": "https://fly.test/away",
+                                 "label": "Gadget", "page": None}
+    runner._maybe_go_back(runner.state, "https://fly.test/away", False, ["unrelated story"])
+    assert browser.go_back.call_count == 1
+    goals = {item["text"]: item for item in runner.state["subgoals"]}
+    assert goals["passengers"]["satisfied"] is False
+    assert "value" not in goals["passengers"] and "source" not in goals["passengers"]
+    assert goals["cabin"]["satisfied"] is True
+    assert goals["weather"]["satisfied"] is True
+
+
+def test_back_releases_the_reverted_control(runner):
+    browser = runner.state["browser"]
+    browser.go_back = Mock()
+    browser.wait_until_ready = Mock()
+    browser.observe = Mock(return_value=page())
+    runner.state["subgoals"] = [{"id": 0, "text": "price of usb-c hub"}]
+    done_key = loop.noop_key({"kind": "click", "label": "Done", "role": "button"})
+    other_key = loop.noop_key({"kind": "click", "label": "Other", "role": "button"})
+    runner.state["held_actions"] = {done_key: 2, other_key: 2}
+    runner.state["hold_reasons"] = {done_key: "no-progress hold"}
+    runner.state["noop_streak"] = {done_key: 2}
+    runner.state["noop_page"] = {"https://example.test/": [done_key, other_key]}
+    runner.state["noop_noted"] = [done_key]
+    runner.state["excursion"] = {"from": "a", "at": "https://shop.test/itm/9",
+                                 "label": "Done", "page": None}
+    runner._maybe_go_back(runner.state, "https://shop.test/itm/9", False, ["unrelated story"])
+    assert browser.go_back.call_count == 1
+    assert done_key not in runner.state["held_actions"]
+    assert done_key not in runner.state["hold_reasons"]
+    assert done_key not in runner.state["noop_streak"]
+    assert done_key not in runner.state["noop_page"]["https://example.test/"]
+    assert done_key not in runner.state["noop_noted"]
+    assert runner.state["held_actions"] == {other_key: 2}
 
 
 def test_gate_holds_done_until_wind_down_with_todo(runner, monkeypatch):

@@ -387,6 +387,16 @@ def main():
         page = browser.observe(screenshot=False)
         assert (page.get("captcha_reason") or "").startswith("challenge "), page.get("captcha_reason")
         passed.append("captcha text and challenge iframe flag the page")
+
+        browser.call("Page.navigate", url="data:text/html," + quote("<title>First</title><p>first</p>"))
+        browser.wait_until_ready()
+        browser.call("Page.navigate", url="data:text/html," + quote("<title>Second</title><p>second</p>"))
+        browser.wait_until_ready()
+        browser.go_back()
+        browser.wait_until_ready()
+        page = browser.observe(screenshot=False)
+        assert page["title"] == "First", page["title"]
+        passed.append("go_back returns to the previous document")
     finally:
         browser.close()
     print("\n".join(passed))
