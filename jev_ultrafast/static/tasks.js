@@ -2,6 +2,9 @@ const $ = (id) => document.getElementById(id);
 let currentId = null;
 let liveAbort = null;
 let liveFor = null;
+let traceCache = { id: null, steps: -1, events: [] };
+let debugStep = null;
+const PHASE_COLORS = { snapshot: "#4c8caf", decision: "#4caf7d", text: "#c9a227", action: "#b06ab0", verify: "#777" };
 
 const escape = (value) =>
   String(value ?? "").replace(
@@ -117,11 +120,13 @@ function renderTask(task) {
   $("steps").innerHTML = task.steps
     .map(
       (s) =>
-        `<tr><td>${escape(s.n)}</td><td>${escape(s.operation)}</td>` +
+        `<tr data-n="${escape(s.n)}" class="${s.n === debugStep ? "selected" : ""}"><td>${escape(s.n)}</td>` +
+        `<td>${escape(s.operation)}</td>` +
         `<td>${escape(s.target_label)}${s.note ? ` <span title="${escape(s.note)}">*</span>` : ""}</td>` +
         `<td>${escape(s.ms)}</td></tr>`,
     )
     .join("");
+  refreshDebug(task, terminal);
   const lastUrl = task.steps.length ? task.steps[task.steps.length - 1].url : null;
   $("urlbar").textContent = task.final_url || lastUrl || task.url || "";
   if (!terminal && task.browser === "local") {
@@ -141,6 +146,98 @@ function renderTask(task) {
     }
   }
   return terminal;
+}
+
+async function refreshDebug(task, terminal) {
+  if (traceCache.id !== task.id || traceCache.steps !== task.steps.length) {
+    try {
+      const trace = await api(`/api/tasks/${task.id}/trace`);
+      traceCache = { id: task.id, steps: task.steps.length, events: trace.events || [] };
+    } catch (error) {
+      traceCache = { id: task.id, steps: task.steps.length, events: [] };
+    }
+  }
+  const events = traceCache.events;
+  const end = events.find((e) => e.kind === "end");
+  if (end && end.data.phases) {
+    const phases = end.data.phases;
+    const total = Object.values(phases).reduce((a, b) => a + b, 0) || 1;
+    $("phasebar").innerHTML = Object.entries(phases)
+      .map(
+        ([name, ms]) =>
+          `<span style="flex:${ms};background:${PHASE_COLORS[name] || "#555"}" ` +
+          `title="${escape(name)} ${escape(ms)}ms"></span>`,
+      )
+      .join("");
+    $("phasebar").title = `snapshot ${phases.snapshot}ms · decision ${phases.decision}ms · ` +
+      `text ${phases.text}ms · action ${phases.action}ms · verify ${phases.verify}ms (total ${total}ms)`;
+  } else {
+    $("phasebar").innerHTML = "";
+  }
+  if (terminal && (task.status === "blocked" || task.status === "failed") && !traceCache.shotDone) {
+    traceCache.shotDone = true;
+    try {
+      const response = await fetch(`/api/tasks/${task.id}/failshot`, { headers: headers() });
+      if (response.ok) {
+        const blob = await response.blob();
+        $("failshot").src = URL.createObjectURL(blob);
+        $("failshot").hidden = false;
+      }
+    } catch (error) {
+      /* No failure screenshot; the trace still explains the run. */
+    }
+  }
+  if (!task.steps.length || !events.length) {
+    if (!task.steps.length) $("debug-panel").hidden = true;
+    return;
+  }
+  $("debug-panel").hidden = false;
+  if (debugStep === null || !task.steps.some((s) => s.n === debugStep)) {
+    const failed = [...events].reverse().find((e) => e.kind === "verify" && e.data.success === false);
+    debugStep = failed ? failed.step : task.steps[task.steps.length - 1].n;
+  }
+  renderDebugStep(events);
+}
+
+function renderDebugStep(events) {
+  $("debug-step").textContent = `#${debugStep}`;
+  document.querySelectorAll("#steps tr[data-n]").forEach((row) => {
+    row.classList.toggle("selected", Number(row.dataset.n) === debugStep);
+  });
+  const at = events.filter((e) => e.step === debugStep);
+  const first = (kind) => at.find((e) => e.kind === kind);
+  const offered = first("offered");
+  const decision = first("decision");
+  const verify = first("verify");
+  const guards = at.filter((e) => e.kind === "guard");
+  let html = "";
+  if (offered) {
+    const rows = (offered.data.offered || [])
+      .map((c) => `[${escape(c.id)}] ${escape(c.label)} (${escape(c.role || c.kind)})`)
+      .join("\n");
+    html += `<h3>Offered (${offered.data.offered_count} controls)</h3><pre>${rows || "—"}</pre>`;
+    const hidden = { ...(offered.data.held || {}), ...(offered.data.suppressed || {}) };
+    if (Object.keys(hidden).length) {
+      html += `<h3>Held / suppressed</h3><pre>${escape(JSON.stringify(hidden, null, 1))}</pre>`;
+    }
+  }
+  if (decision) {
+    html += `<h3>Decision</h3><pre>${escape(JSON.stringify({
+      choice: decision.data.choice, operation: decision.data.operation,
+      confidence: decision.data.confidence, latency_ms: decision.data.latency_ms,
+      retries: decision.data.retries, invalid_reason: decision.data.invalid_reason,
+    }, null, 1))}</pre>`;
+  }
+  if (verify) {
+    html += `<h3>Verify (${verify.data.success ? "ok" : "FAILED"})</h3><pre>${escape(JSON.stringify({
+      before: verify.data.before, after: verify.data.after,
+      changed: verify.data.changed, next: verify.data.next_strategy,
+    }, null, 1))}</pre>`;
+  }
+  if (guards.length) {
+    html += `<h3>Guards</h3><pre>${escape(JSON.stringify(guards.map((g) => g.data), null, 1))}</pre>`;
+  }
+  $("debug").innerHTML = html || "<p>No trace events for this step yet.</p>";
 }
 
 async function refreshCurrent() {
@@ -210,10 +307,21 @@ $("history").addEventListener("click", async (event) => {
   const id = event.target.closest("[data-id]")?.dataset.id;
   if (!id) return;
   currentId = id;
+  traceCache = { id: null, steps: -1, events: [] };
+  debugStep = null;
+  $("failshot").hidden = true;
+  $("failshot").removeAttribute("src");
   stopStream();
   $("live").removeAttribute("src");
   await refreshCurrent();
   await refreshHistory();
+});
+
+$("steps").addEventListener("click", (event) => {
+  const row = event.target.closest("tr[data-n]");
+  if (!row) return;
+  debugStep = Number(row.dataset.n);
+  if (traceCache.events.length) renderDebugStep(traceCache.events);
 });
 
 $("token").value = sessionStorage.getItem("jev-token") || "";

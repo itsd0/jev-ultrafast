@@ -9,7 +9,6 @@ import hmac
 import json
 import os
 import sqlite3
-import sys
 import threading
 import time
 import uuid
@@ -25,6 +24,9 @@ from .agent import Agent
 from .config import env_bool
 from .demo import load_environment
 from .model import redact_secrets, token_counts
+from .trace import configure_logging, get_logger, trace_dir
+
+LOG = get_logger("server")
 
 ROOT = Path(__file__).parent
 TERMINAL = {"done", "blocked", "failed"}
@@ -64,6 +66,15 @@ CREATE TABLE IF NOT EXISTS steps (
     note TEXT
 );
 CREATE INDEX IF NOT EXISTS steps_task ON steps(task_id, n);
+CREATE TABLE IF NOT EXISTS events (
+    task_id TEXT NOT NULL REFERENCES tasks(id),
+    seq INTEGER NOT NULL,
+    step INTEGER,
+    kind TEXT NOT NULL,
+    ts_ms INTEGER NOT NULL,
+    data TEXT NOT NULL,
+    PRIMARY KEY (task_id, seq)
+);
 """
 
 
@@ -143,6 +154,30 @@ class Store:
             )
             self.conn.commit()
 
+    def add_events(self, task_id, rows):
+        """One buffered batch from a run's Trace. Old DBs gain the table on open."""
+        if not rows:
+            return
+        with self.lock:
+            self.conn.executemany(
+                "INSERT OR IGNORE INTO events (task_id, seq, step, kind, ts_ms, data)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                [(task_id, seq, step, kind, ts_ms, data) for seq, step, kind, ts_ms, data in rows],
+            )
+            self.conn.commit()
+
+    def get_events(self, task_id):
+        with self.lock:
+            rows = self.conn.execute(
+                "SELECT seq, step, kind, ts_ms, data FROM events WHERE task_id = ? ORDER BY seq",
+                (task_id,),
+            ).fetchall()
+        return [
+            {"seq": row[0], "step": row[1], "kind": row[2], "ts_ms": row[3],
+             "data": json.loads(row[4])}
+            for row in rows
+        ]
+
 
 def tally_tokens(snapshot):
     """Prompt/completion sums with the same usage keys as the measure scripts."""
@@ -192,11 +227,11 @@ def reclaim_daemon(name):
         return
     except Exception:
         pass
-    print(f"[jev:server] daemon {name} is stale; stopping it", file=sys.stderr, flush=True)
+    LOG.info(f"[jev:server] daemon {name} is stale; stopping it")
     try:
         harness_admin.restart_daemon(name)
     except Exception as error:
-        print(f"[jev:server] daemon stop failed: {error}", file=sys.stderr, flush=True)
+        LOG.warning(f"[jev:server] daemon stop failed: {error}")
 
 
 class Viewer:
@@ -393,7 +428,7 @@ class Runner:
         with self._cond:
             self._pending.append(task_id)
             self._cond.notify()
-        print(f"[jev:server] task {task_id[:8]} queued ({browser})", flush=True)
+        LOG.info(f"[jev:server] task {task_id[:8]} queued ({browser})")
         return task_id
 
     def stop(self, task_id):
@@ -423,20 +458,29 @@ class Runner:
             worker.start()
 
     def _create_agent(self, task):
-        # JEV_BROWSER is read once during construction. The lock plus restore
-        # keeps mixed local/cloud tasks from seeing each other's value.
+        # JEV_BROWSER and JEV_RUN_ID are read once during construction. The lock
+        # plus restore keeps mixed tasks from seeing each other's values.
         with self._create_lock:
-            previous = os.environ.get("JEV_BROWSER")
+            previous_browser = os.environ.get("JEV_BROWSER")
+            previous_run = os.environ.get("JEV_RUN_ID")
             os.environ["JEV_BROWSER"] = task["browser"]
+            os.environ["JEV_RUN_ID"] = task["id"]
             try:
                 agent = self.agent_factory(task["url"], task["goal"], screenshots=False)
             finally:
-                if previous is None:
+                if previous_browser is None:
                     os.environ.pop("JEV_BROWSER", None)
                 else:
-                    os.environ["JEV_BROWSER"] = previous
+                    os.environ["JEV_BROWSER"] = previous_browser
+                if previous_run is None:
+                    os.environ.pop("JEV_RUN_ID", None)
+                else:
+                    os.environ["JEV_RUN_ID"] = previous_run
         if task["max_decisions"] is not None:
             agent.config["max_decisions"] = task["max_decisions"]
+        trace = getattr(agent, "trace", None)
+        if trace is not None:
+            trace.attach(task["id"], self.store)
         return agent
 
     def _record_new_steps(self, task_id, snapshot, recorded):
@@ -453,7 +497,7 @@ class Runner:
             )
         return len(history)
 
-    def _finish(self, task_id, snapshot, status, error=None):
+    def _finish(self, task_id, snapshot, status, error=None, trace=None):
         prompt, completion = tally_tokens(snapshot)
         page = snapshot.get("page") or {}
         self.store.update_task(
@@ -472,11 +516,18 @@ class Runner:
             cost_usd_estimate=cost_estimate_usd(prompt, completion),
             error=error,
         )
-        print(
-            f"[jev:server] task {task_id[:8]} {status}"
-            f" tokens={prompt + completion} error={error or '-'}",
-            flush=True,
-        )
+        if trace is not None and not trace.ended:
+            trace.emit(
+                "end", step=len(snapshot.get("history") or []), status=status,
+                blocked_reason=snapshot.get("blocked_reason"), error=(error or "")[:200],
+                decisions=len(snapshot.get("decisions") or []),
+                input_tokens=prompt, output_tokens=completion,
+                cost_usd_estimate=cost_estimate_usd(prompt, completion),
+                wall_ms=snapshot.get("elapsed_ms"),
+                phases={phase: round(value) for phase, value in trace.phase_ms.items()},
+            )
+            trace.flush()
+        LOG.info(f"[jev:server] task {task_id[:8]} {status} tokens={prompt + completion} error={error or '-'}")
 
     def wait_for_viewer(self, task_id, timeout=20):
         """Like get_viewer, but waits out queueing and browser startup."""
@@ -526,8 +577,10 @@ class Runner:
             stopper = self._active[task_id]["stop"]
         self.store.update_task(task_id, status="running", started_at=time.time())
         agent = None
+        trace = None
         try:
             agent = self._create_agent(self.store.get_task(task_id))
+            trace = getattr(agent, "trace", None)
             with self._cond:
                 self._active[task_id]["agent"] = agent
                 self._active[task_id]["live_url"] = live_url_for(agent)
@@ -536,24 +589,33 @@ class Runner:
                 snapshot = agent.command("tick")
                 recorded = self._record_new_steps(task_id, snapshot, recorded)
                 if stopper.is_set():
-                    self._finish(task_id, snapshot, "blocked", "stopped by user")
+                    self._finish(task_id, snapshot, "blocked", "stopped by user", trace)
                     return
                 if snapshot.get("status") in TERMINAL - {"failed"}:
-                    self._finish(task_id, snapshot, snapshot["status"])
+                    self._finish(task_id, snapshot, snapshot["status"], trace=trace)
                     return
         except Exception as error:
             try:
                 snapshot = agent.snapshot() if agent is not None else {}
             except Exception:
                 snapshot = {}
+            if trace is not None:
+                trace.emit(
+                    "error", step=len((snapshot or {}).get("history") or []),
+                    type=type(error).__name__, message=str(error)[:300],
+                    where="run", retried=False,
+                )
             safe = str(redact_secrets(f"{type(error).__name__}: {error}"))[:500]
-            self._finish(task_id, snapshot if isinstance(snapshot, dict) else {}, "failed", safe)
+            snapshot = snapshot if isinstance(snapshot, dict) else {}
+            self._finish(task_id, snapshot, "failed", safe, trace)
         finally:
             if agent is not None:
                 try:
                     agent.close()
                 except Exception:
                     pass
+            if trace is not None:
+                trace.close()
             with self._cond:
                 entry = self._active.pop(task_id, None)
                 self._cond.notify()
@@ -569,13 +631,15 @@ class Handler(BaseHTTPRequestHandler):
     PORT = 8770
     TOKEN = ""
 
-    def send(self, status, content, mime="application/json"):
+    def send(self, status, content, mime="application/json", extra_headers=None):
         content = content if isinstance(content, bytes) else content.encode()
         self.send_response(status)
         self.send_header("Content-Type", mime)
         self.send_header("Content-Length", str(len(content)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
+        for name, value in (extra_headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(content)
 
@@ -615,6 +679,14 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200, json.dumps(self.STORE.list_tasks()))
         if path.startswith("/api/tasks/") and path.endswith("/live"):
             return self.stream_live(path.removeprefix("/api/tasks/").removesuffix("/live"))
+        if path.startswith("/api/tasks/") and path.endswith("/trace"):
+            return self.serve_trace(path.removeprefix("/api/tasks/").removesuffix("/trace"), download=False)
+        if path.startswith("/api/tasks/") and path.endswith("/trace.jsonl"):
+            return self.serve_trace(
+                path.removeprefix("/api/tasks/").removesuffix("/trace.jsonl"), download=True
+            )
+        if path.startswith("/api/tasks/") and path.endswith("/failshot"):
+            return self.serve_failshot(path.removeprefix("/api/tasks/").removesuffix("/failshot"))
         task_id = path.removeprefix("/api/tasks/")
         if "/" in task_id or not task_id:
             return self.send(404, json.dumps({"error": "Not found"}))
@@ -623,6 +695,36 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(404, json.dumps({"error": "Unknown task"}))
         task["live_url"] = self.RUNNER.live_url(task_id)
         return self.send(200, json.dumps(task))
+
+    def serve_trace(self, task_id, download):
+        if "/" in task_id or not task_id:
+            return self.send(404, json.dumps({"error": "Not found"}))
+        if self.STORE.get_task(task_id) is None:
+            return self.send(404, json.dumps({"error": "Unknown task"}))
+        events = self.STORE.get_events(task_id)
+        if not download:
+            return self.send(200, json.dumps({"task_id": task_id, "events": events}))
+        body = "".join(json.dumps(event) + "\n" for event in events)
+        return self.send(
+            200, body, "application/x-ndjson",
+            {"Content-Disposition": f'attachment; filename="trace-{task_id}.jsonl"'},
+        )
+
+    def serve_failshot(self, task_id):
+        if "/" in task_id or not task_id or not all(char.isalnum() or char == "-" for char in task_id):
+            return self.send(404, json.dumps({"error": "Not found"}))
+        if self.STORE.get_task(task_id) is None:
+            return self.send(404, json.dumps({"error": "Unknown task"}))
+        try:
+            shots = sorted(trace_dir(task_id).glob("fail-step-*.png"))
+        except OSError:
+            shots = []
+        if not shots:
+            return self.send(404, json.dumps({"error": "No failure screenshot"}))
+        try:
+            return self.send(200, shots[-1].read_bytes(), "image/png")
+        except OSError:
+            return self.send(404, json.dumps({"error": "No failure screenshot"}))
 
     def stream_live(self, task_id):
         viewer, status = self.RUNNER.wait_for_viewer(task_id)
@@ -698,6 +800,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     load_environment()
+    configure_logging()
     # Local tasks drive one pinned Chrome through our own daemon, in visible
     # tabs. BU_CDP_URL selects the Chrome (e.g. http://127.0.0.1:9222).
     os.environ.setdefault("BU_NAME", "jev-server")
@@ -719,7 +822,7 @@ def main():
     if host not in {"127.0.0.1", "localhost", "::1"} and not Handler.TOKEN:
         raise SystemExit(f"Refusing to bind {host} without JEV_SERVER_TOKEN")
     server = ThreadingHTTPServer((host, port), Handler)
-    print(f"Jev tasks: http://{host}:{port}/", flush=True)
+    LOG.info(f"Jev tasks: http://{host}:{port}/")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
