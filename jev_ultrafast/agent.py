@@ -246,33 +246,46 @@ def current_page_number(url, text):
     return int(match.group(1)) if match else None
 
 
-SUBGOAL_ACTIVATE_STEPS = 8
 MEMO_CAP = 20
 
 
-def distinct_hosts(history):
-    hosts = set()
-    for item in history or []:
-        try:
-            host = urlparse(item.get("url") or "").hostname or ""
-        except ValueError:
-            host = ""
-        if host:
-            hosts.add(host.lower())
-    return hosts
-
-
 def should_activate_subgoals(state):
-    """Multi-site or long runs get sub-goal tracking; simple runs skip the overhead."""
-    if state.get("subgoals") is not None:
-        return False
-    if len(distinct_hosts(state.get("history"))) >= 2:
-        return True
-    return len(state.get("history") or []) >= SUBGOAL_ACTIVATE_STEPS
+    """Decompose once, on the first progress check, before any model decision."""
+    return state.get("subgoals") is None and not state.get("_decomposed")
+
+
+_REQUIRED_CUE = re.compile(r"\b(must|needs?|requires?|required)\b", re.IGNORECASE)
+_GOAL_VERBS = frozenset({"find", "get", "search", "look", "show", "list", "report", "give", "tell",
+                          "open", "visit", "go", "see", "check"})
+_AND_SPLIT = re.compile(r"\s+and\s+|\s*;\s*|\s+then\s+|\s*&\s*", re.IGNORECASE)
+
+
+def split_requirements(text, existing=()):
+    """One deterministic 'and'-split into 2-4 flat items. Single level: never recurses.
+
+    Pieces without enough structure stay glued to the goal text (no split).
+    Against an existing partial set, pieces it already covers are dropped.
+    """
+    parts = [part.strip(" ,") for part in _AND_SPLIT.split(text or "") if part.strip(" ,")]
+    if len(parts) < 2:
+        return [text] if (text or "").strip() else []
+    if len(parts) > 4:
+        parts = parts[:3] + [" and ".join(parts[3:])]
+    if not existing:
+        return parts
+    union = set()
+    for item in existing:
+        union |= _score_words(item)
+    return [part for part in parts if _score_words(part) and not _score_words(part) <= union]
 
 
 def apply_judgment(state, judgment, source_url):
-    """Fold satisfied sub-goals (with evidence) and new facts into the run."""
+    """Fold satisfied sub-goals (with evidence) and new facts into the run.
+
+    Required items need the judge's copied value. Nice-to-have items are also
+    satisfied by a memo fact covering every content word: the fact itself is
+    the copied evidence, with its exact source URL.
+    """
     subgoals = state.get("subgoals") or []
     by_id = {item["id"]: item for item in subgoals}
     for item in judgment.get("satisfied") or []:
@@ -288,6 +301,18 @@ def apply_judgment(state, judgment, source_url):
             seen.add(fact)
             memo.append({"fact": fact, "source": source_url})
     state["memo"] = memo[-MEMO_CAP:]
+    for item in subgoals:
+        if item.get("satisfied") or item.get("required", True):
+            continue
+        need = _score_words(item["text"]) - _GOAL_VERBS
+        if not need:
+            continue
+        for fact in state["memo"]:
+            if need <= _score_words(fact["fact"]):
+                item["satisfied"] = True
+                item["value"] = fact["fact"]
+                item["source"] = fact.get("source") or source_url
+                break
     state["leave_site"] = bool(judgment.get("leave_site"))
     state["leave_site_url"] = source_url
 
@@ -311,9 +336,18 @@ def compose_guidance(state):
     subgoals = state.get("subgoals") or []
     if subgoals:
         done = [f"{item['text']} ({item['value']})" for item in subgoals if item.get("satisfied")]
-        todo = [item["text"] for item in subgoals if not item.get("satisfied")]
-        if todo:
-            guidance.append(f"Done: {'; '.join(done) or 'nothing yet'}. Still need: {'; '.join(todo)}")
+        must = [
+            item["text"] for item in subgoals
+            if not item.get("satisfied") and item.get("required", True)
+        ]
+        nice = [
+            item["text"] for item in subgoals
+            if not item.get("satisfied") and not item.get("required", True)
+        ]
+        if must:
+            guidance.append(f"Done: {'; '.join(done) or 'nothing yet'}. Must still: {'; '.join(must)}")
+        if nice:
+            guidance.append(f"Nice to have: {'; '.join(nice)}")
     memo = state.get("memo") or []
     if memo:
         known = f"Known facts ({len(memo)}): " + "; ".join(item["fact"] for item in memo[-8:])
@@ -767,7 +801,8 @@ class Agent:
             return choose(page, state["goal"], state["history"], guidance=compose_guidance(state))
         fresh_requirements = state.get("requirements_goal") != state["goal"]
         if fresh_requirements:
-            state["requirements"] = decompose_goal(state["goal"])
+            cached = state.get("_decomposed")
+            state["requirements"] = list(cached) if cached else decompose_goal(state["goal"])
             state["requirements_goal"] = state["goal"]
             state["requirement_progress"] = {}
         decision = choose_mercury(
@@ -1678,8 +1713,16 @@ class Agent:
         step = len(state.get("history") or []) if step is None else step
         if should_activate_subgoals(state):
             started = time.perf_counter()
-            items = decompose_goal(state["goal"])
-            state["subgoals"] = [{"id": index, "text": text} for index, text in enumerate(items)]
+            items = []
+            for text in decompose_goal(state["goal"]):
+                for part in split_requirements(text, [item["text"] for item in items]):
+                    items.append({
+                        "id": len(items), "text": part,
+                        "required": bool(_REQUIRED_CUE.search(part)),
+                    })
+            state["_decomposed"] = [item["text"] for item in items]
+            if len(items) > 1:
+                state["subgoals"] = items
             state["text_calls"].append(
                 {
                     "model": os.environ.get("TEXT_MODEL", "mercury-2.5"),
@@ -1696,8 +1739,8 @@ class Agent:
                 field_label=None, value=None,
             )
             self.trace.emit(
-                "progress", step=step, subgoals=[item["text"] for item in state["subgoals"]],
-                satisfied=[], todo=[item["text"] for item in state["subgoals"]],
+                "progress", step=step, subgoals=[item["text"] for item in items],
+                satisfied=[], todo=[item["text"] for item in items],
                 facts_added=[], leave_site=False, complete=False,
             )
         if state.get("subgoals") is None:
@@ -1706,6 +1749,37 @@ class Agent:
         if url == state.get("judged_url"):
             return
         if step - state.get("judged_step", -9) < 3:
+            return
+        todos = [item for item in state.get("subgoals") or [] if not item.get("satisfied")]
+        todo_words = [_score_words(item["text"]) for item in todos]
+        page_words = _score_words(" ".join(
+            part for part in (state["page"].get("title"), state["page"].get("url"), state["page"].get("text"))
+            if part
+        ))
+        if (
+            todos
+            and any(todo_words)
+            and not any(words & page_words for words in todo_words)
+            and not state["page"].get("modal_scoped")
+            and not state["page"].get("overlay")
+        ):
+            # Nothing here speaks the todo's language: skip the judge call.
+            # complete=False (todos remain); leave_site=True (go look elsewhere).
+            state["judged_url"] = url
+            state["judged_step"] = step
+            apply_judgment(state, {"satisfied": [], "facts": [], "leave_site": True}, url)
+            subgoals = state.get("subgoals") or []
+            self.trace.emit(
+                "progress", step=step,
+                subgoals=[item["text"] for item in subgoals],
+                satisfied=[
+                    {"text": item["text"], "value": item.get("value"), "source": item.get("source")}
+                    for item in subgoals if item.get("satisfied")
+                ],
+                todo=[item["text"] for item in subgoals if not item.get("satisfied")],
+                facts_added=[], leave_site=True, complete=False, early_exit=True,
+            )
+            self._maybe_go_back(state, url, False, [], step)
             return
         state["judged_url"] = url
         state["judged_step"] = step

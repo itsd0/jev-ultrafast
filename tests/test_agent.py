@@ -1390,14 +1390,112 @@ def test_subgoals_activate_on_second_host(runner, monkeypatch):
     assert calls == ["Find a book"]
 
 
-def test_subgoals_skip_simple_runs(runner, monkeypatch):
-    def boom(goal):
-        raise AssertionError("must not decompose a simple run")
+def test_subgoals_decompose_on_first_tick_before_any_decision(runner, monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        loop, "decompose_goal", lambda goal: calls.append("decompose") or ["one", "two"]
+    )
+    monkeypatch.setattr(loop, "judge_progress", lambda context, system: _judgment())
+    monkeypatch.setattr(
+        loop, "choose", lambda *_args, **kwargs: calls.append("choose") or decision("e3")
+    )
+    runner.command("predict", {})
+    assert calls == ["decompose", "choose"]
+    assert [item["text"] for item in runner.state["subgoals"]] == ["one", "two"]
+    assert runner.state["_decomposed"] == ["one", "two"]
 
-    monkeypatch.setattr(loop, "decompose_goal", boom)
+
+def test_single_requirement_stays_dormant(runner, monkeypatch):
+    monkeypatch.setattr(loop, "decompose_goal", lambda goal: ["Find a book"])
+    monkeypatch.setattr(loop, "judge_progress", Mock(side_effect=AssertionError("no judge call")))
     monkeypatch.setattr(loop, "choose", lambda *_args, **kwargs: decision("e3"))
     runner.command("predict", {})
     assert runner.state.get("subgoals") is None
+    assert runner.state["_decomposed"] == ["Find a book"]
+
+
+def test_split_requirements_is_one_level_and_deduped():
+    assert loop.split_requirements("Find the population of Bangkok, then find its weather") == [
+        "Find the population of Bangkok", "find its weather",
+    ]
+    assert loop.split_requirements("A and B and C and D and E") == ["A", "B", "C", "D and E"]
+    assert loop.split_requirements("Find a book") == ["Find a book"]
+    assert loop.split_requirements("") == []
+    assert loop.split_requirements("hotels in Lisbon and 2 adults", ["search hotels in Lisbon"]) == [
+        "2 adults",
+    ]
+
+
+def test_model_single_item_is_split_into_subgoals(runner, monkeypatch):
+    monkeypatch.setattr(
+        loop, "decompose_goal", lambda goal: ["find the population of Bangkok, then find its weather"]
+    )
+    monkeypatch.setattr(loop, "judge_progress", lambda context, system: _judgment())
+    monkeypatch.setattr(loop, "choose", lambda *_args, **kwargs: decision("e3"))
+    runner.command("predict", {})
+    assert [item["text"] for item in runner.state["subgoals"]] == [
+        "find the population of Bangkok", "find its weather",
+    ]
+
+
+def test_required_cue_verbs_mark_strict_items():
+    state = {
+        "subgoals": [
+            {"id": 0, "text": "must find the price", "required": True},
+            {"id": 1, "text": "find the seller rating", "required": False},
+        ],
+        "memo": [],
+    }
+    loop.apply_judgment(
+        state,
+        {"satisfied": [], "facts": ["seller rating 98% from the listing page"]},
+        "https://shop.test/item",
+    )
+    assert state["subgoals"][0].get("satisfied") is not True
+    assert state["subgoals"][1]["satisfied"] is True
+    assert state["subgoals"][1]["value"] == "seller rating 98% from the listing page"
+    assert state["subgoals"][1]["source"] == "https://shop.test/item"
+    guidance = loop.compose_guidance({**state, "history": [], "goal": "g"})
+    assert any("Must still: must find the price" in line for line in guidance)
+
+
+def test_evidence_rules_survive_in_prompts():
+    from jev_ultrafast.questions import DECOMPOSE_SYSTEM, TRACK_SYSTEM
+
+    assert "neutral imperative" in DECOMPOSE_SYSTEM
+    assert "no nested sub-plans" in DECOMPOSE_SYSTEM
+    assert "copied" in TRACK_SYSTEM and "exact page URL" in TRACK_SYSTEM
+    assert "must match the sub-goal's item" in TRACK_SYSTEM
+    assert "same items on both sides" in TRACK_SYSTEM
+
+
+def test_judge_early_exits_without_overlap(runner, monkeypatch):
+    judge = Mock(return_value=_judgment())
+    monkeypatch.setattr(loop, "decompose_goal", lambda goal: ["population of Bangkok", "Bangkok weather"])
+    monkeypatch.setattr(loop, "judge_progress", judge)
+    monkeypatch.setattr(loop, "choose", lambda *_args, **kwargs: decision("e3"))
+    runner.command("predict", {})
+    judge.assert_not_called()
+    assert runner.state["leave_site"] is True
+    assert runner.state["judged_url"] == "https://example.test/"
+
+
+def test_judge_runs_with_overlap_or_dialog(runner, monkeypatch):
+    judge = Mock(return_value=_judgment())
+    monkeypatch.setattr(loop, "decompose_goal", lambda goal: ["population of Bangkok", "Bangkok weather"])
+    monkeypatch.setattr(loop, "judge_progress", judge)
+    monkeypatch.setattr(loop, "choose", lambda *_args, **kwargs: decision("e3"))
+    runner.state["page"]["text"] = "Bangkok weather today"
+    runner.command("predict", {})
+    judge.assert_called_once()
+    runner.state["page"]["text"] = "Search"
+    runner.state["page"]["modal_scoped"] = True
+    runner.state["judged_url"] = None
+    runner.state["judged_step"] = -9
+    runner.state["status"] = "ready"
+    runner.state["decision"] = None
+    runner.command("predict", {})
+    assert judge.call_count == 2
 
 
 def test_apply_judgment_folds_evidence_and_memo():

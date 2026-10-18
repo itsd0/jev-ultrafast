@@ -49,10 +49,13 @@ only asked to reach a page, return its title and URL. If the requested informati
 what is missing instead of guessing. No commentary or browser actions."""
 
 TRACK_SYSTEM = """Track progress on a multi-part browser goal. Given the ordered sub-goals, the current
-page, and recent actions, return which sub-goals are now satisfied WITH the exact value seen (numbers,
-names, prices: copy them exactly), plus any other durable facts for the goal worth remembering. Never
-invent values: only report what the page or actions show. If nothing new, return empty lists. Also say
-whether the next unsatisfied sub-goal needs leaving this site (true) or can be done here (false)."""
+page, and recent actions, return which sub-goals are now satisfied WITH the exact value seen.
+Evidence rules: the value is text copied from the page or actions, never invented; its source is
+the exact page URL it was seen on. The entity in the value must match the sub-goal's item (a price
+for the named product, weather for the named city). For comparisons, both sides must
+cover the same items on both sides. Also report any other durable facts for the goal. If nothing new, return
+empty lists. Also say whether the next unsatisfied sub-goal needs leaving this site (true) or can
+be done here (false)."""
 
 GATE_SYSTEM = """The browser agent declares the goal DONE. Confirm ONLY if the current page, the satisfied
 sub-goals, and the collected facts show every part of the goal is complete. If any part is missing or
@@ -64,7 +67,8 @@ MAX_STEPS = 60
 DECOMPOSE_SYSTEM = (
     "Split the browser task into atomic, independently checkable requirements. "
     "Each filter, field value, toggle, selection, and final page/result is its own requirement. "
-    "Phrase each as a visible end-state (e.g. 'Destination search applied with value X'). No commentary."
+    "Phrase each as a neutral imperative end-state (e.g. 'Find the population of Bangkok'). "
+    "One flat list, no nested sub-plans. No commentary."
 )
 
 MERCURY_RULE_EXTRA = (

@@ -923,7 +923,11 @@ def track_context(goal, subgoals, memo, page, history):
     return {
         "goal": goal,
         "subgoals": [
-            {"id": item["id"], "text": item["text"], "satisfied": bool(item.get("satisfied"))}
+            {
+                "id": item["id"], "text": item["text"],
+                "satisfied": bool(item.get("satisfied")),
+                "required": bool(item.get("required", True)),
+            }
             for item in subgoals
         ],
         "known_facts": [item["fact"] for item in memo][-12:],
