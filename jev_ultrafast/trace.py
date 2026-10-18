@@ -31,7 +31,9 @@ SECRET_ENV_NAMES = (
     "VISION_API_KEY",
     "BROWSER_USE_API_KEY",
     "JEV_SERVER_TOKEN",
+    "REFLECTION_API_KEY",
 )
+SECRET_ENV_PREFIXES = ("JEV_SECRET_",)
 SECRET_KEY = re.compile(
     r"(?i)^(authorization|x-browser-use-api-key|api[_\- ]?key|token|.*[_\-]token|.*Token"
     r"|.*secret.*|password|passwd|pwd)$"
@@ -89,6 +91,9 @@ def scrub(value, _secrets=None):
     try:
         if _secrets is None:
             _secrets = [os.environ.get(name) or "" for name in SECRET_ENV_NAMES]
+            for env_name, env_value in os.environ.items():
+                if env_name.startswith(SECRET_ENV_PREFIXES) and "_DOMAINS" not in env_name:
+                    _secrets.append(env_value or "")
             _secrets = [secret for secret in _secrets if len(secret) >= 8]
         if isinstance(value, dict):
             return {

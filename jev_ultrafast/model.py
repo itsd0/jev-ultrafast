@@ -194,7 +194,15 @@ def redact_secrets(value):
         redacted = value
         if redacted.lower().startswith("bearer "):
             return "Bearer [redacted]"
-        for name in ("INCEPTION_API_KEY", "TYPESAFE_API_KEY", "TEXT_MODEL_API_KEY", "VISION_API_KEY"):
+        names = [
+            "INCEPTION_API_KEY", "TYPESAFE_API_KEY", "TEXT_MODEL_API_KEY",
+            "VISION_API_KEY", "REFLECTION_API_KEY",
+        ]
+        names.extend(
+            name for name in os.environ
+            if name.startswith("JEV_SECRET_") and "_DOMAINS" not in name
+        )
+        for name in names:
             secret = os.environ.get(name) or ""
             if len(secret) >= 8:
                 redacted = redacted.replace(secret, "[redacted]")
