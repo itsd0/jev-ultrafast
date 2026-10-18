@@ -160,6 +160,183 @@ def test_loop_detector_fires_twice_then_blocks(runner, monkeypatch):
     assert any("loop detected" in (h.get("note") or "") for h in runner.state["history"])
 
 
+def _click_step(label, progress=False):
+    return {
+        "key": ("CLICK", label, "u", "t"),
+        "id": label, "label": label, "kind": "click", "role": "button",
+        "progress": progress,
+    }
+
+
+def test_pair_key_groups_inverse_labels():
+    from jev_ultrafast.agent import pair_key
+
+    assert pair_key("Add adult")[:2] == ("adult", 0)
+    assert pair_key("Remove adult")[:2] == ("adult", 0)
+    assert pair_key("Add adult")[2] != pair_key("Remove adult")[2]
+    assert pair_key("+")[:2] == pair_key("−")[:2]  # unicode minus pairs with plus
+    assert pair_key("Search") is None
+
+
+def test_detect_oscillation_rules():
+    from jev_ultrafast.agent import detect_oscillation
+
+    found = detect_oscillation([_click_step(label) for label in ("Add adult", "Remove adult") * 3])
+    assert found["object"] == "adult"
+    assert found["flips"] == 5
+    assert set(found["labels"]) == {"Add adult", "Remove adult"}
+    assert len(found["keys"]) == 2
+    symbols = detect_oscillation([_click_step(label) for label in ("+", "−") * 3])
+    assert symbols["object"] == ""
+    assert symbols["flips"] == 5
+    one_sided = [_click_step("Add adult")] * 5 + [_click_step("Remove adult")]
+    assert detect_oscillation(one_sided) is None  # one flip only
+    progressed = [
+        _click_step(label, progress=(index == 2))
+        for index, label in enumerate(("Add adult", "Remove adult") * 3)
+    ]
+    assert detect_oscillation(progressed) is None
+    scattered = [_click_step(label) for label in ("Add adult", "Search", "Go", "Wait", "Add adult", "Search")]
+    assert detect_oscillation(scattered) is None  # shared by 2 of 6 only
+    scrolls = {"key": ("SCROLL", "Scroll down", "u", "t"), "label": "Scroll down",
+               "kind": "scroll", "progress": False}
+    few_clicks = [_click_step(label) for label in ("Add adult", "Remove adult", "Add adult")]
+    assert detect_oscillation(few_clicks + [scrolls] * 3) is None  # scrolls are not clicks
+
+
+def test_oscillation_hold_and_note_in_predict(runner, monkeypatch):
+    monkeypatch.setattr(loop, "choose", lambda *_args, **_kwargs: decision("e3"))
+    monkeypatch.setattr(loop, "decompose_goal", lambda goal: ["goal"])
+    runner.state["page"]["actions"].extend([
+        {"id": "e4", "kind": "click", "label": "Add adult", "role": "button", "value": "2", "node": 30},
+        {"id": "e5", "kind": "click", "label": "Remove adult", "role": "button", "value": "2", "node": 31},
+        {"id": "e6", "kind": "click", "label": "Done", "role": "button", "node": 32},
+    ])
+    labels = ("Add adult", "Add adult", "Remove adult", "Add adult", "Remove adult", "Remove adult")
+    runner.state["loop_window"] = [_click_step(label) for label in labels]
+    runner.command("predict", {})
+    held = runner.state["held_actions"] or {}
+    add = loop.noop_key({"kind": "click", "label": "Add adult", "role": "button"})
+    remove = loop.noop_key({"kind": "click", "label": "Remove adult", "role": "button"})
+    assert add in held and remove in held
+    assert runner.state["hold_reasons"][add] == "oscillation hold"
+    note = runner.state["event_notes"][-1]["text"]
+    assert "alternated" in note and "Current value: 2" in note and "Done" in note
+
+
+def test_detect_pingpong_rules():
+    from jev_ultrafast.agent import detect_pingpong
+
+    assert detect_pingpong(["a", "b"] * 2) == {"pair": ["a", "b"]}
+    assert detect_pingpong(["a", "b"] * 3) == {"pair": ["a", "b"]}
+    assert detect_pingpong(["a", "a", "b", "b"]) is None
+    assert detect_pingpong(["a", "b", "c"]) is None
+    assert detect_pingpong(["a", "b", "a", "c"]) is None
+
+
+def test_pingpong_excludes_both_urls_once(runner, monkeypatch):
+    monkeypatch.setattr(loop, "choose", lambda *_args, **_kwargs: decision("e3"))
+    monkeypatch.setattr(loop, "decompose_goal", lambda goal: ["goal"])
+    runner.state["visited_urls"] = ["a.test/x", "b.test/y"] * 2
+    runner.command("predict", {})
+    assert set(runner.state["failed_urls"]) == {"a.test/x", "b.test/y"}
+    assert any("somewhere new" in note["text"] for note in runner.state["event_notes"])
+    notes_before = len(runner.state["event_notes"])
+    runner.command("predict", {})
+    assert len(runner.state["event_notes"]) == notes_before  # no refire without new visits
+
+
+def test_scroll_watch_rules():
+    from jev_ultrafast.agent import SCROLL_EXHAUSTED_COUNT, scroll_exhausted, update_scroll_watch
+
+    watch = None
+    for _ in range(SCROLL_EXHAUSTED_COUNT - 1):
+        watch = update_scroll_watch(watch, "p", 0, 0)
+    assert scroll_exhausted(watch, 0, 0) is False
+    watch = update_scroll_watch(watch, "p", 0, 0)
+    assert scroll_exhausted(watch, 0, 0) is True
+    assert scroll_exhausted(watch, 1, 0) is False  # a new fact excuses the streak
+    assert scroll_exhausted(watch, 0, 1) is False  # sub-goal progress excuses it
+    assert update_scroll_watch(watch, "p", 1, 0)["count"] == 1  # new facts restart
+    assert update_scroll_watch(watch, "other", 0, 0)["count"] == 1  # a new page restarts
+
+
+def test_scroll_exhaustion_holds_scrolls_in_act(runner):
+    scroll = {"id": "s1", "kind": "scroll", "label": "Scroll down page", "role": None, "node": 9}
+    runner.state["page"]["actions"].append(scroll)
+    runner.state["scroll_watch"] = {
+        "key": loop.normalize_link_url(runner.state["page"]["url"]),
+        "count": 3, "memo": 0, "satisfied": 0,
+    }
+    runner.state["decision"] = {**decision("s1"), "operation": "SCROLL_DOWN"}
+    runner.state["browser"].act.return_value = {"executed": "s1"}
+    runner.state["browser"].observe.return_value = {**runner.state["page"], "fingerprint": "fp2"}
+    runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    assert loop.noop_key(scroll) in (runner.state["held_actions"] or {})
+    assert any("exhausted" in note["text"] for note in runner.state["event_notes"])
+
+
+def test_stem_strips_plurals():
+    from jev_ultrafast.agent import _stem
+
+    assert _stem("filters") == "filter"
+    assert _stem("cities") == "city"
+    assert _stem("passes") == "pass"
+    assert _stem("churches") == "church"
+    assert _stem("houses") == "house"
+    assert _stem("class") == "class"
+    assert _stem("gas") == "gas"
+    assert _stem("plus") == "plus"
+
+
+def test_guidance_ranks_buttons_and_stems_plurals():
+    from jev_ultrafast.agent import compose_guidance
+
+    state = {
+        "history": [], "event_notes": [],
+        "subgoals": [{"id": 0, "text": "set the filters", "required": True}],
+        "page": {"actions": [
+            {"id": "e1", "kind": "click", "role": "button", "label": "Filter"},
+            {"id": "e2", "kind": "click", "role": "link", "label": "Help"},
+        ]},
+    }
+    guidance = compose_guidance(state)
+    assert any("Filter" in line and "consider" in line for line in guidance)
+
+
+def test_done_runs_the_judge_on_demand(runner, monkeypatch):
+    calls = []
+
+    def fake_judge(context, system):
+        calls.append(system)
+        return (
+            {"satisfied": [{"id": 0, "value": "9M"}], "facts": [], "complete": True, "missing": ""},
+            {"model": "t", "latency_ms": 1, "usage": {}},
+        )
+
+    monkeypatch.setattr(loop, "judge_progress", fake_judge)
+    runner.state["subgoals"] = [{"id": 0, "text": "population", "required": True}]
+    runner.state["judged_url"] = runner.state["page"]["url"]  # the throttle would skip
+    runner.state["judged_step"] = 99
+    verdict = runner._done_verdict(runner.state, runner.state["page"], 1)
+    assert calls  # judged despite the throttle
+    assert verdict["accept"] is True
+
+
+def test_unblock_scroll_emits_action_and_verify(runner):
+    events = []
+    runner.trace.emit = lambda event, **fields: events.append((event, fields))
+    scroll = {"id": "scroll_down", "kind": "scroll", "label": "Scroll down page", "node": 7}
+    runner.state["page"]["actions"].append(scroll)
+    runner.state["browser"].act.return_value = {"executed": "scroll_down"}
+    runner.state["browser"].observe.return_value = {**runner.state["page"], "fingerprint": "fp2"}
+    assert runner._unblock_scroll(runner.state, runner.state["page"], decision("BLOCKED")) is True
+    by_kind = {event: fields for event, fields in events}
+    assert by_kind["action"]["strategy"] == "unblock"
+    assert by_kind["verify"]["kind"] == "scroll"
+    assert by_kind["verify"]["success"] is True
+
+
 def test_decision_budget_stops_cleanly(runner, monkeypatch):
     ids = ["e2", "e3"]
     monkeypatch.setattr(
@@ -1601,16 +1778,33 @@ def test_guidance_reaches_typesafe_body():
 
 def test_winding_down_flags_at_75_percent(runner, monkeypatch):
     runner.config = {"max_decisions": 4}
-    runner.state["decisions"] = [{}, {}, {}]
+    runner.state["history"] = [{}, {}, {}]
     monkeypatch.setattr(loop, "choose", lambda *_args, **_kwargs: decision("e3"))
     runner.command("predict", {})
     assert runner.state["winding_down"] is True
     assert runner.state["status"] == "predicted"
 
 
-def test_budget_stop_attaches_partial_answer(runner, monkeypatch):
+def test_stale_decisions_do_not_spend_the_action_budget(runner, monkeypatch):
     runner.config = {"max_decisions": 2}
     runner.state["decisions"] = [{}, {}]
+    runner.state["history"] = []
+    monkeypatch.setattr(loop, "choose", lambda *_args, **_kwargs: decision("e3"))
+    runner.command("predict", {})
+    assert runner.state["status"] == "predicted"
+    assert runner.state.get("winding_down") is not True
+
+
+def test_stale_cap_blocks_the_run(runner):
+    runner.state["stale_used"] = loop.STALE_CAP
+    runner.command("predict", {})
+    assert runner.state["status"] == "blocked"
+    assert runner.state["blocked_reason"] == "stale budget"
+
+
+def test_budget_stop_attaches_partial_answer(runner, monkeypatch):
+    runner.config = {"max_decisions": 2}
+    runner.state["history"] = [{}, {}]
     runner.state["memo"] = [{"fact": "Mercury has 0 moons", "source": "https://example.test/"}]
     seen = {}
 

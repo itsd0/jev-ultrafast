@@ -80,6 +80,7 @@ LOOP_REPEATS = 2
 LOOP_HOLD_STEPS = 3
 LOOP_STOP_FIRES = 3
 DEFAULT_MAX_DECISIONS = 80
+STALE_CAP = 10
 
 
 def loop_step(decision, action, page, progress):
@@ -155,12 +156,24 @@ _SCORE_STOPWORDS = frozenset(
 )
 
 
-def _score_words(text):
-    return {
+def _stem(word):
+    """A plural strip for matching: filters->filter, cities->city, passes->pass."""
+    if len(word) > 4 and word.endswith("ies"):
+        return word[:-3] + "y"
+    if len(word) > 4 and word.endswith(("ches", "shes", "sses", "xes", "zes")):
+        return word[:-2]
+    if len(word) > 3 and word.endswith("s") and not word.endswith(("ss", "us")):
+        return word[:-1]
+    return word
+
+
+def _score_words(text, stem=False):
+    words = {
         word
         for word in re.findall(r"[a-z0-9]+", (text or "").lower())
         if word not in _SCORE_STOPWORDS and len(word) > 1
     }
+    return {_stem(word) for word in words} if stem else words
 
 
 def normalize_link_url(url):
@@ -173,10 +186,12 @@ def normalize_link_url(url):
     return (parsed.hostname.lower() + (parsed.path or "").rstrip("/")).rstrip("/")
 
 
-def score_link(label, url, nav, todo_words, tried):
+def score_link(label, url, nav, todo_words, tried, stem=False):
     """Rank a link for the current sub-goal. Result items win by word overlap;
     nav chrome and already-tried detours lose."""
-    score = 2 * len(todo_words & _score_words(label)) + len(todo_words & _score_words(url))
+    score = 2 * len(todo_words & _score_words(label, stem=stem)) + len(
+        todo_words & _score_words(url, stem=stem)
+    )
     if nav:
         score -= 4
     if normalize_link_url(url) in tried:
@@ -227,6 +242,106 @@ def detect_control_stall(window):
     if len(keys) != 1:
         return None
     return {"key": noop_key(tail[0]), "label": tail[0].get("label") or "?"}
+
+
+INVERSE_PAIRS = (
+    ("add", "remove"), ("increase", "decrease"), ("increment", "decrement"),
+    ("plus", "minus"), ("+", "-"), ("+", "−"),
+    ("next", "previous"), ("show", "hide"), ("expand", "collapse"),
+    ("open", "close"), ("more", "fewer"), ("up", "down"),
+    ("select", "deselect"),
+)
+OSCILLATION_CLICKS = 6
+OSCILLATION_MIN_SHARE = 4
+OSCILLATION_MIN_FLIPS = 2
+OSCILLATION_HOLD_STEPS = 4
+
+
+def pair_tokens(label):
+    """Label tokens with unicode minuses normalized, so +/− steppers pair."""
+    text = (label or "").lower().replace("−", "-").replace("–", "-")
+    return re.findall(r"[a-z0-9]+|[+-]", text)
+
+
+def pair_key(label):
+    """An inverse pair's (object, axis, side): "Add adult" -> ("adult", 0, 0)."""
+    toks = pair_tokens(label)
+    for index, (side_a, side_b) in enumerate(INVERSE_PAIRS):
+        if side_a in toks or side_b in toks:
+            obj = " ".join(t for t in toks if t not in (side_a, side_b))
+            side = 1 if side_b in toks and side_a not in toks else 0
+            return (obj, index, side)
+    return None
+
+
+def detect_oscillation(window):
+    """Inverse-pair oscillation: one object, 2+ direction flips, no progress."""
+    clicks = [step for step in window if step.get("kind") == "click"][-OSCILLATION_CLICKS:]
+    if len(clicks) < OSCILLATION_MIN_SHARE:
+        return None
+    if any(step.get("progress") for step in clicks):
+        return None
+    keyed = [(step, pair_key(step.get("label"))) for step in clicks]
+    counts = {}
+    for _, key in keyed:
+        if key is not None:
+            counts[key[:2]] = counts.get(key[:2], 0) + 1
+    shared = [key for key, count in counts.items() if count >= OSCILLATION_MIN_SHARE]
+    if not shared:
+        return None
+    key = max(shared, key=lambda item: counts[item])
+    sides = [found[2] for _, found in keyed if found is not None and found[:2] == key]
+    flips = sum(1 for first, second in zip(sides, sides[1:]) if first != second)
+    if flips < OSCILLATION_MIN_FLIPS:
+        return None
+    labels, keys = [], []
+    for step, found in keyed:
+        if found is None or found[:2] != key:
+            continue
+        if step.get("label") not in labels:
+            labels.append(step.get("label"))
+        hold = noop_key(step)
+        if hold not in keys:
+            keys.append(hold)
+    return {"object": key[0], "axis": key[1], "flips": flips, "labels": labels, "keys": keys}
+
+
+def detect_pingpong(visited):
+    """URL ping-pong: the last four committed pages alternate between two URLs."""
+    tail = [url for url in (visited or [])[-6:] if url][-4:]
+    if len(tail) < 4:
+        return None
+    first, second = tail[0], tail[1]
+    if first == second or first != tail[2] or second != tail[3]:
+        return None
+    return {"pair": [first, second]}
+
+
+SCROLL_EXHAUSTED_COUNT = 4
+SCROLL_HOLD_STEPS = 5
+
+
+def update_scroll_watch(watch, page_key, memo_len, satisfied):
+    """Count scrolls on one page key; new facts or progress restart the streak."""
+    if (
+        (watch or {}).get("key") != page_key
+        or memo_len > (watch or {}).get("memo", 0)
+        or satisfied > (watch or {}).get("satisfied", 0)
+    ):
+        return {"key": page_key, "count": 1, "memo": memo_len, "satisfied": satisfied}
+    watch = dict(watch)
+    watch["count"] = watch.get("count", 0) + 1
+    return watch
+
+
+def scroll_exhausted(watch, memo_len, satisfied):
+    """4+ scrolls on one page with no new facts and no sub-goal progress."""
+    watch = watch or {}
+    return (
+        watch.get("count", 0) >= SCROLL_EXHAUSTED_COUNT
+        and memo_len <= watch.get("memo", 0)
+        and satisfied <= watch.get("satisfied", 0)
+    )
 
 
 def goal_page_target(goal):
@@ -358,22 +473,24 @@ def compose_guidance(state):
     if state.get("force_navigate") and current_todo(state):
         guidance.append(f"Leave this site now: NAVIGATE for the next step ({current_todo(state)[:80]}).")
     elif state.get("subgoals") is not None and not target:
-        todo_words = _score_words(current_todo(state))
+        todo_words = _score_words(current_todo(state), stem=True)
         tried = set(state.get("tried_links") or [])
         ranked = sorted(
             (
                 a
                 for a in (state.get("page") or {}).get("actions", [])
-                if a.get("kind") == "click" and a.get("role") == "link"
+                if a.get("kind") == "click" and a.get("role") in {"link", "button", "tab", "menuitem"}
             ),
             key=lambda a: score_link(
-                a.get("label"), action_url(state["page"], a), a.get("nav"), todo_words, tried
+                a.get("label"), action_url(state["page"], a), a.get("nav"), todo_words, tried, stem=True
             ),
             reverse=True,
         )
         top = [
             a for a in ranked
-            if score_link(a.get("label"), action_url(state["page"], a), a.get("nav"), todo_words, tried) > 0
+            if score_link(
+                a.get("label"), action_url(state["page"], a), a.get("nav"), todo_words, tried, stem=True
+            ) > 0
         ][:3]
         if top:
             names = "; ".join((a.get("label") or "?")[:40] for a in top)
@@ -1022,6 +1139,7 @@ class Agent:
                 where="predict", retried=True,
                 stack=traceback.format_exc(limit=5) if self.trace.level >= 2 else None,
             )
+            state["stale_used"] = state.get("stale_used", 0) + 1
             state["decision"] = None
             state["status"] = "ready"
             try:
@@ -1101,6 +1219,41 @@ class Agent:
                 )
                 if state["loop_fires"] >= LOOP_STOP_FIRES:
                     return self._terminal(state, "loop detected", step)
+            oscillation = detect_oscillation(state.get("loop_window") or [])
+            if oscillation:
+                reasons = dict(state.get("hold_reasons") or {})
+                state["held_actions"] = hold_actions(
+                    state.get("held_actions"), oscillation["keys"],
+                    OSCILLATION_HOLD_STEPS, reasons, "oscillation hold",
+                )
+                state["hold_reasons"] = reasons
+                add_event_note(state, self._oscillation_note(state, oscillation))
+                self.trace.emit(
+                    "guard", step=step, type="oscillation",
+                    object=oscillation["object"], labels=oscillation["labels"],
+                    flips=oscillation["flips"],
+                    evidence=f"alternated {'/'.join(oscillation['labels'][:2])} with no progress"[:200],
+                )
+            pong = detect_pingpong(state.get("visited_urls") or [])
+            notified = state.get("pingpong_notified") or {}
+            visits = len(state.get("visited_urls") or [])
+            if pong and (notified.get("pair") != pong["pair"] or notified.get("visits") != visits):
+                # The pair is already normalized host+path, like failed_urls entries.
+                failed = list(state.get("failed_urls") or [])
+                for url in pong["pair"]:
+                    if url not in failed:
+                        failed.append(url)
+                state["failed_urls"] = failed[-20:]
+                state["pingpong_notified"] = {"pair": pong["pair"], "visits": visits}
+                add_event_note(
+                    state,
+                    f"Navigating between {pong['pair'][0]} and {pong['pair'][1]} made no progress; "
+                    "both are excluded now, go somewhere new.",
+                )
+                self.trace.emit(
+                    "guard", step=step, type="pingpong", pair=pong["pair"],
+                    evidence="last four committed pages alternate A,B,A,B",
+                )
             self._stall_check(state, step)
             if "page_target" not in state:
                 state["page_target"] = goal_page_target(state["goal"])
@@ -1110,12 +1263,20 @@ class Agent:
                 )
             config = getattr(self, "config", None) or {}
             budget = config.get("max_decisions") or DEFAULT_MAX_DECISIONS
-            if len(state["decisions"]) >= budget:
-                self.trace.emit("guard", step=step, type="budget", used=len(state["decisions"]), budget=budget)
+            # Only executed actions spend the budget; stale decisions, BLOCKED
+            # re-asks, and repair retries have their own small cap instead.
+            used = len(state.get("history") or [])
+            if state.get("stale_used", 0) >= STALE_CAP:
+                self.trace.emit(
+                    "guard", step=step, type="stale_budget", used=state["stale_used"], cap=STALE_CAP
+                )
+                return self._terminal(state, "stale budget", step)
+            if used >= budget:
+                self.trace.emit("guard", step=step, type="budget", used=used, budget=budget)
                 return self._terminal(state, "decision budget", step)
-            if len(state["decisions"]) >= budget * 0.75 and not state.get("winding_down"):
+            if used >= budget * 0.75 and not state.get("winding_down"):
                 state["winding_down"] = True
-                self.trace.emit("guard", step=step, type="wind_down", used=len(state["decisions"]), budget=budget)
+                self.trace.emit("guard", step=step, type="wind_down", used=used, budget=budget)
             self._track_progress(state, step)
             self._update_suppression(state, step)
             shown = page_for_choice(state)
@@ -1458,6 +1619,35 @@ class Agent:
             self.trace.maybe_step_shot(done_step, state["page"].get("screenshot"))
             state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
             note_visit(state, state["page"].get("url"))
+            if action.get("kind") == "scroll":
+                key = normalize_link_url(state["page"].get("url"))
+                memo_len = len(state.get("memo") or [])
+                satisfied = sum(1 for item in state.get("subgoals") or [] if item.get("satisfied"))
+                state["scroll_watch"] = update_scroll_watch(
+                    state.get("scroll_watch"), key, memo_len, satisfied
+                )
+                if scroll_exhausted(state["scroll_watch"], memo_len, satisfied):
+                    reasons = dict(state.get("hold_reasons") or {})
+                    scroll_keys = [
+                        noop_key(item)
+                        for item in state["page"].get("actions", [])
+                        if item.get("kind") == "scroll"
+                    ]
+                    state["held_actions"] = hold_actions(
+                        state.get("held_actions"), scroll_keys, SCROLL_HOLD_STEPS, reasons, "scroll hold"
+                    )
+                    state["hold_reasons"] = reasons
+                    add_event_note(
+                        state, "Scrolling is exhausted; use a filter, link, or navigate instead."
+                    )
+                    self.trace.emit(
+                        "guard", step=done_step, type="scroll_exhausted", page=key,
+                        scrolls=state["scroll_watch"]["count"],
+                        evidence=f"{state['scroll_watch']['count']} scrolls with no new facts or progress"[:200],
+                    )
+                    state["scroll_watch"] = {
+                        "key": key, "count": 0, "memo": memo_len, "satisfied": satisfied
+                    }
             off_topic = (
                 action.get("kind") == "navigate"
                 and not navigate_failed
@@ -1627,6 +1817,8 @@ class Agent:
                 "elapsed_ms": state["elapsed_ms"],
             }
         )
+        cdp_calls, cdp_ms = self._cdp(state["browser"])
+        unblock_started = time.perf_counter()
         state["browser"].act(scroll, page)
         state["browser"].wait_until_ready()
         state["page"] = state["browser"].observe(screenshot=self.screenshots)
@@ -1635,6 +1827,18 @@ class Agent:
         window = state.get("loop_window") or []
         window.append(loop_step({**decision, "operation": "SCROLL_DOWN"}, scroll, state["page"], changed))
         state["loop_window"] = window[-LOOP_WINDOW:]
+        self.trace.emit(
+            "action", step=len(state["history"]), operation="SCROLL_DOWN", target=scroll.get("label"),
+            kind="scroll", strategy="unblock", cdp_calls=cdp_calls, cdp_ms=cdp_ms,
+            duration_ms=round((time.perf_counter() - unblock_started) * 1000), ok=changed,
+        )
+        self.trace.emit(
+            "verify", step=len(state["history"]), kind="scroll",
+            before={"fingerprint": page["fingerprint"]},
+            after={"fingerprint": state["page"]["fingerprint"]},
+            changed=changed, success=changed, next_strategy=None, commit=None,
+            duration_ms=0,
+        )
         state["status"] = "ready"
         return True
 
@@ -1683,6 +1887,31 @@ class Agent:
                 f"{sibling.get('label') or 'the field'} and pressing Enter instead."
             )
         return f"{stall['label']} is not responding; try a different strategy instead of clicking it again."
+
+    def _oscillation_note(self, state, oscillation):
+        """Set the count once, then press the widget's confirm button."""
+        actions = (state.get("page") or {}).get("actions", [])
+        labels = oscillation.get("labels") or []
+        value = "unknown"
+        for action in actions:
+            if action.get("label") in labels and action.get("value"):
+                value = action["value"]
+                break
+        confirms = [
+            (action.get("label") or "?")[:30]
+            for action in actions
+            if action.get("kind") == "click" and is_confirm_label(action.get("label"))
+        ][:3]
+        obj = oscillation.get("object") or "this control"
+        sides = "/".join(label[:30] for label in labels[:2]) or "both directions"
+        note = (
+            f"You alternated {sides} for {obj}. Current value: {value}. "
+            "Decide the target count from the goal, do it once, then press the "
+            "confirming button (Done/Apply/OK) of this widget."
+        )
+        if confirms:
+            note += f" Candidates: {'; '.join(confirms)}."
+        return note
 
     def _note_noop(self, state, action, unchanged):
         """A click that cannot move its own state is a no-op: suppress it for the
@@ -2191,6 +2420,7 @@ class Agent:
                     else:
                         resolution = "missing"
                     self._emit_stale(state, step, locator, page_before, candidates, resolution, attempt)
+                    state["stale_used"] = state.get("stale_used", 0) + 1
                     state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
                     self.trace.flush()
                     return self.snapshot()
