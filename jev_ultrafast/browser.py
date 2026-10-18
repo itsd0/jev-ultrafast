@@ -1837,6 +1837,11 @@ def link_href_expression(action):
     )
 
 
+def full_text_expression(limit=20000):
+    """Full-document rendered text for bench evidence. The agent keeps viewport text."""
+    return f"(() => (document.body ? document.body.innerText : '').slice(0, {int(limit)}))()"
+
+
 def cover_info_expression(action):
     locator = {k: action[k] for k in ("node", "frame") if k in action}
     return (

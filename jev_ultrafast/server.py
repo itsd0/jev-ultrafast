@@ -21,6 +21,7 @@ from browser_harness import admin as harness_admin
 from browser_harness import helpers as harness_helpers
 
 from .agent import Agent
+from .browser import full_text_expression
 from .config import env_bool
 from .demo import load_environment
 from .model import redact_secrets, token_counts
@@ -497,7 +498,20 @@ class Runner:
             )
         return len(history)
 
-    def _finish(self, task_id, snapshot, status, error=None, trace=None):
+    @staticmethod
+    def _final_text(browser, page):
+        """Bench evidence: full-document text for checks only. Viewport on failure."""
+        evaluate = getattr(browser, "evaluate", None)
+        if evaluate is not None:
+            try:
+                full = evaluate(full_text_expression())
+            except Exception:
+                full = None
+            if isinstance(full, str) and full.strip():
+                return full[:20000]
+        return (page.get("text") or "")[:20000]
+
+    def _finish(self, task_id, snapshot, status, error=None, trace=None, browser=None):
         prompt, completion = tally_tokens(snapshot)
         page = snapshot.get("page") or {}
         self.store.update_task(
@@ -505,7 +519,7 @@ class Runner:
             status=status,
             ended_at=time.time(),
             final_url=page.get("url"),
-            final_text=(page.get("text") or "")[:20000],
+            final_text=self._final_text(browser, page),
             answer_text=snapshot.get("answer"),
             decisions_count=len(snapshot.get("decisions") or []),
             blocked_reason=snapshot.get("blocked_reason"),
@@ -589,10 +603,16 @@ class Runner:
                 snapshot = agent.command("tick")
                 recorded = self._record_new_steps(task_id, snapshot, recorded)
                 if stopper.is_set():
-                    self._finish(task_id, snapshot, "blocked", "stopped by user", trace)
+                    self._finish(
+                        task_id, snapshot, "blocked", "stopped by user", trace,
+                        browser=agent.browser,
+                    )
                     return
                 if snapshot.get("status") in TERMINAL - {"failed"}:
-                    self._finish(task_id, snapshot, snapshot["status"], trace=trace)
+                    self._finish(
+                        task_id, snapshot, snapshot["status"], trace=trace,
+                        browser=agent.browser,
+                    )
                     return
         except Exception as error:
             try:
@@ -607,7 +627,10 @@ class Runner:
                 )
             safe = str(redact_secrets(f"{type(error).__name__}: {error}"))[:500]
             snapshot = snapshot if isinstance(snapshot, dict) else {}
-            self._finish(task_id, snapshot, "failed", safe, trace)
+            self._finish(
+                task_id, snapshot, "failed", safe, trace,
+                browser=getattr(agent, "browser", None),
+            )
         finally:
             if agent is not None:
                 try:

@@ -456,6 +456,34 @@ def test_finish_stores_bench_evidence(start_service):
     assert "final_text" not in listed[0]
 
 
+def test_finish_prefers_full_document_text(start_service):
+    class FullBrowser(FakeBrowser):
+        def __init__(self, text):
+            super().__init__()
+            self.text = text
+
+        def evaluate(self, expression):
+            assert "innerText" in expression
+            if isinstance(self.text, Exception):
+                raise self.text
+            return self.text
+
+    def script(fake):
+        finished = snap("done", 1)
+        finished["page"] = {"url": "https://example.test/", "text": "Viewport only"}
+        return finished
+
+    base, _ = start_service(script, browser=FullBrowser("Whole document here"))
+    _, created = api(base, "POST", "/api/tasks", {"goal": "Bench", "url": "https://example.test/"})
+    done = wait_for(base, created["id"], {"done"})
+    assert done["final_text"] == "Whole document here"
+
+    base, _ = start_service(script, browser=FullBrowser(RuntimeError("dead")))
+    _, created = api(base, "POST", "/api/tasks", {"goal": "Bench", "url": "https://example.test/"})
+    done = wait_for(base, created["id"], {"done"})
+    assert done["final_text"] == "Viewport only"
+
+
 def test_store_migrates_old_schema(tmp_path):
     import sqlite3
 
