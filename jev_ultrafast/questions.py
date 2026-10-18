@@ -45,6 +45,8 @@ goal names them. No commentary, code, or browser actions. If no page can be dete
 ANSWER_VALUE = """Return a JSON object with exactly one key, text: the final answer to the goal.
 Report what the goal asked for (names, numbers, prices, titles) using the current page and the action
 history. Prefer the collected evidence and facts: they may come from pages no longer open. If the goal
+asks for a syntax, signature, code, title, or exact line, quote it verbatim from the page or its
+sections; never paraphrase or reconstruct it from memory. If the goal
 only asked to reach a page, return its title and URL. If the requested information is not visible, say
 what is missing instead of guessing. No commentary or browser actions."""
 

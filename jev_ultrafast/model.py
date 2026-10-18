@@ -3,6 +3,7 @@
 import json
 import math
 import os
+import re
 import time
 
 import httpx
@@ -904,10 +905,40 @@ def navigate_context(goal, todo, memo, page, history, visited=(), failed=(), blo
     }
 
 
+_SECTION_STOPWORDS = frozenset(
+    "the a an to of and for on in with or by from is are was were be as at it its this that".split()
+)
+
+
+def _section_words(text):
+    return {
+        word
+        for word in re.findall(r"[a-z0-9]+", (text or "").lower())
+        if word not in _SECTION_STOPWORDS and len(word) > 1
+    }
+
+
+def matching_sections(goal, texts, sections, limit=4):
+    """Whole-document sections whose heading shares a content word with the goal or todos."""
+    want = _section_words(goal)
+    for text in texts or []:
+        want |= _section_words(text)
+    if not want:
+        return []
+    return [
+        {"heading": section.get("heading"), "text": section.get("text")}
+        for section in sections or []
+        if want & _section_words(section.get("heading"))
+    ][:limit]
+
+
 def answer_context(goal, page, history, evidence=(), memo=(), partial=False):
     return {
         "goal": goal,
         "page": {"url": page.get("url"), "title": page.get("title"), "text": (page.get("text") or "")[:6000]},
+        "sections": matching_sections(
+            goal, [item["subgoal"] for item in evidence], page.get("sections")
+        ),
         "evidence": [
             {"subgoal": item["subgoal"], "value": item["value"], "source": item["source"]} for item in evidence
         ],
@@ -932,6 +963,11 @@ def track_context(goal, subgoals, memo, page, history):
         ],
         "known_facts": [item["fact"] for item in memo][-12:],
         "page": {"url": page.get("url"), "title": page.get("title"), "text": (page.get("text") or "")[:4000]},
+        "sections": matching_sections(
+            goal,
+            [item["text"] for item in subgoals if not item.get("satisfied")],
+            page.get("sections"),
+        ),
         "recent_actions": [
             {k: h.get(k) for k in ("action", "text", "url")} for h in history[-6:]
         ],

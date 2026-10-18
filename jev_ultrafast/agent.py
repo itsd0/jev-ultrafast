@@ -429,28 +429,70 @@ def split_requirements(text, existing=()):
     return [part for part in parts if _score_words(part) and not _score_words(part) <= union]
 
 
+def _grounding_haystack(state, source_url):
+    """Observed text a claimed value or fact must appear in: page text, title,
+    URL, whole-document sections, and the prior memo."""
+    page = state.get("page") or {}
+    parts = [page.get("text") or "", page.get("title") or "", page.get("url") or "", source_url or ""]
+    for section in page.get("sections") or []:
+        parts.append(section.get("heading") or "")
+        parts.append(section.get("text") or "")
+    parts.extend(item.get("fact") or "" for item in state.get("memo") or [])
+    return " ".join(" ".join(part.split()).casefold() for part in parts if part)
+
+
+def _grounded(value, haystack, hay_tokens):
+    """The value appears in observed text. Long values need 80% token overlap;
+    numbers tolerate formatting differences (5,494,932 matches 5494932)."""
+    text = " ".join(str(value or "").split()).casefold()
+    if not text:
+        return False
+    if text in haystack:
+        return True
+    squashed = re.sub(r"[,\s_]+", "", text)
+    if squashed and squashed in re.sub(r"[,\s_]+", "", haystack):
+        return True
+    if len(text) > 40:
+        need = _score_words(text)
+        return bool(need) and len(need & hay_tokens) / len(need) >= 0.8
+    return False
+
+
 def apply_judgment(state, judgment, source_url):
     """Fold satisfied sub-goals (with evidence) and new facts into the run.
 
     Required items need the judge's copied value. Nice-to-have items are also
     satisfied by a memo fact covering every content word: the fact itself is
-    the copied evidence, with its exact source URL.
+    the copied evidence, with its exact source URL. Values and facts must be
+    grounded in observed text; dropped claims land in state["_ungrounded"].
     """
+    haystack = _grounding_haystack(state, source_url)
+    hay_tokens = _score_words(haystack)
+    dropped = []
     subgoals = state.get("subgoals") or []
     by_id = {item["id"]: item for item in subgoals}
     for item in judgment.get("satisfied") or []:
         target = by_id.get(item.get("id"))
-        if target is not None and not target.get("satisfied") and item.get("value"):
-            target["satisfied"] = True
-            target["value"] = item["value"]
-            target["source"] = source_url
+        if target is None or target.get("satisfied") or not item.get("value"):
+            continue
+        if not _grounded(item["value"], haystack, hay_tokens):
+            dropped.append({"kind": "value", "value": item["value"]})
+            continue
+        target["satisfied"] = True
+        target["value"] = item["value"]
+        target["source"] = source_url
     memo = state.get("memo") or []
     seen = {item["fact"] for item in memo}
     for fact in judgment.get("facts") or []:
-        if fact and fact not in seen:
-            seen.add(fact)
-            memo.append({"fact": fact, "source": source_url})
+        if not fact or fact in seen:
+            continue
+        if not _grounded(fact, haystack, hay_tokens):
+            dropped.append({"kind": "fact", "value": fact})
+            continue
+        seen.add(fact)
+        memo.append({"fact": fact, "source": source_url})
     state["memo"] = memo[-MEMO_CAP:]
+    state["_ungrounded"] = dropped
     for item in subgoals:
         if item.get("satisfied") or item.get("required", True):
             continue
@@ -1449,6 +1491,7 @@ class Agent:
                         "progress", step=step, gate_accept=verdict["accept"],
                         gate_partial=verdict["partial"], gate_missing=verdict["missing"][:200],
                         todo=[item["text"] for item in state.get("subgoals") or [] if not item.get("satisfied")],
+                        ungrounded=[drop["value"] for drop in state.get("_ungrounded") or []],
                     )
                     if not verdict["accept"]:
                         state["done_rejections"] = state.get("done_rejections", 0) + 1
@@ -2078,6 +2121,7 @@ class Agent:
                 ],
                 todo=[item["text"] for item in subgoals if not item.get("satisfied")],
                 facts_added=[], leave_site=must_leave, complete=False, early_exit=True,
+                ungrounded=[drop["value"] for drop in state.get("_ungrounded") or []],
             )
             self._maybe_go_back(state, url, False, [], step)
             return
@@ -2129,6 +2173,7 @@ class Agent:
             todo=[item["text"] for item in subgoals if not item.get("satisfied")],
             facts_added=new_facts, leave_site=bool(state.get("leave_site")),
             complete=not any(not item.get("satisfied") for item in subgoals),
+            ungrounded=[drop["value"] for drop in state.get("_ungrounded") or []],
         )
         self._maybe_go_back(state, url, gained, new_facts, step)
 

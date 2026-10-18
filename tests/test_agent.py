@@ -316,6 +316,7 @@ def test_done_runs_the_judge_on_demand(runner, monkeypatch):
 
     monkeypatch.setattr(loop, "judge_progress", fake_judge)
     runner.state["subgoals"] = [{"id": 0, "text": "population", "required": True}]
+    runner.state["page"]["text"] = "Bangkok population 9M"  # the claimed value is observed
     runner.state["judged_url"] = runner.state["page"]["url"]  # the throttle would skip
     runner.state["judged_step"] = 99
     verdict = runner._done_verdict(runner.state, runner.state["page"], 1)
@@ -1622,6 +1623,7 @@ def test_required_cue_verbs_mark_strict_items():
             {"id": 1, "text": "find the seller rating", "required": False},
         ],
         "memo": [],
+        "page": {"text": "seller rating 98% from the listing page", "title": "", "url": ""},
     }
     loop.apply_judgment(
         state,
@@ -1706,16 +1708,18 @@ def test_home_host_needs_two_judge_votes_to_force(runner):
 
 
 def test_home_host_set_from_first_evidence():
-    state = {"subgoals": [{"id": 0, "text": "population"}], "memo": []}
+    page = {"text": "population 9M", "title": "", "url": "https://one.test/x"}
+    state = {"subgoals": [{"id": 0, "text": "population"}], "memo": [], "page": page}
     loop.apply_judgment(state, {"satisfied": [{"id": 0, "value": "9M"}], "facts": [], "leave_site": False},
                         "https://one.test/x")
     assert state["home_host"] == "one.test"
-    loop.apply_judgment(state, {"satisfied": [], "facts": ["more"], "leave_site": False},
+    loop.apply_judgment(state, {"satisfied": [], "facts": ["population"], "leave_site": False},
                         "https://two.test/y")
     assert state["home_host"] == "one.test"  # first evidence wins
-    blank = {"subgoals": [{"id": 0, "text": "population"}], "memo": []}
+    blank = {"subgoals": [{"id": 0, "text": "population"}], "memo": [], "page": dict(page)}
     loop.apply_judgment(blank, {"satisfied": [{"id": 0, "value": "9M"}], "facts": [], "leave_site": False}, "")
-    assert blank.get("home_host") is None
+    assert blank["subgoals"][0]["satisfied"] is True  # grounded in page text
+    assert blank.get("home_host") is None  # but a hostless source sets no home
 
 
 def test_judge_runs_with_overlap_or_dialog(runner, monkeypatch):
@@ -1742,6 +1746,7 @@ def test_apply_judgment_folds_evidence_and_memo():
     state = {
         "subgoals": [{"id": 0, "text": "population"}, {"id": 1, "text": "temperature"}],
         "memo": [{"fact": "old", "source": "u"}],
+        "page": {"text": "8.9M Bangkok is hot", "title": "", "url": "https://example.test/w"},
     }
     judgment = {
         "satisfied": [{"id": 0, "value": "8.9M"}, {"id": 9, "value": "bogus"}],

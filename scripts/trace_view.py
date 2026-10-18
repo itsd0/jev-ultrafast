@@ -90,14 +90,16 @@ def one_line(event):
         return (f"{head} guard {item.get('type')}: {item.get('pattern') or item.get('label') or ''}"
                 f" {item.get('evidence') or ''}".rstrip())
     if kind == "progress":
+        dropped = item.get("ungrounded") or []
+        suffix = f" ungrounded={dropped}" if dropped else ""
         if item.get("gate_missing") is not None:
             return (
                 f"{head} gate accept={item.get('gate_accept')} partial={item.get('gate_partial')}"
-                f" missing={item.get('gate_missing')}"
+                f" missing={item.get('gate_missing')}{suffix}"
             )
         return (
             f"{head} progress satisfied={[s['text'] for s in item.get('satisfied', [])]}"
-            f" todo={item.get('todo')} facts+={len(item.get('facts_added', []))}"
+            f" todo={item.get('todo')} facts+={len(item.get('facts_added', []))}{suffix}"
         )
     if kind == "error":
         return f"{head} ERROR {item.get('type')}: {item.get('message')} ({item.get('where')})"

@@ -547,7 +547,41 @@
     const code=entries && entries[0] && entries[0].responseStatus;
     if (typeof code==='number' && code>0) httpStatus=code;
   } catch (error) { httpStatus=null; }
+  // Whole-document sections for the judge and answer: h1-h4 with the first
+  // 800 chars after each, capped at 12k total. Below-the-fold content (a
+  // Syntax section under an example block) is visible here.
+  const sections=[]; let sectionsLength=0;
+  const sectionBody=(heading, budget)=>{
+    const parts=[]; let length=0;
+    const walker=document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT);
+    walker.currentNode=heading;
+    let node;
+    while (length<budget && (node=walker.nextNode())) {
+      const el=node.nodeType===1 ? node : node.parentElement;
+      if (!el || el===heading || heading.contains(el)) continue;
+      if (node.nodeType===1) {
+        if (/^H[1-4]$/.test(node.tagName)) break;
+        continue;
+      }
+      if (el.closest('script,style,noscript,template')) continue;
+      const value=node.textContent.trim();
+      if (!value) continue;
+      const room=budget-length;
+      parts.push(value.slice(0,room)); length+=Math.min(value.length,room);
+    }
+    return parts.join('\n');
+  };
+  if (document.body && document.createTreeWalker) {
+    for (const heading of document.querySelectorAll('h1,h2,h3,h4')) {
+      if (sectionsLength>=12000) break;
+      const title=(heading.innerText||'').trim().replace(/\s+/g,' ').slice(0,200);
+      if (!title) continue;
+      const body=sectionBody(heading, 800);
+      sections.push({heading:title, text:body});
+      sectionsLength+=body.length;
+    }
+  }
   return {url:location.href,title:document.title,w:innerWidth,h:innerHeight,text,
     scroll:{y:scrollY,height},actions,marker,page_key,guards,omitted_actions,cross_frames,surfaces,
-    modal_scoped:modalScoped,overlay,status:httpStatus};
+    modal_scoped:modalScoped,overlay,status:httpStatus,sections};
 })()
