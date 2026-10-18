@@ -246,3 +246,36 @@ def test_diagnose_ranks_captcha_env_first():
         _event("end", status="blocked", blocked_reason="decision budget"),
     ]
     assert diagnose_trace(transport)[0] == "environment/API error"
+
+
+def test_captcha_tick_ends_without_acting(runner, isolated_hosts, monkeypatch):
+    """A full tick on a sorry page: red step, forced way out, run keeps going."""
+    choose = Mock(return_value=decision("e1"))
+    monkeypatch.setattr(loop, "choose", choose)
+    sorry = page(url="https://wall.test/sorry/index", text="Sorry, unusual traffic")
+    sorry["captcha_reason"] = detect_captcha(sorry)
+    assert sorry["captcha_reason"]
+    runner.state["page"] = sorry
+    runner.state["browser"].observe.return_value = page(url="https://wall.test/search")
+    emitted = []
+    monkeypatch.setattr(runner.trace, "emit", lambda event, **fields: emitted.append((event, fields)))
+    snapshot = runner.command("tick")
+    assert snapshot["status"] not in {"done", "blocked", "failed"}
+    assert snapshot["history"][-1]["operation"] == "CAPTCHA"
+    assert runner.state["force_navigate"] is True
+    assert runner.state["decision"] is None
+    choose.assert_not_called()
+    assert "_captcha_tick" not in runner.state
+    assert [fields for event, fields in emitted if event == "error"] == []
+
+
+def test_captcha_tick_wants_cloud_restart_while_running(runner, isolated_hosts, monkeypatch):
+    monkeypatch.setattr(loop, "choose", Mock(return_value=decision("e1")))
+    runner.state["browser"].config = {"browser": "cloud"}
+    sorry = page(url="https://wall.test/sorry/index", text="Sorry, unusual traffic")
+    sorry["captcha_reason"] = detect_captcha(sorry)
+    runner.state["page"] = sorry
+    runner.state["browser"].observe.return_value = page(url="https://wall.test/search")
+    snapshot = runner.command("tick")
+    assert snapshot["status"] not in {"done", "blocked", "failed"}
+    assert runner.state["cloud_restart_wanted"] == "wall.test"

@@ -1469,6 +1469,9 @@ class Agent:
             state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
             self.trace.flush()
             return self.snapshot()
+        if state.pop("_captcha_tick", False):
+            self.trace.flush()
+            return self.snapshot()
         if state["status"] in {"done", "blocked"}:
             return self.snapshot()
         decision = state.get("decision") or {}
@@ -2781,6 +2784,9 @@ class Agent:
         state["force_navigate"] = True
         state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
         wall = {"id": "captcha", "kind": "captcha", "label": f"Blocked by a CAPTCHA on {host or 'this page'}"}
+        # The tick ends here: there is no decision to act on. The next tick
+        # decides the forced way out, and the server may restart cloud first.
+        state["_captcha_tick"] = True
         state["history"].append({
             "step": step,
             "action": wall["label"],
