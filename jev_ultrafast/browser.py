@@ -13,6 +13,7 @@ from browser_harness.helpers import cdp, drain_events
 
 from . import cloud
 from .config import env_bool, resolve_config, snapshot_config
+from .trace import get_logger
 
 # Atomically read visible content and controls, preserving actual DOM node identity.
 READ_STATE = Path(__file__).with_name("snapshot.js").read_text()
@@ -40,6 +41,7 @@ class Browser:
         self._tab_serial = 0
         self._ready_after_act = False
         self.cloud = None
+        self.cdp_counter = {"calls": 0, "ms": 0.0}
         cloud_mode = self.config.get("browser") == "cloud"
         if cloud_mode:
             # The cloud daemon is already attached. ensure_daemon() would spawn a
@@ -94,7 +96,22 @@ class Browser:
             raise
 
     def call(self, method, **params):
-        return cdp(method, session_id=self.session, **params)
+        started = time.perf_counter()
+        try:
+            return cdp(method, session_id=self.session, **params)
+        finally:
+            self._bump_cdp(time.perf_counter() - started)
+
+    def _bump_cdp(self, seconds):
+        counter = getattr(self, "cdp_counter", None)
+        if counter is None:
+            return
+        counter["calls"] += 1
+        counter["ms"] += seconds * 1000
+
+    def cdp_snapshot(self):
+        counter = getattr(self, "cdp_counter", None) or {"calls": 0, "ms": 0.0}
+        return counter["calls"], counter["ms"]
 
     VIEWPORT = (1120, 780, 1)
 
@@ -129,21 +146,16 @@ class Browser:
         except StalePage:
             return actual
         if isinstance(retry, dict) and retry != expected:
-            print(
+            get_logger("cloud").warning(
                 f"[jev:cloud] viewport mismatch: got {retry.get('w')}x{retry.get('h')} "
-                f"dpr={retry.get('dpr')}, expected {expected['w']}x{expected['h']} dpr={expected['dpr']}",
-                file=sys.stderr,
-                flush=True,
+                f"dpr={retry.get('dpr')}, expected {expected['w']}x{expected['h']} dpr={expected['dpr']}"
             )
         return retry
 
     def vision_click(self, x, y):
         """Coordinate input. This is the only path that does not use a code-owned node id."""
-        print(
-            f"[jev:vision] coordinate-based click x={x:.1f} y={y:.1f} "
-            "breaks the node-id invariant",
-            file=sys.stderr,
-            flush=True,
+        get_logger("vision").warning(
+            f"[jev:vision] coordinate-based click x={x:.1f} y={y:.1f} breaks the node-id invariant"
         )
         for event in ("mousePressed", "mouseReleased"):
             self.call("Input.dispatchMouseEvent", type=event, x=x, y=y, button="left", clickCount=1)
@@ -166,12 +178,16 @@ class Browser:
         return value or []
 
     def evaluate(self, expression, session=None):
-        response = cdp(
-            "Runtime.evaluate",
-            session_id=session or self.session,
-            expression=expression,
-            returnByValue=True,
-        )
+        started = time.perf_counter()
+        try:
+            response = cdp(
+                "Runtime.evaluate",
+                session_id=session or self.session,
+                expression=expression,
+                returnByValue=True,
+            )
+        finally:
+            self._bump_cdp(time.perf_counter() - started)
         if response.get("exceptionDetails"):
             raise StalePage("Document changed during evaluation")
         return response.get("result", {}).get("value")
@@ -217,6 +233,7 @@ class Browser:
                         "session": self.session,
                         "screenshot": screenshot,
                         "config": self.config,
+                        "counter": getattr(self, "cdp_counter", None),
                     }
                 )
                 return self._finish_observation(state)
@@ -253,7 +270,13 @@ class Browser:
                     self._target_sessions[target_id] = session
                 child_config = {**self.config, "frames": "same", "frame_id": "f0"}
                 child = browser_operation(
-                    {"operation": "observe", "session": session, "screenshot": False, "config": child_config}
+                    {
+                        "operation": "observe",
+                        "session": session,
+                        "screenshot": False,
+                        "config": child_config,
+                        "counter": getattr(self, "cdp_counter", None),
+                    }
                 )
             except (RuntimeError, StalePage, KeyError, TypeError):
                 continue
@@ -445,6 +468,7 @@ class Browser:
             "probe": probe,
             "verify_active": cloud_mode,
             "verify_wait": cloud_mode,
+            "counter": getattr(self, "cdp_counter", None),
         })
         if result.get("ready"):
             self._ready_after_act = True
@@ -1005,9 +1029,16 @@ def action_probe_expression(action, expected):
 def browser_operation(request):
     operation = request["operation"]
     session = request["session"]
+    counter = request.get("counter")
 
     def call(method, **params):
-        return cdp(method, session_id=session, **params)
+        started = time.perf_counter()
+        try:
+            return cdp(method, session_id=session, **params)
+        finally:
+            if counter is not None:
+                counter["calls"] += 1
+                counter["ms"] += (time.perf_counter() - started) * 1000
 
     def evaluate(expression, await_promise=False):
         result = call(

@@ -338,7 +338,7 @@
   }
   // A genuinely open overlay sorts first; a true modal scopes choices to itself.
   // Background stays available for non-modal popups (the field behind autocomplete).
-  let modal=null;
+  let modal=null, modalScoped=false, overlay=null;
   for (const d of queryAllDeep(document, 'dialog,[role="dialog"],[role="alertdialog"]')) {
     if (d.closest('[inert]')) continue;
     const r=d.getBoundingClientRect();
@@ -350,6 +350,8 @@
   }
   if (modal) {
     const scoped=modal.tagName==='DIALOG' ? !!modal.open : modal.getAttribute('aria-modal')==='true';
+    modalScoped=scoped;
+    overlay=(name(modal)||modal.tagName||'dialog').trim().slice(0,80);
     const sameDoc=action=>!action.frame || action.frame===rootFrame;
     const inside=action=>{
       const n=cache.nodes.get(action.node);
@@ -457,5 +459,6 @@
     }
   }
   return {url:location.href,title:document.title,w:innerWidth,h:innerHeight,text,
-    scroll:{y:scrollY,height},actions,marker,page_key,guards,omitted_actions,cross_frames,surfaces};
+    scroll:{y:scrollY,height},actions,marker,page_key,guards,omitted_actions,cross_frames,surfaces,
+    modal_scoped:modalScoped,overlay};
 })()

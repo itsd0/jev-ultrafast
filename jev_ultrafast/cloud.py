@@ -3,11 +3,12 @@
 import atexit
 import os
 import signal
-import sys
 import threading
 
 from browser_harness import admin, helpers
 from browser_harness.admin import start_remote_daemon, stop_remote_daemon
+
+from .trace import get_logger
 
 SCREEN_WIDTH = 1120
 SCREEN_HEIGHT = 780
@@ -74,9 +75,9 @@ def start(config):
     helpers.NAME = name
     admin.NAME = name
     _register_cleanup(handle)
-    print(f"[jev:cloud] browser {handle['browser_id']}", file=sys.stderr, flush=True)
+    get_logger("cloud").info(f"[jev:cloud] browser {handle['browser_id']}")
     if options.get("show_live_url") and handle["live_url"]:
-        print(f"[jev:cloud] live view {handle['live_url']}", file=sys.stderr, flush=True)
+        get_logger("cloud").info(f"[jev:cloud] live view {handle['live_url']}")
     return handle
 
 
@@ -96,7 +97,7 @@ def stop(handle):
         stop_remote_daemon(name)
     except Exception as exc:
         # The API key and CDP URLs never enter this message.
-        print(f"[jev:cloud] stop failed: {type(exc).__name__}", file=sys.stderr, flush=True)
+        get_logger("cloud").warning(f"[jev:cloud] stop failed: {type(exc).__name__}")
     finally:
         with _lock:
             _active.pop(name, None)

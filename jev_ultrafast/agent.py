@@ -3,8 +3,8 @@
 import base64
 import os
 import re
-import sys
 import time
+import traceback
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -24,9 +24,11 @@ from .model import (
     judge_progress,
     match_option,
     post_json,
+    token_counts,
     track_context,
 )
-from .questions import ANSWER_VALUE, GATE_SYSTEM, NAVIGATE_VALUE, TRACK_SYSTEM
+from .questions import ANSWER_VALUE, GATE_SYSTEM, NAVIGATE_VALUE, TEXT_VALUE, TRACK_SYSTEM
+from .trace import Trace, cost_estimate_usd, get_logger
 from .vision import confirm_point, needs_vision, propose
 
 _RELOAD_WORDS = frozenset({"reload", "refresh"})
@@ -38,13 +40,15 @@ def reload_like(action):
     return bool(words & _RELOAD_WORDS)
 
 
-def note_no_progress(holds, action, page_changed):
+def note_no_progress(holds, action, page_changed, reasons=None, reason="no-progress hold"):
     """Hide an unchanged action for the next two decisions. A wait stays available."""
     holds = dict(holds or {})
     action_id = action.get("id")
     if page_changed or not action_id or action.get("kind") == "wait":
         return holds
     holds[action_id] = 2
+    if reasons is not None:
+        reasons[action_id] = reason
     return holds
 
 
@@ -111,12 +115,18 @@ def detect_cycle(window, periods=LOOP_PERIODS, repeats=LOOP_REPEATS):
     return None
 
 
-def hold_actions(holds, action_ids, steps=LOOP_HOLD_STEPS):
+def hold_actions(holds, action_ids, steps=LOOP_HOLD_STEPS, reasons=None, reason="held"):
     holds = dict(holds or {})
     for action_id in action_ids:
         if action_id:
             holds[action_id] = max(holds.get(action_id, 0), steps)
+            if reasons is not None:
+                reasons[action_id] = reason
     return holds
+
+
+def decay_hold_reasons(reasons, holds):
+    return {key: text for key, text in (reasons or {}).items() if (holds or {}).get(key, 0) > 0}
 
 
 STALL_REPEATS = 3
@@ -336,35 +346,64 @@ def current_todo(state):
     return todo[0] if todo else ""
 
 
-def compute_suppressed(state, page):
-    """Action ids to hide on this page: forced-NAVIGATE keeps only navigate;
+def suppression_reasons(state, page):
+    """Suppressed action id -> reason. Forced-NAVIGATE keeps only navigate;
     otherwise zero-signal nav links and tried detours are hidden while choices remain."""
     actions = page.get("actions") or []
     if state.get("force_navigate"):
-        return {a.get("id") for a in actions if a.get("kind") != "navigate"}
+        return {a.get("id"): "forced NAVIGATE" for a in actions if a.get("kind") != "navigate"}
     if state.get("subgoals") is None or state.get("page_target"):
         # Pagination runs follow the page counter, not link scores.
-        return set()
+        return {}
     todo_words = _score_words(current_todo(state))
     if not todo_words:
-        return set()
+        return {}
     tried = set(state.get("tried_links") or [])
     links = [a for a in actions if a.get("kind") == "click" and a.get("role") == "link"]
     if not links:
-        return set()
-    drop = {
-        a.get("id")
-        for a in links
-        if a.get("nav") and score_link(a.get("label"), action_url(page, a), True, todo_words, tried) <= 0
-    }
-    drop |= {
-        a.get("id")
-        for a in links
-        if normalize_link_url(action_url(page, a)) in tried and normalize_link_url(action_url(page, a))
-    }
-    if drop >= {a.get("id") for a in links}:
-        return set()
+        return {}
+    drop = {}
+    for action in links:
+        norm = normalize_link_url(action_url(page, action))
+        if norm and norm in tried:
+            drop[action.get("id")] = "tried link"
+            continue
+        score = score_link(action.get("label"), action_url(page, action), True, todo_words, tried)
+        if action.get("nav") and score <= 0:
+            drop[action.get("id")] = "nav suppression"
+    if set(drop) >= {a.get("id") for a in links}:
+        return {}
     return drop
+
+
+def compute_suppressed(state, page):
+    return set(suppression_reasons(state, page))
+
+
+ACTION_STRATEGY = {
+    "click": "click",
+    "fill": "type+enter",
+    "select": "select",
+    "select_option": "SELECT_OPTION",
+    "upload": "upload",
+    "check": "SET_CHECKED",
+    "key": "keyboard",
+    "scroll": "scroll",
+    "wait": "wait",
+    "navigate": "navigate",
+    "switch_tab": "switch_tab",
+    "close_tab": "close_tab",
+    "vision": "coordinate",
+}
+
+
+def compact_action(action):
+    """The offered-controls row: id, label, role, kind, and widget state."""
+    row = {"id": action.get("id"), "label": action.get("label"), "role": action.get("role"), "kind": action.get("kind")}
+    for key in ("checked", "selected", "expanded", "pressed", "value", "current_value", "group"):
+        if action.get(key) not in (None, ""):
+            row[key] = action.get(key)
+    return row
 
 
 def page_for_choice(state):
@@ -418,9 +457,19 @@ class Agent:
         self.browser = Browser(url, config=self.config)
         self.record_dir = Path(record_dir) if record_dir else None
         self.screenshots = screenshots or bool(record_dir)
+        self.log = get_logger("agent")
+        self.trace = Trace(run_id=os.environ.get("JEV_RUN_ID") or None)
         try:
+            started = time.perf_counter()
             page = self.browser.observe(screenshot=self.screenshots)
-        except Exception:
+            indexer_ms = round((time.perf_counter() - started) * 1000)
+        except Exception as error:
+            self.trace.emit(
+                "error", step=0, type=type(error).__name__, message=str(error)[:300],
+                where="observe", retried=False,
+                stack=traceback.format_exc(limit=5) if self.trace.level >= 2 else None,
+            )
+            self.trace.close()
             self.browser.close()
             raise
         self.state = dict(
@@ -441,6 +490,7 @@ class Agent:
         if self.record_dir:
             self.record_dir.mkdir(parents=True, exist_ok=True)
             (self.record_dir / "000000.jpg").write_bytes(base64.b64decode(page["screenshot"]))
+        self._emit_snapshot(self.state, 0, indexer_ms, page_changed=None)
 
     def _maybe_vision(self, state):
         if not (getattr(self, "config", None) or {}).get("vision"):
@@ -515,6 +565,169 @@ class Agent:
             "elements": action_space(self.state["page"]["actions"])[0],
         }
 
+    def _emit_snapshot(self, state, step, indexer_ms, page_changed):
+        page = state["page"]
+        self.trace.emit(
+            "snapshot",
+            step=step,
+            url=page.get("url"),
+            title=page.get("title"),
+            controls=len(page.get("actions") or []),
+            modal_scoped=page.get("modal_scoped"),
+            overlay=page.get("overlay"),
+            fingerprint=(page.get("fingerprint") or "")[:16],
+            page_changed=page_changed,
+            duration_ms=indexer_ms,
+        )
+
+    def _emit_offered(self, state, step, shown):
+        ids = {action.get("id") for action in shown.get("actions") or []}
+        holds = state.get("held_actions") or {}
+        reasons = state.get("hold_reasons") or {}
+        held = {action_id: reasons.get(action_id, "held") for action_id, left in holds.items() if left > 0}
+        suppressed = {
+            action_id: reason
+            for action_id, reason in (state.get("suppression_reasons") or {}).items()
+            if action_id not in ids
+        }
+        fields = {
+            "offered": [compact_action(action) for action in shown.get("actions") or []],
+            "offered_count": len(ids),
+            "held": held,
+            "suppressed": suppressed,
+        }
+        if self.trace.level >= 2:
+            fields["offered_full"] = shown.get("actions") or []
+        self.trace.emit("offered", step=step, **fields)
+
+    def _emit_end(self, state, status):
+        if self.trace.ended:
+            return
+        prompt = completion = 0
+        for item in state.get("decisions") or []:
+            for usage in (item.get("usage"), item.get("verifier_usage"), item.get("decompose_usage")):
+                pin, pout = token_counts(usage)
+                prompt += pin
+                completion += pout
+        for item in state.get("text_calls") or []:
+            pin, pout = token_counts(item.get("usage"))
+            prompt += pin
+            completion += pout
+        self.trace.emit(
+            "end",
+            step=len(state.get("history") or []),
+            status=status,
+            blocked_reason=state.get("blocked_reason"),
+            decisions=len(state.get("decisions") or []),
+            input_tokens=prompt,
+            output_tokens=completion,
+            cost_usd_estimate=cost_estimate_usd(prompt, completion),
+            wall_ms=state.get("elapsed_ms"),
+            phases={phase: round(value) for phase, value in self.trace.phase_ms.items()},
+        )
+
+    def _failshot(self, state):
+        """A failure screenshot, captured on demand. Screenshots stay off otherwise."""
+        try:
+            shot = state["browser"].call("Page.captureScreenshot", format="jpeg", quality=60)
+        except Exception:
+            return None
+        return shot.get("data") if isinstance(shot, dict) else None
+
+    def _block(self, state, reason, step):
+        """A terminal blocked stop with its evidence bundle and trace flush."""
+        state["status"] = "blocked"
+        state["blocked_reason"] = reason
+        self._partial_close(state)
+        state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
+        self.trace.save_failure(step, self._failshot(state))
+        self._emit_end(state, "blocked")
+        self.trace.flush()
+        return self.snapshot()
+
+    @staticmethod
+    def _cdp(browser):
+        snapshot = getattr(browser, "cdp_snapshot", None)
+        if snapshot is None:
+            return 0, 0.0
+        try:
+            calls, ms = snapshot()
+            return int(calls), float(ms)
+        except Exception:
+            return 0, 0.0
+
+    def _gen_text(self, state, step, context, system=TEXT_VALUE, purpose="field", action=None):
+        """One text-helper call with its trace event. Failures emit, then raise."""
+        label = (action or {}).get("label")
+        if self.pending_text and self.pending_text[0] == context:
+            _, text, helper = self.pending_text
+            self.trace.emit(
+                "text", step=step, purpose=purpose, model=(helper or {}).get("model"),
+                effort=(helper or {}).get("effort"), latency_ms=0, duration_ms=0,
+                retries=0, filtered=False, valid=True, cached=True,
+                field_label=label, value=text,
+            )
+            return text, helper
+        started = time.perf_counter()
+        try:
+            if system == TEXT_VALUE and purpose == "field":
+                text, helper = field_text(context)
+            else:
+                text, helper = field_text(context, system=system)
+        except (ValueError, RuntimeError) as error:
+            self.trace.emit(
+                "text", step=step, purpose=purpose, latency_ms=round((time.perf_counter() - started) * 1000),
+                duration_ms=round((time.perf_counter() - started) * 1000),
+                retries=0, filtered=False, valid=False, reason=str(error)[:200],
+                field_label=label, value=None,
+            )
+            raise
+        duration_ms = round((time.perf_counter() - started) * 1000)
+        self.trace.emit(
+            "text", step=step, purpose=purpose, model=helper.get("model"), effort=helper.get("effort"),
+            latency_ms=helper.get("latency_ms"), duration_ms=duration_ms,
+            retries=helper.get("retries", 0), filtered=helper.get("filtered", False),
+            valid=True, cached=False, field_label=label, value=text,
+        )
+        return text, helper
+
+    @staticmethod
+    def _verify_info(action, before_page, after_page, result):
+        """Before/after widget state for the verify event, with the next strategy."""
+        before = {key: action.get(key) for key in ("value", "checked", "selected", "expanded", "pressed")}
+        label = action.get("label")
+        match = next(
+            (
+                item
+                for item in (after_page.get("actions") or [])
+                if item.get("label") == label and item.get("kind") == action.get("kind")
+            ),
+            None,
+        )
+        after = (
+            {key: match.get(key) for key in ("value", "checked", "selected", "expanded", "pressed")}
+            if match is not None
+            else None
+        )
+        kind = action.get("kind")
+        if kind == "fill":
+            success = bool((result or {}).get("text_verified", True))
+            changed = before.get("value") != (after or {}).get("value") if after else None
+            nxt = None if success else "held; try typing in the field twin and pressing Enter"
+        elif kind == "check":
+            success = bool((result or {}).get("already_set") or (result or {}).get("verified", False))
+            changed = before.get("checked") != (after or {}).get("checked") if after else None
+            nxt = None if success else "held as already selected; try a different control"
+        elif kind == "select_option":
+            success = match is not None or (result or {}).get("executed") is not None
+            changed = before.get("value") != (after or {}).get("value") if after else None
+            nxt = None if success else "no matching option; held"
+        else:
+            success = after_page.get("fingerprint") != before_page.get("fingerprint") or match is None
+            changed = after_page.get("fingerprint") != before_page.get("fingerprint")
+            nxt = None if success else "held for two steps"
+        return {"before": before, "after": after, "changed": changed, "success": success, "next": nxt}
+
     def command(self, name, body=None):
         body = body or {}
         state = self.state
@@ -525,47 +738,76 @@ class Agent:
                 if state["status"] in {"done", "blocked"}:
                     return self.snapshot()
                 pending = (state.get("decision") or {}).get("choice")
-                return self.command("act", {"fingerprint": state["page"]["fingerprint"]})
-            except StalePage:
+                result = self.command("act", {"fingerprint": state["page"]["fingerprint"]})
+                self.trace.flush()
+                return result
+            except StalePage as error:
+                step = len(state.get("history") or []) + 1
+                self.trace.emit(
+                    "error", step=step, type="StalePage", message=str(error)[:300],
+                    where="tick", retried=True,
+                    stack=traceback.format_exc(limit=5) if self.trace.level >= 2 else None,
+                )
                 state["decision"] = None
                 state["status"] = "ready"
                 if pending and pending not in {"DONE", "BLOCKED"}:
                     # This target stopped matching at execution time. Re-picking
                     # it against the same page would loop forever.
+                    reasons = dict(state.get("hold_reasons") or {})
                     state["held_actions"] = note_no_progress(
-                        state.get("held_actions"), {"id": pending, "kind": None}, False
+                        state.get("held_actions"), {"id": pending, "kind": None}, False,
+                        reasons, "stale hold",
                     )
+                    state["hold_reasons"] = reasons
                 try:
+                    started = time.perf_counter()
                     state["page"] = state["browser"].observe(screenshot=self.screenshots)
+                    indexer_ms = round((time.perf_counter() - started) * 1000)
                 except StalePage:
                     # The document never settled, even after observe's own
                     # backoff. Block honestly instead of failing the run.
-                    state["status"] = "blocked"
-                    state["blocked_reason"] = "page never settled"
+                    return self._block(state, "page never settled", step)
+                self._emit_snapshot(state, step, indexer_ms, page_changed=True)
                 state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
+                self.trace.flush()
                 return self.snapshot()
         elif name == "predict":
             if not state["browser"]:
                 raise ValueError("Start a demo first")
             if state["started_at"] is None:
                 state["started_at"] = time.perf_counter()
+            step = len(state.get("history") or []) + 1
+            prev_fp = state.get("_prev_fp")
             if not state["browser"].fresh(state["page"]):
+                started = time.perf_counter()
                 state["page"] = state["browser"].observe(screenshot=self.screenshots)
+                indexer_ms = round((time.perf_counter() - started) * 1000)
+            else:
+                indexer_ms = 0
+            changed = prev_fp is not None and state["page"].get("fingerprint") != prev_fp
+            self._emit_snapshot(state, step, indexer_ms, page_changed=changed)
+            state["_prev_fp"] = state["page"].get("fingerprint")
             state["decision"] = None
             if state["status"] in {"done", "blocked"}:
                 raise ValueError("This run has stopped. Start a fresh demo.")
             cycle = detect_cycle(state.get("loop_window") or [])
             if cycle:
-                state["held_actions"] = hold_actions(state.get("held_actions"), cycle["ids"])
+                reasons = dict(state.get("hold_reasons") or {})
+                state["held_actions"] = hold_actions(
+                    state.get("held_actions"), cycle["ids"], reasons=reasons, reason="loop hold"
+                )
+                state["hold_reasons"] = reasons
                 state["loop_fires"] = state.get("loop_fires", 0) + 1
                 state["loop_note"] = "loop detected: avoid " + "/".join(cycle["labels"])
+                tail = (state.get("loop_window") or [])[-6:]
+                self.trace.emit(
+                    "guard", step=step, type="loop",
+                    pattern="/".join(cycle["labels"]), ids=cycle["ids"], fires=state["loop_fires"],
+                    evidence=[{"op": item.get("key", ["?"])[0], "label": item.get("label")} for item in tail],
+                )
                 if state["loop_fires"] >= LOOP_STOP_FIRES:
-                    state["status"] = "blocked"
-                    state["blocked_reason"] = "loop detected"
-                    self._partial_close(state)
-                    state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
-                    return self.snapshot()
-            self._stall_check(state)
+                    return self._block(state, "loop detected", step)
+            self._stall_check(state, step)
             if "page_target" not in state:
                 state["page_target"] = goal_page_target(state["goal"])
             if state["page_target"]:
@@ -575,31 +817,56 @@ class Agent:
             config = getattr(self, "config", None) or {}
             budget = config.get("max_decisions") or DEFAULT_MAX_DECISIONS
             if len(state["decisions"]) >= budget:
-                state["status"] = "blocked"
-                state["blocked_reason"] = "decision budget"
-                self._partial_close(state)
-                state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
-                return self.snapshot()
-            if len(state["decisions"]) >= budget * 0.75:
+                self.trace.emit("guard", step=step, type="budget", used=len(state["decisions"]), budget=budget)
+                return self._block(state, "decision budget", step)
+            if len(state["decisions"]) >= budget * 0.75 and not state.get("winding_down"):
                 state["winding_down"] = True
-            self._track_progress(state)
-            self._update_suppression(state)
+                self.trace.emit("guard", step=step, type="wind_down", used=len(state["decisions"]), budget=budget)
+            self._track_progress(state, step)
+            self._update_suppression(state, step)
+            shown = page_for_choice(state)
+            self._emit_offered(state, step, shown)
+            retries = 0
+            invalid_reason = None
+            started = time.perf_counter()
             try:
-                state["decision"] = self._maybe_vision(state) or self._decide(state, page_for_choice(state))
+                state["decision"] = self._maybe_vision(state) or self._decide(state, shown)
             except ValueError as exc:
                 if str(exc) != INVALID_RESPONSE:
                     raise
-                print("[jev:decision] invalid response; retrying once", file=sys.stderr, flush=True)
+                self.log.info("[jev:decision] invalid response; retrying once")
+                invalid_reason = getattr(choose, "last_invalid", "") or "invalid response"
                 try:
-                    state["decision"] = self._maybe_vision(state) or self._decide(state, page_for_choice(state))
+                    retries = 1
+                    state["decision"] = self._maybe_vision(state) or self._decide(state, shown)
                 except ValueError as retry_exc:
                     if str(retry_exc) != INVALID_RESPONSE:
                         raise
-                    state["status"] = "blocked"
-                    state["blocked_reason"] = "invalid decision response"
-                    state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
-                    return self.snapshot()
+                    invalid_reason = getattr(choose, "last_invalid", "") or "invalid response"
+                    self.trace.emit(
+                        "decision", step=step, provider=decision_provider(), model=None,
+                        latency_ms=None, duration_ms=round((time.perf_counter() - started) * 1000),
+                        choice=None, retries=retries, invalid_reason=invalid_reason,
+                    )
+                    self.trace.emit(
+                        "error", step=step, type="ValueError", message=INVALID_RESPONSE,
+                        where="predict", retried=True,
+                    )
+                    return self._block(state, "invalid decision response", step)
+            decision = state["decision"]
+            fields = {
+                "provider": decision_provider(), "model": decision.get("model"),
+                "latency_ms": decision.get("latency_ms"),
+                "duration_ms": round((time.perf_counter() - started) * 1000),
+                "choice": decision.get("choice"), "operation": decision.get("operation"),
+                "target": decision.get("target"), "confidence": decision.get("confidence"),
+                "retries": retries, "invalid_reason": invalid_reason,
+            }
+            if self.trace.level >= 2:
+                fields["raw"] = decision.get("raw_answers")
+            self.trace.emit("decision", step=step, **fields)
             state["held_actions"] = decay_holds(state.get("held_actions"))
+            state["hold_reasons"] = decay_hold_reasons(state.get("hold_reasons"), state.get("held_actions"))
             state["decisions"].append(
                 {
                     **state["decision"],
@@ -615,6 +882,7 @@ class Agent:
             # Consume once, before any mutation or model call. A retry cannot double-click.
             state["decision"] = None
             selected = decision["choice"]
+            step = len(state.get("history") or []) + 1
             if selected in {"DONE", "BLOCKED"}:
                 if not state["browser"].fresh(page):
                     state["status"] = "ready"
@@ -631,7 +899,12 @@ class Agent:
                     state["status"] = "ready"
                     return self.snapshot()
                 if selected == "DONE" and decision_provider() != "mercury":
-                    verdict = self._done_verdict(state, page)
+                    verdict = self._done_verdict(state, page, step)
+                    self.trace.emit(
+                        "progress", step=step, gate_accept=verdict["accept"],
+                        gate_partial=verdict["partial"], gate_missing=verdict["missing"][:200],
+                        todo=[item["text"] for item in state.get("subgoals") or [] if not item.get("satisfied")],
+                    )
                     if not verdict["accept"]:
                         state["done_rejections"] = state.get("done_rejections", 0) + 1
                         add_event_note(state, f"Not done yet: still missing {verdict['missing'][:160]}.")
@@ -641,8 +914,14 @@ class Agent:
                 state["status"] = "done" if selected == "DONE" else "blocked"
                 state["plan_index"] = int(selected == "DONE")
                 if selected == "DONE":
-                    state["answer"] = self._final_answer(state, page)
+                    state["answer"] = self._final_answer(state, page, step)
                 state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
+                if selected == "BLOCKED" and not state.get("blocked_reason"):
+                    state["blocked_reason"] = "gave up"
+                if state["status"] == "blocked":
+                    self.trace.save_failure(step, self._failshot(state))
+                self._emit_end(state, state["status"])
+                self.trace.flush()
                 return self.snapshot()
             if selected == "VISION_CLICK":
                 point = decision.get("vision") or {}
@@ -659,24 +938,19 @@ class Agent:
             if len(state["history"]) >= action_budget:
                 # Every action costs a decision, so the action cap follows the
                 # run's decision budget instead of a smaller fixed number.
-                state["status"] = "blocked"
-                state["blocked_reason"] = "action budget"
-                self._partial_close(state)
-                state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
-                return self.snapshot()
+                return self._block(state, "action budget", step)
             text, helper = None, None
             unmatched_option = False
             if action["kind"] in {"fill", "select_option"}:
                 if not state["browser"].fresh(page):
                     raise StalePage("Page changed before text generation. Choose again.")
                 context = field_context(state["goal"], action, page, state["history"])
-                if self.pending_text and self.pending_text[0] == context:
-                    _, text, helper = self.pending_text
-                else:
-                    try:
-                        text, helper = field_text(context)
-                    except ValueError:
-                        return self._skip_text_step(state, page, action, decision, selected)
+                cached = self.pending_text and self.pending_text[0] == context
+                try:
+                    text, helper = self._gen_text(state, step, context, TEXT_VALUE, "field", action)
+                except ValueError:
+                    return self._skip_text_step(state, page, action, decision, selected)
+                if not cached:
                     self.pending_text = (context, text, helper)
                     state["text_calls"].append({**helper, "field": action["label"], "value": text})
                 if action["kind"] == "fill" and action.get("value") == text:
@@ -684,17 +958,18 @@ class Agent:
                     # it is a mutation with no effect; mark the step satisfied.
                     return self._skip_already_set(state, page, action, decision, selected, text, helper)
             result = {"executed": action["id"]}
+            cdp_calls, cdp_ms = self._cdp(state["browser"])
+            act_started = time.perf_counter()
             if action["kind"] == "navigate":
                 if not state["browser"].fresh(page):
                     raise StalePage("Page changed before text generation. Choose again.")
                 context = field_context(state["goal"], action, page, state["history"])
-                if self.pending_text and self.pending_text[0] == context:
-                    _, text, helper = self.pending_text
-                else:
-                    try:
-                        text, helper = field_text(context, system=NAVIGATE_VALUE)
-                    except ValueError:
-                        return self._skip_text_step(state, page, action, decision, selected)
+                cached = self.pending_text and self.pending_text[0] == context
+                try:
+                    text, helper = self._gen_text(state, step, context, NAVIGATE_VALUE, "navigate", action)
+                except ValueError:
+                    return self._skip_text_step(state, page, action, decision, selected)
+                if not cached:
                     self.pending_text = (context, text, helper)
                     state["text_calls"].append({**helper, "field": action["label"], "value": text})
                 try:
@@ -718,6 +993,9 @@ class Agent:
             else:
                 # Browser.act checks freshness immediately before input, including after text generation.
                 result = state["browser"].act(action, page, text=text)
+            act_ms = round((time.perf_counter() - act_started) * 1000)
+            cdp_after, cdp_ms_after = self._cdp(state["browser"])
+            cdp_calls, cdp_ms = cdp_after - cdp_calls, round(cdp_ms_after - cdp_ms)
             if not unmatched_option:
                 self.pending_text = None
                 self.blocked_streak = 0
@@ -774,7 +1052,17 @@ class Agent:
                     "elapsed_ms": state["elapsed_ms"],
                 }
             )
+            done_step = len(state["history"])
+            self.trace.emit(
+                "action", step=done_step, operation=decision["operation"], target=action["label"],
+                kind=action.get("kind"), strategy=ACTION_STRATEGY.get(action.get("kind"), action.get("kind")),
+                cdp_calls=cdp_calls, cdp_ms=cdp_ms, duration_ms=act_ms,
+                ok=not (text_failed or check_failed or unmatched_option),
+            )
+            verify_started = time.perf_counter()
+            post_started = time.perf_counter()
             state["page"] = state["browser"].observe(screenshot=self.screenshots)
+            post_ms = round((time.perf_counter() - post_started) * 1000)
             changed = state["page"]["fingerprint"] != page["fingerprint"]
             unchanged = control_unchanged(action, page, state["page"])
             if unchanged:
@@ -787,17 +1075,30 @@ class Agent:
                 if isinstance(refreshed, dict) and refreshed.get("fingerprint"):
                     state["page"] = refreshed
                     changed = refreshed["fingerprint"] != page["fingerprint"]
+            verify = self._verify_info(action, page, state["page"], result)
+            self.trace.emit(
+                "verify", step=done_step, kind=action.get("kind"), before=verify["before"],
+                after=verify["after"], changed=verify["changed"], success=verify["success"],
+                next_strategy=verify["next"], duration_ms=round((time.perf_counter() - verify_started) * 1000),
+            )
+            self._emit_snapshot(state, done_step, post_ms, page_changed=changed)
+            state["_prev_fp"] = state["page"].get("fingerprint")
+            self.trace.maybe_step_shot(done_step, state["page"].get("screenshot"))
             state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
             state["history"][-1].update(
                 page_changed=changed,
                 url=state["page"]["url"],
                 elapsed_ms=state["elapsed_ms"],
             )
+            reasons = dict(state.get("hold_reasons") or {})
             state["held_actions"] = note_no_progress(
                 state.get("held_actions"),
                 {"id": selected, "kind": action.get("kind")},
                 False if unchanged else changed,
+                reasons,
+                "already selected" if unchanged == "already selected" else "no-progress hold",
             )
+            state["hold_reasons"] = reasons
             if action.get("kind") != "wait":
                 window = state.get("loop_window") or []
                 progress = bool(switched) or not same_page(window, state["page"])
@@ -823,8 +1124,16 @@ class Agent:
                 h["page_changed"] is False and h["kind"] != "wait" for h in repeated
             )
             state["status"] = "blocked" if stalled else "ready"
-            if stalled and any(h.get("possible_closed_shadow") for h in repeated):
-                state["blocked_reason"] = "possible closed shadow root"
+            if stalled:
+                if any(h.get("possible_closed_shadow") for h in repeated):
+                    state["blocked_reason"] = "possible closed shadow root"
+                self.trace.emit(
+                    "guard", step=len(state["history"]), type="stall",
+                    evidence=[h.get("action") for h in repeated],
+                )
+                self.trace.save_failure(len(state["history"]), self._failshot(state))
+                self._emit_end(state, "blocked")
+                self.trace.flush()
         else:
             raise ValueError("Unknown command")
         return self.snapshot()
@@ -856,23 +1165,40 @@ class Agent:
                 "elapsed_ms": state["elapsed_ms"],
             }
         )
+        reasons = dict(state.get("hold_reasons") or {})
         state["held_actions"] = note_no_progress(
-            state.get("held_actions"), {"id": selected, "kind": action.get("kind")}, False
+            state.get("held_actions"), {"id": selected, "kind": action.get("kind")}, False,
+            reasons, "already set",
+        )
+        state["hold_reasons"] = reasons
+        done_step = len(state["history"])
+        self.trace.emit(
+            "action", step=done_step, operation=decision["operation"], target=action["label"],
+            kind=action.get("kind"), strategy="already-set", cdp_calls=0, cdp_ms=0,
+            duration_ms=0, ok=True,
+        )
+        self.trace.emit(
+            "verify", step=done_step, kind=action.get("kind"),
+            before={"value": action.get("value")}, after={"value": action.get("value")},
+            changed=False, success=True, next_strategy=None, duration_ms=0,
         )
         state.setdefault("loop_window", []).append(loop_step(decision, action, page, True))
         state["loop_window"] = state["loop_window"][-LOOP_WINDOW:]
         state["status"] = "ready"
         return self.snapshot()
 
-    def _final_answer(self, state, page):
+    def _final_answer(self, state, page, step=None):
         """One best-effort summary of what the goal asked for. Never fails the run."""
         evidence = [
             {"subgoal": item["text"], "value": item.get("value"), "source": item.get("source")}
             for item in state.get("subgoals") or []
             if item.get("satisfied")
         ]
+        step = len(state.get("history") or []) if step is None else step
         try:
-            text, helper = field_text(
+            text, helper = self._gen_text(
+                state,
+                step,
                 answer_context(
                     state["goal"],
                     page,
@@ -881,10 +1207,11 @@ class Agent:
                     state.get("memo") or [],
                     bool(state.get("partial")),
                 ),
-                system=ANSWER_VALUE,
+                ANSWER_VALUE,
+                "answer",
             )
         except (ValueError, RuntimeError):
-            print("[jev:answer] text helper failed; finishing without an answer", file=sys.stderr, flush=True)
+            self.log.info("[jev:answer] text helper failed; finishing without an answer")
             return None
         state["text_calls"].append({**helper, "field": "final answer", "value": text})
         return text
@@ -935,17 +1262,26 @@ class Agent:
         state["status"] = "ready"
         return True
 
-    def _stall_check(self, state):
+    def _stall_check(self, state, step=None):
         stall = detect_control_stall(state.get("loop_window") or [])
         if not stall or not stall["id"]:
             return
         notified = state.get("stall_notified") or {}
-        step = len(state.get("history") or [])
+        step = len(state.get("history") or []) if step is None else step
         if notified.get("id") == stall["id"] and step - notified.get("step", 0) < 6:
             return
         state["stall_notified"] = {"id": stall["id"], "step": step}
-        state["held_actions"] = hold_actions(state.get("held_actions"), [stall["id"]], STALL_HOLD_STEPS)
-        add_event_note(state, self._stall_advice(state, stall))
+        reasons = dict(state.get("hold_reasons") or {})
+        state["held_actions"] = hold_actions(
+            state.get("held_actions"), [stall["id"]], STALL_HOLD_STEPS, reasons, "stall"
+        )
+        state["hold_reasons"] = reasons
+        advice = self._stall_advice(state, stall)
+        add_event_note(state, advice)
+        self.trace.emit(
+            "guard", step=step, type="stall", id=stall["id"], label=stall["label"],
+            evidence=f"same control {STALL_REPEATS}x with no progress; {advice}"[:200],
+        )
 
     def _stall_advice(self, state, stall):
         actions = state["page"].get("actions", [])
@@ -972,11 +1308,12 @@ class Agent:
             )
         return f"{stall['label']} is not responding; try a different strategy instead of clicking it again."
 
-    def _track_progress(self, state):
+    def _track_progress(self, state, step=None):
+        step = len(state.get("history") or []) if step is None else step
         if should_activate_subgoals(state):
-            state["subgoals"] = [
-                {"id": index, "text": text} for index, text in enumerate(decompose_goal(state["goal"]))
-            ]
+            started = time.perf_counter()
+            items = decompose_goal(state["goal"])
+            state["subgoals"] = [{"id": index, "text": text} for index, text in enumerate(items)]
             state["text_calls"].append(
                 {
                     "model": os.environ.get("TEXT_MODEL", "mercury-2.5"),
@@ -986,16 +1323,27 @@ class Agent:
                     "value": None,
                 }
             )
+            self.trace.emit(
+                "text", step=step, purpose="decompose", model=os.environ.get("TEXT_MODEL", "mercury-2.5"),
+                latency_ms=0, duration_ms=round((time.perf_counter() - started) * 1000),
+                retries=0, filtered=False, valid=True, cached=False,
+                field_label=None, value=None,
+            )
+            self.trace.emit(
+                "progress", step=step, subgoals=[item["text"] for item in state["subgoals"]],
+                satisfied=[], todo=[item["text"] for item in state["subgoals"]],
+                facts_added=[], leave_site=False, complete=False,
+            )
         if state.get("subgoals") is None:
             return
         url = state["page"].get("url") or ""
         if url == state.get("judged_url"):
             return
-        step = len(state.get("history") or [])
         if step - state.get("judged_step", -9) < 3:
             return
         state["judged_url"] = url
         state["judged_step"] = step
+        started = time.perf_counter()
         try:
             judgment, helper = judge_progress(
                 track_context(
@@ -1003,19 +1351,42 @@ class Agent:
                 ),
                 TRACK_SYSTEM,
             )
-        except (ValueError, RuntimeError):
-            print("[jev:track] judgment failed; keeping previous progress", file=sys.stderr, flush=True)
+        except (ValueError, RuntimeError) as error:
+            self.log.info("[jev:track] judgment failed; keeping previous progress")
+            self.trace.emit(
+                "error", step=step, type=type(error).__name__, message=str(error)[:200],
+                where="track", retried=False,
+            )
             return
+        self.trace.emit(
+            "text", step=step, purpose="track", model=helper.get("model"), effort=helper.get("effort"),
+            latency_ms=helper.get("latency_ms"), duration_ms=round((time.perf_counter() - started) * 1000),
+            retries=helper.get("retries", 0), filtered=helper.get("filtered", False),
+            valid=True, cached=False, field_label=None, value=None,
+        )
         state["text_calls"].append({**helper, "field": "progress judgment", "value": None})
         had = sum(1 for item in state.get("subgoals") or [] if item.get("satisfied"))
         memo_before = len(state.get("memo") or [])
         apply_judgment(state, judgment, url)
         gained = sum(1 for item in state.get("subgoals") or [] if item.get("satisfied")) > had
         new_facts = [item["fact"] for item in (state.get("memo") or [])[memo_before:]]
-        self._maybe_go_back(state, url, gained, new_facts)
+        subgoals = state.get("subgoals") or []
+        self.trace.emit(
+            "progress", step=step,
+            subgoals=[item["text"] for item in subgoals],
+            satisfied=[
+                {"text": item["text"], "value": item.get("value"), "source": item.get("source")}
+                for item in subgoals if item.get("satisfied")
+            ],
+            todo=[item["text"] for item in subgoals if not item.get("satisfied")],
+            facts_added=new_facts, leave_site=bool(state.get("leave_site")),
+            complete=not any(not item.get("satisfied") for item in subgoals),
+        )
+        self._maybe_go_back(state, url, gained, new_facts, step)
 
-    def _maybe_go_back(self, state, url, gained, new_facts):
+    def _maybe_go_back(self, state, url, gained, new_facts, step=None):
         """A click that lands nowhere new is a detour: go BACK once and mark it tried."""
+        step = len(state.get("history") or []) if step is None else step
         excursion = state.get("excursion")
         if not excursion or url != excursion.get("at"):
             if excursion:
@@ -1039,7 +1410,11 @@ class Agent:
             state["browser"].wait_until_ready()
             state["page"] = state["browser"].observe(screenshot=self.screenshots)
         except (StalePage, RuntimeError) as error:
-            print(f"[jev:back] could not go back ({error}); continuing", file=sys.stderr, flush=True)
+            self.log.info(f"[jev:back] could not go back ({error}); continuing")
+            self.trace.emit(
+                "error", step=step, type=type(error).__name__, message=str(error)[:200],
+                where="back", retried=False,
+            )
             state["excursion"] = None
             return
         state["backs_used"] = (state.get("backs_used") or 0) + 1
@@ -1050,29 +1425,45 @@ class Agent:
         state["tried_links"] = tried[-20:]
         state["excursion"] = None
         add_event_note(state, f"Went back; '{excursion.get('label')}' led nowhere new.")
+        self.trace.emit(
+            "guard", step=step, type="back", label=excursion.get("label"),
+            back_from=excursion.get("at"), back_to=state["page"].get("url"),
+            backs_used=state["backs_used"],
+            evidence="click landed on a page that advanced no sub-goal and added no on-topic fact",
+        )
         state["judged_url"] = state["page"].get("url") or ""
         state["judged_step"] = len(state.get("history") or [])
 
-    def _update_suppression(self, state):
+    def _update_suppression(self, state, step=None):
         subgoals = state.get("subgoals") or []
         todo = any(not item.get("satisfied") for item in subgoals)
         held_nav = (state.get("held_actions") or {}).get("navigate", 0) > 0
-        state["force_navigate"] = bool(
+        forced = bool(
             todo
             and state.get("leave_site")
             and state.get("leave_site_url") == state["page"].get("url")
             and not held_nav
         )
+        if forced and not state.get("force_navigate"):
+            step = len(state.get("history") or []) if step is None else step
+            self.trace.emit(
+                "guard", step=step, type="force_navigate", todo=current_todo(state)[:160],
+                evidence=f"leave_site on {state.get('leave_site_url')}",
+            )
+        state["force_navigate"] = forced
         state["suppressed_fp"] = state["page"].get("fingerprint")
-        state["suppressed_ids"] = compute_suppressed(state, state["page"])
+        state["suppression_reasons"] = suppression_reasons(state, state["page"])
+        state["suppressed_ids"] = set(state["suppression_reasons"])
 
-    def _done_verdict(self, state, page):
+    def _done_verdict(self, state, page, step=None):
         """Accept DONE only when pagination and every sub-goal check out. Bounded: two
         rejections, then accept as partial so a strict judge cannot trap the run."""
+        step = len(state.get("history") or []) if step is None else step
         target, current = state.get("page_target"), state.get("page_current")
         if target and current != target:
             missing = f"page {target} (now on page {current or '?'})"
         else:
+            started = time.perf_counter()
             try:
                 judgment, helper = judge_progress(
                     gate_context(
@@ -1080,9 +1471,21 @@ class Agent:
                     ),
                     GATE_SYSTEM,
                 )
-            except (ValueError, RuntimeError):
-                print("[jev:gate] judgment failed; treating DONE as unverified", file=sys.stderr, flush=True)
+            except (ValueError, RuntimeError) as error:
+                self.log.info("[jev:gate] judgment failed; treating DONE as unverified")
+                self.trace.emit(
+                    "error", step=step, type=type(error).__name__, message=str(error)[:200],
+                    where="gate", retried=False,
+                )
                 judgment, helper = None, None
+            else:
+                self.trace.emit(
+                    "text", step=step, purpose="gate", model=helper.get("model"), effort=helper.get("effort"),
+                    latency_ms=helper.get("latency_ms"),
+                    duration_ms=round((time.perf_counter() - started) * 1000),
+                    retries=helper.get("retries", 0), filtered=helper.get("filtered", False),
+                    valid=True, cached=False, field_label=None, value=None,
+                )
             if helper is not None:
                 state["text_calls"].append({**helper, "field": "done gate", "value": None})
             if judgment is not None:
@@ -1161,9 +1564,14 @@ class Agent:
 
     def close(self):
         try:
-            self.browser.close()
+            trace = getattr(self, "trace", None)
+            if trace is not None:
+                trace.close()
         finally:
-            self.browser.stop_cloud()
+            try:
+                self.browser.close()
+            finally:
+                self.browser.stop_cloud()
 
     def __enter__(self):
         return self

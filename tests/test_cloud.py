@@ -84,7 +84,7 @@ def test_default_is_local_and_uses_ensure_daemon(local_browser, monkeypatch, fak
         tab.close()
 
 
-def test_cloud_body_switches_names_and_skips_ensure_daemon(monkeypatch, fake_cloud, capsys):
+def test_cloud_body_switches_names_and_skips_ensure_daemon(monkeypatch, fake_cloud, caplog):
     started, _ = fake_cloud
     monkeypatch.setenv("JEV_BROWSER", "cloud")
     monkeypatch.setenv("JEV_CLOUD_PROXY_COUNTRY", "none")
@@ -124,9 +124,8 @@ def test_cloud_body_switches_names_and_skips_ensure_daemon(monkeypatch, fake_clo
         # The live view shows the owned tab by default in cloud mode.
         create = next(params for method, params in calls if method == "Target.createTarget")
         assert create["background"] is False
-        err = capsys.readouterr().err
-        assert "browser-1" in err
-        assert "live.invalid" not in err
+        assert "browser-1" in caplog.text
+        assert "live.invalid" not in caplog.text
     finally:
         tab.close()
 
@@ -138,13 +137,13 @@ def test_timeout_is_clamped(monkeypatch, raw, expected):
     assert resolve_config()["cloud"]["timeout_min"] == expected
 
 
-def test_show_live_url_is_opt_in(monkeypatch, fake_cloud, capsys):
+def test_show_live_url_is_opt_in(monkeypatch, fake_cloud, caplog):
     monkeypatch.setenv("JEV_BROWSER", "cloud")
     monkeypatch.setenv("JEV_CLOUD_SHOW_LIVE_URL", "1")
     config = resolve_config()
     handle = cloud.start(config)
     try:
-        assert "https://live.invalid/owned-tab" in capsys.readouterr().err
+        assert "https://live.invalid/owned-tab" in caplog.text
     finally:
         cloud.stop(handle)
 
@@ -180,29 +179,29 @@ def test_missing_key_is_a_clear_error_without_key_text(monkeypatch, fake_cloud):
     assert started == []
 
 
-def test_stop_failure_is_logged_without_raising_or_leaking(monkeypatch, fake_cloud, capsys):
+def test_stop_failure_is_logged_without_raising_or_leaking(monkeypatch, fake_cloud, caplog):
     def fail(_name):
         raise RuntimeError(f"key={FAKE_KEY} https://live.invalid/owned-tab")
 
     monkeypatch.setattr(cloud, "stop_remote_daemon", fail)
     handle = cloud.start({"cloud": {}})
     cloud.stop(handle)
-    err = capsys.readouterr().err
-    assert "stop failed" in err
-    assert FAKE_KEY not in err
-    assert "live.invalid" not in err
+    assert "stop failed" in caplog.text
+    assert FAKE_KEY not in caplog.text
+    assert "live.invalid" not in caplog.text
 
 
-def test_uploads_are_disabled_and_warn_once_in_cloud_mode(monkeypatch, capsys):
+def test_uploads_are_disabled_and_warn_once_in_cloud_mode(monkeypatch, caplog):
     import jev_ultrafast.config as config_module
 
     monkeypatch.setattr(config_module, "_cloud_upload_warned", False)
     monkeypatch.setenv("JEV_BROWSER", "cloud")
     monkeypatch.setenv("JEV_UPLOAD_FILES", "resume=/tmp/resume.pdf")
     assert resolve_config()["files"] == {}
-    assert "uploads disabled" in capsys.readouterr().err
+    assert "uploads disabled" in caplog.text
+    caplog.clear()
     assert resolve_config()["files"] == {}
-    assert capsys.readouterr().err == ""
+    assert caplog.text == ""
 
 
 def test_local_uploads_are_unchanged(monkeypatch):
@@ -211,18 +210,16 @@ def test_local_uploads_are_unchanged(monkeypatch):
     assert resolve_config()["files"] == {"resume": "/tmp/resume.pdf"}
 
 
-def test_secrets_never_reach_output(monkeypatch, fake_cloud, capsys):
+def test_secrets_never_reach_output(monkeypatch, fake_cloud, caplog):
     monkeypatch.setenv("JEV_BROWSER", "cloud")
     config = resolve_config()
     handle = cloud.start(config)
     try:
-        captured = capsys.readouterr()
         encoded = json.dumps(handle)
-        assert FAKE_KEY not in captured.out + captured.err + encoded
+        assert FAKE_KEY not in caplog.text + encoded
     finally:
         cloud.stop(handle)
-    captured = capsys.readouterr()
-    assert FAKE_KEY not in captured.out + captured.err
+    assert FAKE_KEY not in caplog.text
 
 
 def test_action_freshness_uses_the_frame_pair():
@@ -386,7 +383,7 @@ def _viewport_cdp(calls, reading):
     return cdp
 
 
-def test_cloud_viewport_mismatch_is_reapplied_and_logged(monkeypatch, fake_cloud, capsys):
+def test_cloud_viewport_mismatch_is_reapplied_and_logged(monkeypatch, fake_cloud, caplog):
     monkeypatch.setenv("JEV_BROWSER", "cloud")
     monkeypatch.delenv("JEV_VISIBLE_TAB", raising=False)
     calls = []
@@ -395,10 +392,10 @@ def test_cloud_viewport_mismatch_is_reapplied_and_logged(monkeypatch, fake_cloud
     Browser("https://example.test/").close()
     metrics = [params for method, params in calls if method == "Emulation.setDeviceMetricsOverride"]
     assert len(metrics) == 2
-    assert "viewport mismatch" in capsys.readouterr().err
+    assert "viewport mismatch" in caplog.text
 
 
-def test_cloud_viewport_match_is_not_reapplied(monkeypatch, fake_cloud, capsys):
+def test_cloud_viewport_match_is_not_reapplied(monkeypatch, fake_cloud, caplog):
     monkeypatch.setenv("JEV_BROWSER", "cloud")
     monkeypatch.delenv("JEV_VISIBLE_TAB", raising=False)
     calls = []
@@ -407,7 +404,7 @@ def test_cloud_viewport_match_is_not_reapplied(monkeypatch, fake_cloud, capsys):
     Browser("https://example.test/").close()
     metrics = [params for method, params in calls if method == "Emulation.setDeviceMetricsOverride"]
     assert len(metrics) == 1
-    assert "viewport mismatch" not in capsys.readouterr().err
+    assert "viewport mismatch" not in caplog.text
 
 
 def test_max_decisions_default_and_override(monkeypatch):

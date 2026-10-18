@@ -3,7 +3,6 @@
 import json
 import math
 import os
-import sys
 import time
 
 import httpx
@@ -19,6 +18,7 @@ from .questions import (
     mercury_next_instructions,
     mercury_requirement_instructions,
 )
+from .trace import get_logger
 
 CLIENT = httpx.Client(http2=True, timeout=25)
 RETRY_STATUSES = {429, 500, 502, 503, 504, 529}
@@ -83,24 +83,21 @@ def reasoning_effort():
 
 def log_model_call(kind, url, body, result, latency_ms, summary):
     """Server-side timing log. Credentials are never passed here, so they cannot leak."""
-    level = debug_level()
-    if level < 1:
+    if debug_level() < 1:
         return
     usage = result.get("usage") if isinstance(result, dict) else None
     prompt, completion = token_counts(usage)
     reasoning = reasoning_tokens(usage)
     seconds = max(latency_ms / 1000, 1e-6)
     rate = f"{completion / seconds:.1f}" if completion else "n/a"
-    print(
+    get_logger(kind).debug(
         f"[jev:{kind}] model={body.get('model', '?')} latency_ms={latency_ms} "
-        f"prompt={prompt} completion={completion} tok/s={rate} reasoning={reasoning} {summary}",
-        file=sys.stderr,
-        flush=True,
+        f"prompt={prompt} completion={completion} tok/s={rate} reasoning={reasoning} {summary}"
     )
-    if level >= 2:
+    if debug_level() >= 2:
         for label, payload in (("request", {"url": url, **body}), ("response", result)):
             dumped = json.dumps(redact_secrets(payload))
-            print(f"[jev:{kind}] {label}: {dumped[:4000]}", file=sys.stderr, flush=True)
+            get_logger(kind).debug(f"[jev:{kind}] {label}: {dumped[:4000]}")
 
 
 def retry_delay(response, attempt):
@@ -175,11 +172,9 @@ def post_json(url, key, body):
         if response.status_code in retry_statuses(url) and attempt < MAX_POSTS - 1:
             delay = retry_delay(response, attempt)
             if debug_level() >= 1:
-                print(
+                get_logger("http").debug(
                     f"[jev:http] retry url={url} status={response.status_code} "
-                    f"attempt={attempt + 1} wait_s={delay}",
-                    file=sys.stderr,
-                    flush=True,
+                    f"attempt={attempt + 1} wait_s={delay}"
                 )
             time.sleep(delay)
             continue
@@ -190,10 +185,8 @@ def post_json(url, key, body):
                 safe_body = str(redact_secrets(response.text))
             except Exception:
                 safe_body = ""
-            print(
-                f"[jev:http] error url={url} status={response.status_code} body={safe_body[:2000]}",
-                file=sys.stderr,
-                flush=True,
+            get_logger("http").warning(
+                f"[jev:http] error url={url} status={response.status_code} body={safe_body[:2000]}"
             )
             raise ModelHTTPError(response.status_code, safe_body)
         return response.json()
@@ -216,11 +209,7 @@ def prepare_choice_answer(answer):
     total = sum(numbers)
     if total <= 0 or abs(total - 1) < 0.02:
         return answer
-    print(
-        f"[jev:decision] renormalized probabilities sum={total:.6f}",
-        file=sys.stderr,
-        flush=True,
-    )
+    get_logger("decision").debug(f"[jev:decision] renormalized probabilities sum={total:.6f}")
     return {**answer, "probabilities": {key: value / total for key, value in probabilities.items()}}
 
 
@@ -335,11 +324,7 @@ def recent_actions(history, limit=10):
 def cap_criteria(criteria):
     if len(criteria) <= CHOICE_LIMIT:
         return criteria
-    print(
-        f"[jev:decision] capped choice options {len(criteria)} -> {CHOICE_LIMIT}",
-        file=sys.stderr,
-        flush=True,
-    )
+    get_logger("decision").debug(f"[jev:decision] capped choice options {len(criteria)} -> {CHOICE_LIMIT}")
     return dict(list(criteria.items())[:CHOICE_LIMIT])
 
 
@@ -401,11 +386,8 @@ def choose(state, goal, history, requirements=None, progress=None, guidance=None
             safe_result = str(redact_secrets(result))
         except Exception:
             safe_result = ""
-        print(
-            f"[jev:decision] invalid response body={safe_result[:2000]}",
-            file=sys.stderr,
-            flush=True,
-        )
+        get_logger("decision").warning(f"[jev:decision] invalid response body={safe_result[:2000]}")
+        choose.last_invalid = f"{type(error).__name__}: {error}"[:300]
         raise ValueError(INVALID_RESPONSE) from error
     latency_ms = round((time.perf_counter() - started) * 1000)
     log_model_call(
@@ -432,6 +414,9 @@ def choose(state, goal, history, requirements=None, progress=None, guidance=None
         "latency_ms": latency_ms,
         "request": body,
     }
+
+
+choose.last_invalid = ""
 
 
 def inception_key():
@@ -523,10 +508,8 @@ def flat_catalog(state):
             ordered.append(action["id"])
     room = CHOICE_LIMIT - 2
     if len(ordered) > room:
-        print(
-            f"[jev:decision] capped choice options {len(ordered) + 2} -> {CHOICE_LIMIT}",
-            file=sys.stderr,
-            flush=True,
+        get_logger("decision").debug(
+            f"[jev:decision] capped choice options {len(ordered) + 2} -> {CHOICE_LIMIT}"
         )
         ordered = ordered[:room]
     criteria = {}
@@ -1090,22 +1073,20 @@ def field_text(context, system=TEXT_VALUE, schema=None, name="FieldText", parse=
                     {"role": "user", "content": json.dumps(without_page_text(context))},
                 ],
             }
-            print(
-                "[jev:text] provider content filter; retrying without page text",
-                file=sys.stderr,
-                flush=True,
-            )
+            get_logger("text").info("[jev:text] provider content filter; retrying without page text")
             return post_json(endpoint, key, payload)
 
     result = {}
+    retries = 0
     for attempt in range(2):
         if attempt:
             payload = {**payload, "reasoning_effort": "low"}
+            retries += 1
         try:
             result = request_text()
         except ModelHTTPError as error:
             if error.code == "content_filter":
-                print("[jev:text] error=provider content filter; step skipped", file=sys.stderr, flush=True)
+                get_logger("text").warning("[jev:text] error=provider content filter; step skipped")
                 raise ValueError("Text helper was content-filtered; nothing typed.") from None
             raise
         try:
@@ -1117,9 +1098,9 @@ def field_text(context, system=TEXT_VALUE, schema=None, name="FieldText", parse=
             log_model_call("text", endpoint, payload, logged, latency_ms, problem)
             if attempt:
                 if label:
-                    print(f"[jev:text] {problem}; skipped", file=sys.stderr, flush=True)
+                    get_logger("text").warning(f"[jev:text] {problem}; skipped")
                     raise ValueError(f"Text helper returned no valid {label}.") from None
-                print("[jev:text] error=no valid field value; step skipped", file=sys.stderr, flush=True)
+                get_logger("text").warning("[jev:text] error=no valid field value; step skipped")
                 raise ValueError("Text helper returned no valid field value; nothing typed.") from None
             continue
         latency_ms = round((time.perf_counter() - started) * 1000)
@@ -1128,5 +1109,8 @@ def field_text(context, system=TEXT_VALUE, schema=None, name="FieldText", parse=
             "model": model_name,
             "latency_ms": latency_ms,
             "usage": result.get("usage", {}) if isinstance(result, dict) else {},
+            "effort": payload.get("reasoning_effort") or reasoning.get("reasoning_effort", "default"),
+            "retries": retries,
+            "filtered": filtered,
         }
     raise ValueError("Text helper returned no valid field value; nothing typed.")

@@ -11,6 +11,7 @@ from urllib.parse import urlparse
 
 from .agent import Agent
 from .questions import MAX_STEPS
+from .trace import configure_logging, get_logger
 
 ROOT = Path(__file__).parent
 PORT = int(os.environ.get("TYPESAFE_DEMO_PORT", "8766"))
@@ -130,9 +131,10 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     load_environment()
+    configure_logging()
     atexit.register(close_browser)
     server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
-    print(f"Jev Ultrafast: {ORIGIN}", flush=True)
+    get_logger("demo").info(f"Jev Ultrafast: {ORIGIN}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

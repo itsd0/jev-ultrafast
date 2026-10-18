@@ -2,7 +2,8 @@
 
 import json
 import os
-import sys
+
+from .trace import get_logger
 
 _cloud_upload_warned = False
 
@@ -119,11 +120,7 @@ def disable_cloud_uploads(files):
         # TODO: upload through POST /api/v2/files/browsers/{session_id}/presigned-url
         # (the destination path is undocumented), then reach the remote copy from
         # the browser. Until that exists, cloud runs offer no upload targets.
-        print(
-            "[jev:cloud] uploads disabled: the remote browser cannot read local paths",
-            file=sys.stderr,
-            flush=True,
-        )
+        get_logger("cloud").warning("[jev:cloud] uploads disabled: the remote browser cannot read local paths")
     return {}
 
 

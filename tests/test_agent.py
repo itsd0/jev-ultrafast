@@ -1,6 +1,7 @@
 """Offline contracts for a dynamic operation/target policy. No paid APIs."""
 
 import json
+import logging
 import time
 from copy import deepcopy
 from unittest.mock import Mock
@@ -323,7 +324,7 @@ def test_click_cannot_consume_a_text_target(monkeypatch):
         model.choose(page(), "Find a book", [])
 
 
-def test_invalid_decision_logs_redacted_body(monkeypatch, capsys):
+def test_invalid_decision_logs_redacted_body(monkeypatch, caplog):
     def post(_url, _key, _body):
         return {
             "model": "test",
@@ -332,12 +333,12 @@ def test_invalid_decision_logs_redacted_body(monkeypatch, capsys):
 
     monkeypatch.setenv("TYPESAFE_API_KEY", "fake-test-key-12345678")
     monkeypatch.setattr(model, "post_json", post)
-    with pytest.raises(ValueError, match="Invalid TypeSafe"):
-        model.choose(page(), "Find a book", [])
-    err = capsys.readouterr().err
-    assert "[jev:decision] invalid response body=" in err
-    assert "fake-test-key-12345678" not in err
-    assert "[redacted]" in err
+    with caplog.at_level(logging.WARNING, logger="jev"):
+        with pytest.raises(ValueError, match="Invalid TypeSafe"):
+            model.choose(page(), "Find a book", [])
+    assert "[jev:decision] invalid response body=" in caplog.text
+    assert "fake-test-key-12345678" not in caplog.text
+    assert "[redacted]" in caplog.text
 
 
 def test_target_head_receives_control_state_and_full_next_step_rules(monkeypatch):
@@ -387,10 +388,14 @@ def test_missing_text_credential_stops_before_guessing(monkeypatch):
 
 @pytest.fixture
 def runner():
+    from jev_ultrafast.trace import Trace, get_logger
+
     a = loop.Agent.__new__(loop.Agent)
     a.screenshots = False
     a.pending_text = None
     a.blocked_streak = 0
+    a.log = get_logger("agent")
+    a.trace = Trace(run_id="test-run", level=0)
     p = page()
     a.state = {
         "browser": Mock(fresh=Mock(return_value=True), observe=Mock(return_value=p)),
@@ -717,7 +722,7 @@ def test_stale_execution_target_is_held_before_the_retry(runner, monkeypatch):
     assert runner.state["history"][-1]["choice"] == "e3"
 
 
-def test_debug_log_reports_tokens_per_second(monkeypatch, capsys):
+def test_debug_log_reports_tokens_per_second(monkeypatch, caplog):
     def post(_url, _key, body):
         return {
             "model": "test",
@@ -731,15 +736,15 @@ def test_debug_log_reports_tokens_per_second(monkeypatch, capsys):
     monkeypatch.setenv("TYPESAFE_API_KEY", "SECRETKEY123")
     monkeypatch.setenv("JEV_DEBUG", "2")
     monkeypatch.setattr(model, "post_json", post)
-    model.choose(page(), "Find a book", [])
-    err = capsys.readouterr().err
-    assert "[jev:typesafe]" in err
-    assert "prompt=100 completion=50 tok/s=" in err
-    assert "operation=TYPE_TEXT target=1 choice=e1" in err
-    assert "SECRETKEY123" not in err
+    with caplog.at_level(logging.DEBUG, logger="jev"):
+        model.choose(page(), "Find a book", [])
+    assert "[jev:typesafe]" in caplog.text
+    assert "prompt=100 completion=50 tok/s=" in caplog.text
+    assert "operation=TYPE_TEXT target=1 choice=e1" in caplog.text
+    assert "SECRETKEY123" not in caplog.text
 
 
-def test_debug_log_parses_gateway_usage_keys(monkeypatch, capsys):
+def test_debug_log_parses_gateway_usage_keys(monkeypatch, caplog):
     monkeypatch.setenv("TEXT_MODEL_API_KEY", "test")
     monkeypatch.setenv("JEV_DEBUG", "1")
     monkeypatch.setattr(
@@ -752,11 +757,11 @@ def test_debug_log_parses_gateway_usage_keys(monkeypatch, capsys):
             }
         ),
     )
-    model.field_text({"goal": "Find a flight"})
-    err = capsys.readouterr().err
-    assert "[jev:text]" in err
-    assert "prompt=200 completion=25 tok/s=" in err
-    assert "value='Zurich'" in err
+    with caplog.at_level(logging.DEBUG, logger="jev"):
+        model.field_text({"goal": "Find a flight"})
+    assert "[jev:text]" in caplog.text
+    assert "prompt=200 completion=25 tok/s=" in caplog.text
+    assert "value='Zurich'" in caplog.text
 
 
 def test_debug_log_quiet_by_default(monkeypatch, capsys):
@@ -771,28 +776,29 @@ def test_debug_log_quiet_by_default(monkeypatch, capsys):
     assert capsys.readouterr().err == ""
 
 
-def test_debug_verbose_dumps_request_and_response(monkeypatch, capsys):
+def test_debug_verbose_dumps_request_and_response(monkeypatch, caplog):
     monkeypatch.setenv("TEXT_MODEL_API_KEY", "test")
     monkeypatch.setenv("JEV_DEBUG", "2")
     monkeypatch.setattr(
         model, "post_json", Mock(return_value={"choices": [{"message": {"content": '{"text":"Zurich"}'}}]})
     )
-    model.field_text({"goal": "Find a flight"})
-    err = capsys.readouterr().err
-    assert "[jev:text] request:" in err
-    assert "[jev:text] response:" in err
-    assert "sk-" not in err and "Bearer" not in err
+    with caplog.at_level(logging.DEBUG, logger="jev"):
+        model.field_text({"goal": "Find a flight"})
+    assert "[jev:text] request:" in caplog.text
+    assert "[jev:text] response:" in caplog.text
+    assert "sk-" not in caplog.text and "Bearer" not in caplog.text
 
 
-def test_debug_log_covers_rejected_values(monkeypatch, capsys):
+def test_debug_log_covers_rejected_values(monkeypatch, caplog):
     monkeypatch.setenv("TEXT_MODEL_API_KEY", "test")
     monkeypatch.setenv("JEV_DEBUG", "1")
     monkeypatch.setattr(
         model, "post_json", Mock(return_value={"choices": [{"message": {"content": '{"text":null}'}}]})
     )
-    with pytest.raises(ValueError, match="nothing typed"):
-        model.field_text({"goal": "Find a flight"})
-    assert "error=no valid field value" in capsys.readouterr().err
+    with caplog.at_level(logging.DEBUG, logger="jev"):
+        with pytest.raises(ValueError, match="nothing typed"):
+            model.field_text({"goal": "Find a flight"})
+    assert "error=no valid field value" in caplog.text
 
 
 def test_text_max_tokens_override(monkeypatch):
@@ -933,7 +939,7 @@ def test_invalid_text_retries_once_at_low_effort_then_succeeds(monkeypatch):
     assert efforts == ["instant", "low"]
 
 
-def test_invalid_text_twice_fails_cleanly(monkeypatch, capsys, runner):
+def test_invalid_text_twice_fails_cleanly(monkeypatch, caplog, runner):
     monkeypatch.setenv("TEXT_MODEL_API_KEY", "test")
     monkeypatch.setenv("TEXT_MODEL", "mercury-2.5")
     monkeypatch.setenv("TEXT_MODEL_REASONING", "instant")
@@ -944,10 +950,11 @@ def test_invalid_text_twice_fails_cleanly(monkeypatch, capsys, runner):
         return {"choices": [{"message": {"content": "still not json"}}], "usage": {}}
 
     monkeypatch.setattr(model, "post_json", post)
-    with pytest.raises(ValueError, match="nothing typed"):
-        model.field_text({"goal": "Find a flight"})
+    with caplog.at_level(logging.WARNING, logger="jev"):
+        with pytest.raises(ValueError, match="nothing typed"):
+            model.field_text({"goal": "Find a flight"})
     assert efforts == ["instant", "low"]
-    assert "error=no valid field value; step skipped" in capsys.readouterr().err
+    assert "error=no valid field value; step skipped" in caplog.text
     runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
     runner.state["browser"].act.assert_not_called()
     assert runner.state["status"] == "ready"

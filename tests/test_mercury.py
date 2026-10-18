@@ -1,6 +1,7 @@
 """Offline Mercury Decide adapter and Mercury text requests. No network."""
 
 import json
+import logging
 
 import pytest
 
@@ -80,7 +81,7 @@ def test_status_without_retry_after_uses_backoff_and_stops(monkeypatch):
     assert sleeps == [0.5, 1, 2]
 
 
-def test_text_request_uses_mercury_instant_json(monkeypatch, capsys):
+def test_text_request_uses_mercury_instant_json(monkeypatch, caplog):
     monkeypatch.setenv("INCEPTION_API_KEY", "test-key")
     monkeypatch.delenv("TEXT_MODEL_API_KEY", raising=False)
     monkeypatch.setenv("TEXT_MODEL", "mercury-2.5")
@@ -106,7 +107,8 @@ def test_text_request_uses_mercury_instant_json(monkeypatch, capsys):
         )
 
     monkeypatch.setattr(model.CLIENT, "post", post)
-    value, meta = model.field_text({"goal": "Fly from Zurich"})
+    with caplog.at_level(logging.DEBUG, logger="jev"):
+        value, meta = model.field_text({"goal": "Fly from Zurich"})
     assert value == "Zurich"
     assert seen["url"].endswith("/chat/completions")
     assert seen["body"]["model"] == "mercury-2.5"
@@ -118,10 +120,9 @@ def test_text_request_uses_mercury_instant_json(monkeypatch, capsys):
     assert seen["body"]["max_completion_tokens"] >= 1000
     assert "extra_body" not in seen["body"]
     assert meta["latency_ms"] >= 0
-    err = capsys.readouterr().err
-    assert "[jev:text]" in err
-    assert "reasoning=3" in err
-    assert "test-key" not in err
+    assert "[jev:text]" in caplog.text
+    assert "reasoning=3" in caplog.text
+    assert "test-key" not in caplog.text
 
 
 def test_text_reasoning_levels(monkeypatch):
@@ -158,18 +159,18 @@ def _text_env(monkeypatch):
     monkeypatch.setenv("TEXT_MODEL_REASONING", "instant")
 
 
-def test_http_error_logs_a_redacted_body(monkeypatch, capsys):
+def test_http_error_logs_a_redacted_body(monkeypatch, caplog):
     monkeypatch.setenv("INCEPTION_API_KEY", "offline-key")
     body = {"error": {"message": "rejected offline-key", "code": "content_filter"}}
     monkeypatch.setattr(model.CLIENT, "post", lambda *args, **kwargs: Response(400, body))
-    with pytest.raises(model.ModelHTTPError) as error:
-        model.post_json("https://api.inceptionlabs.ai/v1/chat/completions", "offline-key", {})
+    with caplog.at_level(logging.WARNING, logger="jev"):
+        with pytest.raises(model.ModelHTTPError) as error:
+            model.post_json("https://api.inceptionlabs.ai/v1/chat/completions", "offline-key", {})
     assert error.value.status_code == 400
     assert error.value.code == "content_filter"
-    err = capsys.readouterr().err
-    assert "content_filter" in err
-    assert "[redacted]" in err
-    assert "offline-key" not in err
+    assert "content_filter" in caplog.text
+    assert "[redacted]" in caplog.text
+    assert "offline-key" not in caplog.text
 
 
 def test_content_filter_retries_without_page_text(monkeypatch):
