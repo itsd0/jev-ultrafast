@@ -11,6 +11,7 @@ import hmac
 import json
 import mimetypes
 import os
+import re
 import secrets
 import sqlite3
 import threading
@@ -726,9 +727,111 @@ def _first_sentences(text, limit=2, cap=500):
     return reply if len(reply) <= cap else reply[: cap - 3] + "..."
 
 
+_HOST_MENTION_RE = re.compile(
+    r"\b(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}\b", re.IGNORECASE
+)
+_PAGE_NAME_RE = re.compile(
+    r"\b([A-Z][A-Za-z0-9&]*(?:\s+[A-Z][A-Za-z0-9&]*){0,2})\s+(?:page|site|website|homepage)\b"
+)
+_GENERIC_PAGE_NAMES = frozenset({
+    "home", "search", "new", "blank", "main", "web", "start", "error", "login",
+    "results", "result", "detail", "details", "product", "article", "list",
+})
+
+
+def _normalize_host(host):
+    host = (host or "").lower()
+    return host[4:] if host.startswith("www.") else host
+
+
+def _snapshot_hosts(snapshot):
+    """Every hostname the run actually touched, www-folded."""
+    urls = list(snapshot.get("visited_urls") or [])
+    for item in snapshot.get("history") or []:
+        if isinstance(item, dict) and item.get("url"):
+            urls.append(item["url"])
+    page = snapshot.get("page") or {}
+    if page.get("url"):
+        urls.append(page["url"])
+    hosts = set()
+    for url in urls:
+        try:
+            host = urlparse(url if "://" in url else f"https://{url}").hostname or ""
+        except ValueError:
+            continue
+        if host:
+            hosts.add(_normalize_host(host))
+    return hosts
+
+
+def _host_supported(claimed, seen):
+    return any(
+        claimed == host or claimed.endswith("." + host) or host.endswith("." + claimed)
+        for host in seen
+    )
+
+
+def _snapshot_name_haystack(snapshot):
+    parts = []
+    page = snapshot.get("page") or {}
+    parts.append(page.get("title") or "")
+    parts.append(page.get("url") or "")
+    for item in snapshot.get("memo") or []:
+        if isinstance(item, dict):
+            parts.append(item.get("fact") or "")
+            parts.append(item.get("source") or "")
+    parts.extend(_snapshot_hosts(snapshot))
+    return " ".join(parts).lower()
+
+
+def unsupported_reply_claims(answer, snapshot):
+    """Site/page names in the answer the trace cannot back. Empty means honest."""
+    problems = []
+    hosts = _snapshot_hosts(snapshot)
+    for match in _HOST_MENTION_RE.finditer(answer or ""):
+        claimed = _normalize_host(match.group(0))
+        if claimed and not _host_supported(claimed, hosts):
+            problems.append(match.group(0))
+    if problems:
+        return problems
+    haystack = _snapshot_name_haystack(snapshot)
+    for match in _PAGE_NAME_RE.finditer(answer or ""):
+        name = match.group(1)
+        if len(name) < 3 or name.lower() in _GENERIC_PAGE_NAMES:
+            continue
+        if name.lower() not in haystack:
+            problems.append(match.group(0))
+    return problems
+
+
+def _factual_fallback(snapshot):
+    """What actually happened: final page plus verified memo facts."""
+    page = snapshot.get("page") or {}
+    url = page.get("url") or ""
+    title = (page.get("title") or "").strip()
+    if url and url != "about:blank":
+        base = f"Opened {title} ({url})." if title else f"Opened {url}."
+    else:
+        base = "The browser ended on a blank page."
+    verified = []
+    for item in snapshot.get("memo") or []:
+        if isinstance(item, dict) and (item.get("fact") or "").strip():
+            bit = item["fact"].strip()
+            if item.get("source"):
+                bit += f" ({item['source']})"
+            verified.append(bit)
+        if len(verified) >= 2:
+            break
+    if verified:
+        return base + " Verified: " + " ".join(bit.rstrip(".") + "." for bit in verified)
+    return base
+
+
 def compose_reply(snapshot, status, error):
     """One or two plain sentences from the run outcome. Never raw JSON."""
     answer = (snapshot.get("answer") or "").strip()
+    if answer and unsupported_reply_claims(answer, snapshot):
+        answer = _factual_fallback(snapshot)
     if status == "done" and answer:
         return _first_sentences(answer) or "Done."
     if status == "done":

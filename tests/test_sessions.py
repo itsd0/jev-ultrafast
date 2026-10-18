@@ -179,9 +179,9 @@ def test_close_session_stops_and_marks_closed(tmp_path):
 
 
 def test_compose_reply_is_plain_sentences():
-    assert hosted.compose_reply({"answer": "Opened x.com. It shows a login wall."}, "done", None) == (
-        "Opened x.com. It shows a login wall."
-    )
+    assert hosted.compose_reply(
+        {"answer": "Opened x.com. It shows a login wall.", "visited_urls": ["x.com/"]}, "done", None
+    ) == ("Opened x.com. It shows a login wall.")
     assert hosted.compose_reply({"answer": '{"a": 1}'}, "done", None) == '{"a": 1}.'
     reply = hosted.compose_reply({"blocked_reason": "gave up", "partial": 1, "answer": "X. Y."}, "blocked", None)
     assert reply.startswith("I couldn't fully finish (gave up). So far: X.")
@@ -190,6 +190,45 @@ def test_compose_reply_is_plain_sentences():
         {"blocked_reason": "gave up; hit CAPTCHA walls on wall.test"}, "blocked", None
     )
     assert reply == "I couldn't finish (gave up; hit CAPTCHA walls on wall.test)."
+
+
+def test_compose_reply_rejects_unvisited_site_claim():
+    snapshot = {
+        "answer": "I opened a new tab and navigated to the AccuWeather page for Bangkok weather.",
+        "page": {"url": "https://www.google.com/search?q=Bangkok+weather", "title": "Bangkok weather - Google"},
+        "visited_urls": ["google.com/search?q=Bangkok+weather"],
+        "memo": [],
+        "history": [],
+    }
+    reply = hosted.compose_reply(snapshot, "done", None)
+    assert "accuweather" not in reply.lower()
+    assert "google.com/search" in reply
+
+
+def test_compose_reply_rejects_unvisited_host():
+    snapshot = {
+        "answer": "Opened example.com. It shows the docs.",
+        "page": {"url": "https://www.google.com/", "title": "Google"},
+        "visited_urls": ["google.com/"],
+        "memo": [{"fact": "8.5 million residents (2021 estimate)", "source": "https://en.wikipedia.org/wiki/X"}],
+        "history": [],
+    }
+    reply = hosted.compose_reply(snapshot, "done", None)
+    assert "example.com" not in reply
+    assert "Google" in reply and "8.5 million residents" in reply
+
+
+def test_compose_reply_keeps_supported_page_name():
+    snapshot = {
+        "answer": "Opened the Wikipedia page. Population is 8.5 million.",
+        "page": {"url": "https://en.wikipedia.org/wiki/Bangkok", "title": "Bangkok - Wikipedia"},
+        "visited_urls": ["en.wikipedia.org/wiki/Bangkok"],
+        "memo": [],
+        "history": [],
+    }
+    assert hosted.compose_reply(snapshot, "done", None) == (
+        "Opened the Wikipedia page. Population is 8.5 million."
+    )
 
 
 def test_tabs_event_published_on_tab_change(tmp_path):
