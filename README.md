@@ -50,6 +50,15 @@ Target questions are speculative. If the operation is `CLICK`, only `click_targe
 
 There are no site-specific action scripts or prepared field strings in the policy. The Flights example supplies a goal and independently verifies the outcome. The screenshot renderer adds labels afterward; it does not drive the browser.
 
+## Agent core
+
+The default core is one LLM call per step: the model reads an indented DOM tree of indexed elements plus tabs, plan, and history, then returns thinking, an evaluation ending in `Verdict: Success|Failure`, memory, the next goal, and 1–5 ordered actions. Code validates every action against the live observation (indices, URLs, allowlists) and stops the sequence after a page-changing action or a URL/tab change. A separate judge call checks `done` claims against the recorded observations before the run finishes; replies only claim what the trace proves.
+
+- `JEV_AGENT=new` (default) selects Beam; `classic` keeps the TypeSafe-decision + Mercury-text split.
+- `REFLECTION_API_KEY` authenticates Beam at `https://api.reflection.ai/openai/v1`; `JEV_MODEL` (default `Beam-1.0-501B-A23B`) and `JEV_REASONING_EFFORT` (`low`–`max`, default `low`) tune it. Structured output uses strict `json_schema`, one schema per call, never tool calls.
+- Domain-scoped secrets: `JEV_SECRET_<NAME>` plus `JEV_SECRET_<NAME>_DOMAINS` (comma-separated hosts). The model only sees `<secret>NAME</secret>`; the executor substitutes the value at input time on matching hosts only. Secret values never reach prompts, history, traces, or logs.
+- Token cost uses `JEV_PRICE_<MODEL>_IN/OUT` per 1M tokens (for Beam: `JEV_PRICE_BEAM_1_0_501B_A23B_IN/OUT`), blank by default with a "price not set" display.
+
 ## Try it
 
 ```bash
