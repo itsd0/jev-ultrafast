@@ -1367,7 +1367,10 @@ class SessionRunner:
                 if callable(navigate):
                     navigate(url)
                 entry["navigated"] = True
-            elif entry.pop("fresh_browser", False) and url is None and session.get("last_url"):
+            elif (
+                entry.pop("fresh_browser", False) and url is None
+                and session.get("last_url") not in (None, "", "about:blank")
+            ):
                 # Idle-timeout or restart resume: reopen where the session was.
                 navigate = getattr(browser, "navigate", None)
                 if callable(navigate):
@@ -1520,15 +1523,17 @@ class SessionRunner:
             partial=int(bool(snapshot.get("partial"))),
         )
         session = self.store.get_session(session_id, with_steps=False) or {}
-        self.store.update_session(
-            session_id,
-            last_active_at=time.time(),
-            total_input_tokens=(session.get("total_input_tokens") or 0) + prompt,
-            total_output_tokens=(session.get("total_output_tokens") or 0) + completion,
-            total_cost_usd=(session.get("total_cost_usd") or 0) + cost,
-            last_url=(snapshot.get("page") or {}).get("url") or self._browser_url(browser),
-            last_tabs=json.dumps(session_tabs(browser)),
-        )
+        fields = {
+            "last_active_at": time.time(),
+            "total_input_tokens": (session.get("total_input_tokens") or 0) + prompt,
+            "total_output_tokens": (session.get("total_output_tokens") or 0) + completion,
+            "total_cost_usd": (session.get("total_cost_usd") or 0) + cost,
+            "last_tabs": json.dumps(session_tabs(browser)),
+        }
+        landed = (snapshot.get("page") or {}).get("url") or self._browser_url(browser)
+        if landed and landed != "about:blank":
+            fields["last_url"] = landed
+        self.store.update_session(session_id, **fields)
         if trace is not None and not trace.ended:
             trace.emit(
                 "end", step=len(snapshot.get("history") or []), status=status,

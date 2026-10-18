@@ -528,6 +528,17 @@ def test_explicit_url_wins_over_last_url(tmp_path):
     assert navigated == ["https://example.test/explicit"]
 
 
+def test_blank_finish_keeps_last_url(tmp_path):
+    runner = _runner(tmp_path, agent_factory=FakeAgent)
+    sid = runner.create_session("local")
+    runner.store.update_session(sid, last_url="https://example.test/there")
+    _inject(runner, sid, FakeBrowser("about:blank"))
+    mid = runner.submit_message(sid, "hi")
+    _wait_done(runner, sid, mid)
+    session = runner.store.get_session(sid, with_steps=False)
+    assert session["last_url"] == "https://example.test/there"
+
+
 def test_bus_replays_events(tmp_path):
     runner = _runner(tmp_path, agent_factory=FakeAgent)
     sid = runner.create_session("local")
