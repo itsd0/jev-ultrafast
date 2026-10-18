@@ -63,7 +63,7 @@ tasks:
       weather. Report both the population and the current temperature.
     max_decisions: 60
     checks:
-      - {type: answer_contains_all, values: [million]}
+      - {type: answer_regex, pattern: "(?i)(million|\\d{1,3}(,\\d{3}){2,})"}
       - {type: answer_regex, pattern: "(?i)(°|celsius|fahrenheit|degrees)"}
 
   - id: hn-page3

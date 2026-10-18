@@ -135,6 +135,19 @@ def test_git_info_reports_sha_dirty_and_diff():
     assert re.fullmatch(r"[0-9a-f]{64}", git["diff_hash"] or "")
 
 
+def test_bangkok_accepts_digit_form_population():
+    import yaml
+
+    suite = yaml.safe_load(
+        (Path(__file__).resolve().parent.parent / "bench" / "tasks.yaml").read_text()
+    )
+    task = next(t for t in suite["tasks"] if t["id"] == "bangkok-pop-weather")
+    pop = next(c for c in task["checks"] if "celsius" not in c.get("pattern", ""))
+    assert bench.run_checks({"checks": [pop]}, evidence(answer_text="Population 5,494,932"))[0]["passed"]
+    assert bench.run_checks({"checks": [pop]}, evidence(answer_text="8 million people"))[0]["passed"]
+    assert not bench.run_checks({"checks": [pop]}, evidence(answer_text="30 degrees"))[0]["passed"]
+
+
 def test_text_regex_and_hotels_checks():
     task = {"checks": [{"type": "text_regex", "pattern": "(?i)lisbon"}]}
     assert bench.run_checks(task, evidence(final_text="Hotels in Lisbon"))[0]["passed"]
