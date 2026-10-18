@@ -13,6 +13,7 @@ from urllib.parse import quote_plus, urlparse
 
 from .agent import (
     DEFAULT_MAX_DECISIONS,
+    Agent,
     add_event_note,
     modal_scroll_route,
     normalize_link_url,
@@ -56,6 +57,13 @@ from .model import (
 )
 from .secrets import substitute, unavailable
 from .trace import Trace, cost_estimate_usd, get_logger
+from .widget_stall import (
+    WidgetStallTracker,
+    control_key,
+    is_modal_key,
+    modal_key,
+    suggest_change,
+)
 
 STEP_FORMAT = response_format("BeamStep", STEP_SCHEMA)
 JUDGE_FORMAT = response_format("BeamJudge", JUDGE_SCHEMA)
@@ -137,6 +145,8 @@ class BeamAgent:
         self.trace = Trace(run_id=os.environ.get("JEV_RUN_ID") or None)
         self.transcript = Transcript()
         self.loops = LoopMonitor()
+        self._widget_stall = WidgetStallTracker()
+        self._suppressed_widgets = set()
         self._by_index = {}
         self._provider_override = provider
         self._helper_override = helper_provider
@@ -246,11 +256,19 @@ class BeamAgent:
         except Exception as error:
             return self._terminal(state, f"env:{type(error).__name__}", used + 1)
         indexer_ms = round((time.perf_counter() - observe_started) * 1000)
-        page_changed = page.get("fingerprint") != (state.get("page") or {}).get("fingerprint")
+        prev_page = state.get("page") or {}
+        page_changed = page.get("fingerprint") != prev_page.get("fingerprint")
         page["fingerprint"] = fingerprint(page)
         state["page"] = page
         note_visit(state, page.get("url"))
         step_no = used + 1
+        self._verify_pending(state, prev_page, page, step_no)
+        if self._suppressed_widgets:
+            page["actions"] = [
+                item for item in page.get("actions") or []
+                if control_key(item.get("kind"), item.get("label"), item.get("role"))
+                not in self._suppressed_widgets
+            ]
         self.trace.emit(
             "snapshot", step=step_no, url=page.get("url"), title=page.get("title"),
             controls=len(page.get("actions") or []),
@@ -640,6 +658,7 @@ class BeamAgent:
                 stop = "invalid action; re-plan with the fresh tree"
                 break
             outcome = self._execute_action(state, page, prepared)
+            self._stash_pending_verify(state, page, action, prepared, outcome)
             results.append({"label": outcome["label"], "ok": outcome["ok"], "note": outcome.get("note", "")})
             actions_summary.append({
                 "name": action.get("name"), "target": outcome.get("target", ""),
@@ -690,6 +709,73 @@ class BeamAgent:
             add_event_note(state, f"Sequence stopped: {stop}.")
         self.trace.flush()
         return self.snapshot()
+
+    def _stash_pending_verify(self, state, page, action, prepared, outcome):
+        """Queue widget actions for verification against the next observation."""
+        if action.get("name") not in {"click", "input", "select_dropdown", "send_keys"}:
+            return
+        if not outcome.get("ok", True):
+            return
+        element = prepared.get("element")
+        exec_result = outcome.get("_exec")
+        state.setdefault("_pending_verify", []).append({
+            "name": action.get("name"),
+            "element": dict(element) if isinstance(element, dict) else None,
+            "exec": exec_result if isinstance(exec_result, dict) else {},
+            "fingerprint": page.get("fingerprint") or "",
+            "overlay": page.get("overlay") or "",
+        })
+
+    def _verify_pending(self, state, prev_page, page, step_no):
+        """Verify last step's widget actions; escalate stalls, suppress the unmet."""
+        pending = state.get("_pending_verify") or []
+        state["_pending_verify"] = []
+        if not pending:
+            return
+        prev_page = prev_page or {}
+        fresh_fp = page.get("fingerprint") or ""
+        here = page.get("url") or ""
+        if state.get("_widget_url") != here:
+            state["_widget_url"] = here
+            self._widget_stall.reset()
+        can_type = any(item.get("kind") == "fill" for item in page.get("actions") or [])
+        for entry in pending:
+            element = entry.get("element")
+            if element:
+                key = control_key(element.get("kind"), element.get("label"), element.get("role"))
+                label = element.get("label") or "control"
+                info = Agent._verify_info(element, prev_page, page, entry.get("exec") or {})
+                verified = info.get("success", False)
+            elif entry.get("overlay"):
+                key, label = modal_key(entry["overlay"]), entry["overlay"]
+                verified = bool(fresh_fp) and fresh_fp != (entry.get("fingerprint") or "")
+            else:
+                continue
+            event = self._widget_stall.note(
+                key, label=label, verified=bool(verified), strategy=entry.get("name"),
+                fingerprint=fresh_fp,
+            )
+            if not event:
+                continue
+            total = self._widget_stall.after * event["level"]
+            if event["level"] == 1:
+                advice = (
+                    f"'{label[:60]}' did not respond after {total} tries; "
+                    f"{suggest_change(event['tried'], can_type)} instead of repeating."
+                )
+            else:
+                if not is_modal_key(key):
+                    self._suppressed_widgets.add(key)
+                advice = (
+                    f"'{label[:60]}' is marked unmet after {total} tries; "
+                    "move on to the next requirement."
+                )
+            add_event_note(state, advice)
+            self.trace.emit(
+                "guard", step=step_no, type="widget_stall", level=event["level"],
+                key=key, label=label[:80], tried=event["tried"],
+                evidence=f"{total} unverified; {advice}"[:200],
+            )
 
     def _active_key(self, state):
         for tab in self._tabs(state):
@@ -1031,7 +1117,8 @@ class BeamAgent:
         executed = result.get("executed") if isinstance(result, dict) else None
         return {"ok": True, "operation": "CLICK", "kind": "click",
                 "label": f"Clicked '{_clean(label, 80)}'", "target": self._target_desc(prepared["element"]),
-                "note": "" if executed else "click dispatched"}
+                "note": "" if executed else "click dispatched",
+                "_exec": result if isinstance(result, dict) else {}}
 
     def _do_input(self, state, page, prepared):
         element, label = prepared["element"], prepared["element"].get("label") or "field"
@@ -1057,7 +1144,8 @@ class BeamAgent:
         return {"ok": bool(verified), "operation": "TYPE_TEXT", "kind": "fill",
                 "label": f"Typed into '{_clean(label, 80)}'",
                 "target": self._target_desc(element),
-                "note": "" if verified else f"the page did not keep {shown!r}"}
+                "note": "" if verified else f"the page did not keep {shown!r}",
+                "_exec": result if isinstance(result, dict) else {}}
 
     def _clear_field(self, state, page, element):
         browser = state["browser"]
@@ -1105,12 +1193,13 @@ class BeamAgent:
                     "label": f"Selected '{_clean(prepared['option'], 60)}'",
                     "target": self._target_desc(prepared["element"]),
                     "note": "no matching enabled option"}
-        browser.act({**prepared["element"], "value": match.get("value")}, page)
+        selected = browser.act({**prepared["element"], "value": match.get("value")}, page)
         self.trace.emit("verify", step=len(state.get("history") or []) + 1,
                         control=_clean(prepared["element"].get("label"), 80), verified=True)
         return {"ok": True, "operation": "SELECT_OPTION", "kind": "select",
                 "label": f"Selected '{_clean(match.get('label'), 60)}'",
-                "target": self._target_desc(prepared["element"]), "note": ""}
+                "target": self._target_desc(prepared["element"]), "note": "",
+                "_exec": selected if isinstance(selected, dict) else {}}
 
     def _do_dropdown_options(self, state, page, prepared):
         browser = state["browser"]

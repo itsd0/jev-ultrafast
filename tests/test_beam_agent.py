@@ -501,3 +501,41 @@ def test_executor_exception_records_failed_step_without_crashing():
     assert snapshot["status"] == "ready"
     assert snapshot["history"][-1]["operation"] == "CLICK"
     assert "cdp exploded" in snapshot["history"][-1]["note"]
+
+
+def _prompt(agent, call=-1):
+    return agent._provider_override.calls[call]["messages"][-1]["content"]
+
+
+def test_unverified_clicks_escalate_then_suppress():
+    page = _page([_action("e1", "click", "Nonstop", node=1)])
+    script = [(_step(("click", {"index": 1})), {})] * 7
+    agent, _browser = _agent(page, script)
+    for _ in range(3):
+        agent.command("tick")
+    assert "did not respond" not in _prompt(agent)
+    agent.command("tick")
+    assert "'Nonstop' did not respond after 3 tries" in _prompt(agent)
+    for _ in range(3):
+        agent.command("tick")
+    assert "'Nonstop' is marked unmet after 6 tries" in _prompt(agent)
+    assert "Nonstop" not in [item.get("label") for item in agent._by_index.values()]
+
+
+def test_unverified_keys_in_dialog_escalate_without_suppression():
+    page = _page([])
+    agent, _browser = _agent(page, [])
+    prev = {"fingerprint": "f1", "actions": []}
+    fresh = _page([])
+    fresh["fingerprint"] = "f1"
+    fresh["overlay"] = "Stops"
+    for _ in range(3):
+        agent.state["_pending_verify"] = [{
+            "name": "send_keys", "element": None, "exec": {},
+            "fingerprint": "f1", "overlay": "Stops",
+        }]
+        agent._verify_pending(agent.state, prev, fresh, 1)
+    notes = [note.get("text") or "" for note in agent.state["event_notes"]]
+    assert any("'Stops' did not respond after 3 tries" in text for text in notes)
+    assert any("close and reopen" in text for text in notes)
+    assert agent._suppressed_widgets == set()

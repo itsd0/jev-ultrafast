@@ -47,6 +47,13 @@ from .questions import (
 )
 from .trace import Trace, cost_estimate_usd, get_logger
 from .vision import confirm_point, needs_vision, propose
+from .widget_stall import (
+    RUN_HOLD_STEPS,
+    WidgetStallTracker,
+    is_modal_key,
+    suggest_change,
+    widget_key_for,
+)
 
 _RELOAD_WORDS = frozenset({"reload", "refresh"})
 
@@ -1131,6 +1138,7 @@ class Agent:
         self.browser = browser if browser is not None else Browser(url, config=self.config)
         self.record_dir = Path(record_dir) if record_dir else None
         self.screenshots = screenshots or bool(record_dir)
+        self._widget_stall = WidgetStallTracker()
         self.log = get_logger("agent")
         self.trace = Trace(run_id=os.environ.get("JEV_RUN_ID") or None)
         try:
@@ -1999,6 +2007,9 @@ class Agent:
                 next_strategy=verify["next"], commit=verify.get("commit"),
                 duration_ms=round((time.perf_counter() - verify_started) * 1000),
             )
+            self._widget_stall_hook(
+                state, action, page, verify, changed, strategy, done_step,
+            )
             self._emit_snapshot(state, done_step, post_ms, page_changed=changed)
             state["_prev_fp"] = state["page"].get("fingerprint")
             self.trace.maybe_step_shot(done_step, state["page"].get("screenshot"))
@@ -2306,6 +2317,75 @@ class Agent:
         )
         state["status"] = "ready"
         return True
+
+    def _widget_tracker(self):
+        tracker = getattr(self, "_widget_stall", None)
+        if tracker is None:
+            tracker = WidgetStallTracker()
+            self._widget_stall = tracker
+        return tracker
+
+    def _widget_can_type(self, state, action):
+        """A fill twin (same node) or any field in the open dialog exists."""
+        live = state.get("page") or {}
+        actions = live.get("actions") or []
+        node = action.get("node")
+        for item in actions:
+            if item.get("kind") != "fill" or item.get("node") is None:
+                continue
+            if item.get("node") == node or live.get("modal_scoped"):
+                return True
+        return False
+
+    def _widget_stall_hook(self, state, action, page, verify, changed, strategy, done_step):
+        """Escalate widgets that absorb actions without verifiable change."""
+        if action.get("kind") not in {"click", "fill", "check", "select", "select_option", "key"}:
+            return
+        key, label = widget_key_for(action, page)
+        if not key:
+            return
+        modal = is_modal_key(key)
+        success = changed if modal else verify.get("success", False)
+        tracker = self._widget_tracker()
+        here = (state.get("page") or {}).get("url") or ""
+        if state.get("_widget_url") != here:
+            state["_widget_url"] = here
+            tracker.reset()
+        event = tracker.note(
+            key, label=label, verified=bool(success), strategy=strategy,
+            fingerprint=(state.get("page") or {}).get("fingerprint") or "",
+        )
+        if not event:
+            return
+        reasons = dict(state.get("hold_reasons") or {})
+        total = tracker.after * event["level"]
+        if event["level"] == 1:
+            suggestion = suggest_change(event["tried"], self._widget_can_type(state, action))
+            if not modal:
+                state["held_actions"] = hold_actions(
+                    state.get("held_actions"), [key], STALL_HOLD_STEPS, reasons, "widget stall",
+                )
+                state["hold_reasons"] = reasons
+            advice = f"'{label[:60]}' did not respond after {total} tries; {suggestion} instead."
+        else:
+            if not modal:
+                state["held_actions"] = hold_actions(
+                    state.get("held_actions"), [key], RUN_HOLD_STEPS, reasons, "widget unmet",
+                )
+                state["hold_reasons"] = reasons
+            unmet = list(state.get("unmet_widgets") or [])
+            unmet.append({"key": key, "label": label[:80], "step": done_step})
+            state["unmet_widgets"] = unmet
+            advice = (
+                f"'{label[:60]}' is marked unmet after {total} tries; "
+                "move on to the next requirement."
+            )
+        add_event_note(state, advice)
+        self.trace.emit(
+            "guard", step=done_step, type="widget_stall", level=event["level"],
+            key=key, label=label[:80], tried=event["tried"],
+            evidence=f"{total} unverified; {advice}"[:200],
+        )
 
     def _stall_check(self, state, step=None):
         stall = detect_control_stall(state.get("loop_window") or [])
