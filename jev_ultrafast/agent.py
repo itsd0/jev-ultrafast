@@ -1,6 +1,7 @@
 """The complete agent loop. Typed choices, observable state, bounded execution."""
 
 import base64
+import json
 import os
 import random
 import re
@@ -377,6 +378,51 @@ def scroll_exhausted(watch, memo_len, satisfied):
         and memo_len <= watch.get("memo", 0)
         and satisfied <= watch.get("satisfied", 0)
     )
+
+
+def scroll_direction(action):
+    """A scroll's (axis, sign): page scroll_down is ("y", 1)."""
+    axis = "x" if action.get("axis") == "x" else "y"
+    return (axis, -1 if (action.get("delta") or 0) < 0 else 1)
+
+
+MODAL_SCROLL_NOTE = (
+    "A dialog is open. Fill its fields, then press its confirm button (Done/Apply/OK), "
+    "or Escape to cancel."
+)
+
+
+def modal_scroll_route(page, action):
+    """Route a page scroll into the modal's container, or refuse it.
+
+    Returns (action, note): the routed action and None, or the original action
+    with a refusal note when the modal has no scrollable container. Non-modal
+    pages and container scrolls pass through untouched.
+    """
+    if not page.get("modal_scoped") or action.get("kind") != "scroll":
+        return action, None
+    if type(action.get("node")) is int:
+        return action, None
+    direction = scroll_direction(action)
+    containers = [
+        item for item in page.get("actions", [])
+        if item.get("kind") == "scroll" and type(item.get("node")) is int
+    ]
+    same = [item for item in containers if scroll_direction(item) == direction]
+    target = (same or containers or [None])[0]
+    if target is None:
+        return action, MODAL_SCROLL_NOTE
+    routed = dict(target)
+    routed["id"] = action["id"]
+    return routed, None
+
+
+def append_loop_step(state, entry):
+    """Append to the loop window and bump its sequence, so a guard fire can tell
+    a fresh pattern from a re-fire on an unchanged window."""
+    state.setdefault("loop_window", []).append(entry)
+    state["loop_window"] = state["loop_window"][-LOOP_WINDOW:]
+    state["_loop_seq"] = state.get("_loop_seq", 0) + 1
 
 
 def goal_page_target(goal):
@@ -919,6 +965,14 @@ def page_for_choice(state):
     if any(a.get("generic") for a in actions):
         # Unlabeled controls sort last: prefer controls that say what they do.
         actions = sorted(actions, key=lambda a: bool(a.get("generic")))
+    if state["page"].get("modal_scoped"):
+        fills = [a for a in actions if a.get("kind") == "fill"]
+        if all(a.get("value") for a in fills):
+            # The dialog's fields are set: offer its confirm buttons first.
+            actions = sorted(
+                actions,
+                key=lambda a: not (a.get("kind") == "click" and is_confirm_label(a.get("label"))),
+            )
     if actions == state["page"]["actions"]:
         return state["page"]
     return {**state["page"], "actions": actions}
@@ -1331,7 +1385,10 @@ class Agent:
                 self._handle_captcha(state, step, captcha)
                 return self.snapshot()
             cycle = detect_cycle(state.get("loop_window") or [])
-            if cycle:
+            if cycle and state.get("_loop_seq", 0) != state.get("_loop_fired_seq", -1):
+                # A fire counts only when the window advanced: BLOCKED re-asks
+                # append nothing, so they must not escalate a loop to terminal.
+                state["_loop_fired_seq"] = state.get("_loop_seq", 0)
                 reasons = dict(state.get("hold_reasons") or {})
                 state["held_actions"] = hold_actions(
                     state.get("held_actions"), cycle["keys"], reasons=reasons, reason="loop hold"
@@ -1572,6 +1629,7 @@ class Agent:
             act_started = time.perf_counter()
             navigate_todo = ""
             fallback_used = False
+            modal_routed = False
             if action["kind"] == "navigate":
                 if not state["browser"].fresh(page):
                     raise StalePage("Page changed before text generation. Choose again.")
@@ -1624,6 +1682,14 @@ class Agent:
                         return self._pick_option(state, step, typed, choices, goal, field)
 
                     extra_act = {"goal": state["goal"], "tiebreak": tiebreak}
+                if action["kind"] == "scroll":
+                    had_node = type(action.get("node")) is int
+                    action, modal_note = modal_scroll_route(page, action)
+                    if modal_note is not None:
+                        return self._skip_text_step(
+                            state, page, action, decision, selected, note=modal_note
+                        )
+                    modal_routed = not had_node and type(action.get("node")) is int
                 result = state["browser"].act(action, page, text=text, **extra_act)
             act_ms = round((time.perf_counter() - act_started) * 1000)
             cdp_after, cdp_ms_after = self._cdp(state["browser"])
@@ -1696,6 +1762,7 @@ class Agent:
                         "value unchanged" if check_failed else None,
                         "navigation failed" if navigate_failed else None,
                         "used search fallback" if fallback_used else None,
+                        "scrolled inside the dialog" if modal_routed else None,
                         date_note,
                     ) if part) or None,
                     "page_changed": None,
@@ -1756,22 +1823,51 @@ class Agent:
                     state.get("scroll_watch"), key, memo_len, satisfied
                 )
                 if scroll_exhausted(state["scroll_watch"], memo_len, satisfied):
+                    direction = scroll_direction(action)
                     reasons = dict(state.get("hold_reasons") or {})
                     scroll_keys = [
                         noop_key(item)
                         for item in state["page"].get("actions", [])
-                        if item.get("kind") == "scroll"
+                        if item.get("kind") == "scroll" and scroll_direction(item) == direction
                     ]
                     state["held_actions"] = hold_actions(
                         state.get("held_actions"), scroll_keys, SCROLL_HOLD_STEPS, reasons, "scroll hold"
                     )
                     state["hold_reasons"] = reasons
-                    add_event_note(
-                        state, "Scrolling is exhausted; use a filter, link, or navigate instead."
-                    )
+                    topped = False
+                    if direction == ("y", 1):
+                        # The way back up stays open, and the run takes it itself:
+                        # controls above the fold come back into view.
+                        if type(action.get("node")) is int:
+                            top_expression = (
+                                "(ref => { const fast=window.__jevFast; "
+                                "const e=fast?.resolve ? fast.resolve(ref) : fast?.nodes.get(ref.node); "
+                                "if (!e) return false; e.scrollTop=0; return true; })("
+                                + json.dumps(
+                                    {"node": action["node"], "frame": action.get("frame") or "f0"}
+                                )
+                                + ")"
+                            )
+                        else:
+                            top_expression = "window.scrollTo(0, 0)"
+                        try:
+                            state["browser"].evaluate(top_expression)
+                            state["page"] = state["browser"].observe(screenshot=self.screenshots)
+                            topped = True
+                        except (RuntimeError, StalePage):
+                            topped = False
+                    note = "Scrolling is exhausted; use a filter, link, or navigate instead."
+                    if topped:
+                        note += " Returned to the top of the page."
+                        base_note = state["history"][-1]["note"]
+                        state["history"][-1]["note"] = (
+                            f"{base_note}; auto-scrolled to top" if base_note else "auto-scrolled to top"
+                        )
+                    add_event_note(state, note)
                     self.trace.emit(
                         "guard", step=done_step, type="scroll_exhausted", page=key,
                         scrolls=state["scroll_watch"]["count"],
+                        held_direction=f"{direction[0]}{direction[1]:+d}", auto_top=topped,
                         evidence=f"{state['scroll_watch']['count']} scrolls with no new facts or progress"[:200],
                     )
                     state["scroll_watch"] = {
@@ -1806,8 +1902,7 @@ class Agent:
             if action.get("kind") != "wait":
                 window = state.get("loop_window") or []
                 progress = (bool(switched) or not same_page(window, state["page"])) and not off_topic
-                window.append(loop_step(decision, action, state["page"], progress))
-                state["loop_window"] = window[-LOOP_WINDOW:]
+                append_loop_step(state, loop_step(decision, action, state["page"], progress))
             if action.get("kind") == "click" and state.get("subgoals") is not None:
                 outing = excursion_for(action, page, state["page"])
                 if outing is not None:
@@ -1877,8 +1972,7 @@ class Agent:
             before={"value": action.get("value")}, after={"value": action.get("value")},
             changed=False, success=True, next_strategy=None, duration_ms=0,
         )
-        state.setdefault("loop_window", []).append(loop_step(decision, action, page, True))
-        state["loop_window"] = state["loop_window"][-LOOP_WINDOW:]
+        append_loop_step(state, loop_step(decision, action, page, True))
         state["status"] = "ready"
         return self.snapshot()
 
@@ -1953,9 +2047,9 @@ class Agent:
         state["page"] = state["browser"].observe(screenshot=self.screenshots)
         changed = state["page"]["fingerprint"] != page["fingerprint"]
         state["history"][-1].update(page_changed=changed, url=state["page"]["url"])
-        window = state.get("loop_window") or []
-        window.append(loop_step({**decision, "operation": "SCROLL_DOWN"}, scroll, state["page"], changed))
-        state["loop_window"] = window[-LOOP_WINDOW:]
+        append_loop_step(
+            state, loop_step({**decision, "operation": "SCROLL_DOWN"}, scroll, state["page"], changed)
+        )
         self.trace.emit(
             "action", step=len(state["history"]), operation="SCROLL_DOWN", target=scroll.get("label"),
             kind="scroll", strategy="unblock", cdp_calls=cdp_calls, cdp_ms=cdp_ms,
@@ -2547,8 +2641,7 @@ class Agent:
                 "elapsed_ms": state["elapsed_ms"],
             }
         )
-        state.setdefault("loop_window", []).append(loop_step(decision, action, page, False))
-        state["loop_window"] = state["loop_window"][-LOOP_WINDOW:]
+        append_loop_step(state, loop_step(decision, action, page, False))
         state["status"] = "ready"
         return self.snapshot()
 

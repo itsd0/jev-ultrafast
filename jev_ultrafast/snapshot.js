@@ -477,8 +477,12 @@
     const prefix=a.frame && a.frame!=='f0' ? a.frame+':' : '';
     a.id=prefix+'e'+(i+1);
   });
-  if (scrollY+innerHeight<height-2) actions.push({id:'scroll_down',kind:'scroll',label:'Scroll down',delta:560});
-  if (scrollY>0) actions.push({id:'scroll_up',kind:'scroll',label:'Scroll up',delta:-560});
+  // No document scroll under a modal: scrolling behind a dialog dismisses it on
+  // many sites. Only scroll containers inside the modal stay offered.
+  if (!modalScoped) {
+    if (scrollY+innerHeight<height-2) actions.push({id:'scroll_down',kind:'scroll',label:'Scroll down',delta:560});
+    if (scrollY>0) actions.push({id:'scroll_up',kind:'scroll',label:'Scroll up',delta:-560});
+  }
   if (cfg().nested) {
     const candidates=[];
     function addContainers(doc, frameId, ox, oy) {
@@ -487,6 +491,7 @@
       try { nodes=queryAllDeep(doc, '*'); } catch (error) { return; }
       for (const e of nodes) {
         if (e===document.body || e===document.documentElement || !visible(e)) continue;
+        if (modalScoped && frameId===rootFrame && modal && !modal.contains(e)) continue;
         const style=getComputedStyle(e);
         const vertical=['auto','scroll','overlay'].includes(style.overflowY) && e.scrollHeight>e.clientHeight+4;
         const horizontal=['auto','scroll','overlay'].includes(style.overflowX) && e.scrollWidth>e.clientWidth+4;

@@ -168,6 +168,19 @@ def _click_step(label, progress=False):
     }
 
 
+def test_blocked_reasks_do_not_escalate_a_loop(runner, monkeypatch):
+    monkeypatch.setattr(loop, "decompose_goal", lambda goal: ["goal"])
+    monkeypatch.setattr(loop, "choose", lambda *_args, **kwargs: decision("BLOCKED"))
+    runner.state["loop_window"] = [_click_step(label) for label in ("A", "B") * 2]
+    for _ in range(3):
+        runner.command("predict", {})
+        assert runner.state["status"] == "predicted"
+    assert runner.state["loop_fires"] == 1  # the window never advanced
+    loop.append_loop_step(runner.state, _click_step("A"))
+    runner.command("predict", {})
+    assert runner.state["loop_fires"] == 2  # a fresh step fires again
+
+
 def test_pair_key_groups_inverse_labels():
     from jev_ultrafast.agent import pair_key
 
@@ -274,6 +287,55 @@ def test_scroll_exhaustion_holds_scrolls_in_act(runner):
     runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
     assert loop.noop_key(scroll) in (runner.state["held_actions"] or {})
     assert any("exhausted" in note["text"] for note in runner.state["event_notes"])
+
+
+def test_modal_page_scroll_routes_into_the_dialog():
+    page = {"modal_scoped": True, "actions": [
+        {"id": "scroll_down", "kind": "scroll", "label": "Scroll down", "delta": 560},
+        {"id": "s1", "kind": "scroll", "label": "Scroll down list", "node": 9,
+         "frame": "f0", "axis": "y", "delta": 96},
+    ]}
+    routed, note = loop.modal_scroll_route(page, page["actions"][0])
+    assert note is None
+    assert routed["node"] == 9 and routed["id"] == "scroll_down"  # decided id kept
+    bare = {"modal_scoped": True, "actions": [page["actions"][0]]}
+    kept, note = loop.modal_scroll_route(bare, bare["actions"][0])
+    assert kept["id"] == "scroll_down" and note == loop.MODAL_SCROLL_NOTE
+    plain = {"actions": [page["actions"][0]]}
+    same, note = loop.modal_scroll_route(plain, plain["actions"][0])
+    assert same["id"] == "scroll_down" and note is None  # no modal: untouched
+    same, note = loop.modal_scroll_route(page, page["actions"][1])
+    assert same["id"] == "s1" and note is None  # container scrolls pass through
+
+
+def test_modal_refusal_skips_browser_execution(runner):
+    runner.state["page"]["modal_scoped"] = True
+    scroll = {"id": "scroll_down", "kind": "scroll", "label": "Scroll down", "delta": 560}
+    runner.state["page"]["actions"].append(scroll)
+    runner.state["decision"] = {**decision("scroll_down"), "operation": "SCROLL_DOWN"}
+    runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    runner.state["browser"].act.assert_not_called()
+    assert runner.state["history"][-1]["note"] == loop.MODAL_SCROLL_NOTE
+    assert runner.state["status"] == "ready"
+
+
+def test_scroll_exhaustion_holds_only_down_and_tops(runner):
+    down = {"id": "scroll_down", "kind": "scroll", "label": "Scroll down", "delta": 560}
+    up = {"id": "scroll_up", "kind": "scroll", "label": "Scroll up", "delta": -560}
+    runner.state["page"]["actions"].extend([down, up])
+    runner.state["scroll_watch"] = {
+        "key": loop.normalize_link_url(runner.state["page"]["url"]),
+        "count": 3, "memo": 0, "satisfied": 0,
+    }
+    runner.state["decision"] = {**decision("scroll_down"), "operation": "SCROLL_DOWN"}
+    runner.state["browser"].act.return_value = {"executed": "scroll_down"}
+    runner.state["browser"].observe.return_value = {**runner.state["page"], "fingerprint": "fp2"}
+    runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    held = runner.state["held_actions"] or {}
+    assert loop.noop_key(down) in held
+    assert loop.noop_key(up) not in held  # the way back up stays open
+    runner.state["browser"].evaluate.assert_called_with("window.scrollTo(0, 0)")
+    assert "auto-scrolled to top" in (runner.state["history"][-1]["note"] or "")
 
 
 def test_stem_strips_plurals():
@@ -2042,6 +2104,20 @@ def test_page_for_choice_sorts_generic_targets_last(runner):
     assert [a["id"] for a in offered["actions"]] == ["e2", "e3", "wait", "e1"]
     offered["actions"][0]["label"] = "sentinel"
     assert second["label"] == "sentinel"  # sorted copy still shares the action dicts
+
+
+def test_modal_confirms_offered_first_when_fields_set(runner):
+    runner.state["page"]["modal_scoped"] = True
+    runner.state["page"]["actions"] = [
+        {"id": "e1", "kind": "fill", "label": "Name", "role": "textbox", "value": "x"},
+        {"id": "e2", "kind": "click", "label": "Cancel", "role": "button"},
+        {"id": "e3", "kind": "click", "label": "Done", "role": "button"},
+    ]
+    offered = loop.page_for_choice(runner.state)
+    assert [a["id"] for a in offered["actions"]] == ["e3", "e1", "e2"]
+    runner.state["page"]["actions"][0]["value"] = ""
+    offered = loop.page_for_choice(runner.state)
+    assert [a["id"] for a in offered["actions"]] == ["e1", "e2", "e3"]
 
 
 def test_force_navigate_updates_suppression(runner):
