@@ -9,9 +9,11 @@ Usage: uv run scripts/bench.py [--server URL] [--runs N] [--jobs N] [--task ID]
 """
 
 import argparse
+import hashlib
 import json
 import re
 import statistics
+import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -170,6 +172,28 @@ def med(values):
     return round(statistics.median(values), 1) if values else None
 
 
+def git_info():
+    """The tree the bench ran on: HEAD sha, dirty flag, and diff hash."""
+    root = Path(__file__).resolve().parent.parent
+    try:
+        sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=root, capture_output=True, text=True
+        ).stdout.strip()
+        porcelain = subprocess.run(
+            ["git", "status", "--porcelain"], cwd=root, capture_output=True, text=True
+        ).stdout.strip()
+        diff = subprocess.run(
+            ["git", "diff", "HEAD"], cwd=root, capture_output=True
+        ).stdout
+    except OSError:
+        return {"sha": None, "dirty": None, "diff_hash": None}
+    return {
+        "sha": sha or None,
+        "dirty": bool(porcelain),
+        "diff_hash": hashlib.sha256(diff).hexdigest(),
+    }
+
+
 def report(suite, records):
     lines = ["| task | ok | median time | median steps | median decisions | median tokens | cost | failures |"]
     lines.append("| --- | --- | --- | --- | --- | --- | --- | --- |")
@@ -231,10 +255,14 @@ def main(argv=None):
             mark = "ok" if record.get("reason") is None else record.get("reason")
             print(f"[{len(records)}/{len(work)}] {task_id} rep {rep}: {mark}", flush=True)
     records.sort(key=lambda r: (r["task"], r.get("rep", 0)))
+    git = git_info()
+    print(f"Bench on {git['sha']} (dirty={git['dirty']}, diff={git['diff_hash'][:12]})")
     print("\n" + report(suite, records))
     out = Path(args.out or f"artifacts/bench-{datetime.now(timezone.utc):%Y%m%d-%H%M%S}.json")
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps({"server": args.server, "tasks": args.task, "records": records}, indent=2))
+    out.write_text(
+        json.dumps({"server": args.server, "tasks": args.task, "git": git, "records": records}, indent=2)
+    )
     print(f"\nResults: {out}")
     return 0
 

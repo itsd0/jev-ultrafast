@@ -1,6 +1,7 @@
 """Offline tests for scripts/bench.py checkers and failure classifier."""
 
 import importlib.util
+import re
 from pathlib import Path
 
 bench = importlib.util.module_from_spec(
@@ -83,6 +84,13 @@ def test_classify_success_is_none():
     task = {"checks": [{"type": "text_contains", "value": "points"}]}
     good = bench.run_checks(task, evidence())
     assert bench.classify(task, evidence(), good, False) is None
+
+
+def test_git_info_reports_sha_dirty_and_diff():
+    git = bench.git_info()
+    assert re.fullmatch(r"[0-9a-f]{40}", git["sha"] or "")
+    assert isinstance(git["dirty"], bool)
+    assert re.fullmatch(r"[0-9a-f]{64}", git["diff_hash"] or "")
 
 
 def test_text_regex_and_hotels_checks():
