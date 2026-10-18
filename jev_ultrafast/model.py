@@ -1058,6 +1058,29 @@ def answer_context(goal, page, history, evidence=(), memo=(), partial=False):
     }
 
 
+_GOAL_NUMBER_RE = re.compile(
+    r"\b(population|price|cost|count|number|rating|temperature|percent|percentage|total|"
+    r"how many|how much|old|tall|long|far|area|height|weight|speed|score|points)\b",
+    re.IGNORECASE,
+)
+_MISSING_RE = re.compile(
+    r"\b(missing|not (visible|found|available|shown|listed)|could ?n'?t|cannot|"
+    r"does not show|unavailable|unknown)\b",
+    re.IGNORECASE,
+)
+_NUMBER_RE = re.compile(r"\d[\d,]*(?:\.\d+)?")
+
+
+def answer_needs_number(goal, text):
+    """True when the goal asks for a number but the answer neither quotes digits
+    nor honestly says the value is missing. General: digit and wording check only."""
+    return (
+        bool(_GOAL_NUMBER_RE.search(goal or ""))
+        and not _NUMBER_RE.search(text or "")
+        and not _MISSING_RE.search(text or "")
+    )
+
+
 def track_context(goal, subgoals, memo, page, history):
     return {
         "goal": goal,

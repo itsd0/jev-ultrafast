@@ -1599,6 +1599,79 @@ def test_done_without_answer_when_helper_fails(runner, monkeypatch):
     assert runner.state["answer"] is None
 
 
+def test_answer_needs_number_flags_vague_million_people():
+    assert model.answer_needs_number(
+        "find the population of Bangkok", "Bangkok has several million people."
+    )
+    assert not model.answer_needs_number(
+        "find the population of Bangkok",
+        "The region has 10,722,000 residents, per the census table.",
+    )
+    assert not model.answer_needs_number(
+        "find the population of Bangkok", "The population is not visible on this page."
+    )
+    assert not model.answer_needs_number("open x.com", "Opened x.com.")
+
+
+def test_done_retries_vague_number_answer_once(runner, monkeypatch):
+    from jev_ultrafast.questions import ANSWER_NUMBER_RETRY, ANSWER_VALUE
+
+    calls = []
+
+    def vague_then_quoted(context, system=None):
+        calls.append(system)
+        if len(calls) == 1:
+            return "Bangkok has several million people.", {"model": "t", "usage": {}}
+        return (
+            "The region has 10,722,000 residents, per the census table.",
+            {"model": "t", "usage": {}},
+        )
+
+    monkeypatch.setattr(loop, "field_text", vague_then_quoted)
+    monkeypatch.setattr(
+        loop,
+        "judge_progress",
+        lambda context, system: (
+            {"satisfied": [], "facts": [], "complete": True, "missing": ""},
+            {"model": "t", "latency_ms": 1, "usage": {}},
+        ),
+    )
+    runner.state["goal"] = "find the population of Bangkok"
+    runner.state["decision"] = decision("DONE")
+    runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    assert runner.state["status"] == "done"
+    assert "10,722,000" in runner.state["answer"]
+    assert len(calls) == 2
+    assert calls[0] == ANSWER_VALUE
+    assert calls[1] == ANSWER_VALUE + ANSWER_NUMBER_RETRY
+    finals = [c for c in runner.state["text_calls"] if c["field"] == "final answer"]
+    assert len(finals) == 2
+
+
+def test_done_keeps_honest_missing_number_answer(runner, monkeypatch):
+    calls = []
+
+    def missing(context, system=None):
+        calls.append(system)
+        return "The price is not listed on this page.", {"model": "t", "usage": {}}
+
+    monkeypatch.setattr(loop, "field_text", missing)
+    monkeypatch.setattr(
+        loop,
+        "judge_progress",
+        lambda context, system: (
+            {"satisfied": [], "facts": [], "complete": True, "missing": ""},
+            {"model": "t", "latency_ms": 1, "usage": {}},
+        ),
+    )
+    runner.state["goal"] = "get the price of the usb-c hub"
+    runner.state["decision"] = decision("DONE")
+    runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    assert runner.state["status"] == "done"
+    assert "not listed" in runner.state["answer"]
+    assert len(calls) == 1
+
+
 def test_blocked_third_time_scrolls_once_then_accepts(runner):
     scrolled = page()
     scrolled["url"] = "https://example.test/scrolled"

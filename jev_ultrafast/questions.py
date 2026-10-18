@@ -55,9 +55,17 @@ ANSWER_VALUE = """Return a JSON object with exactly one key, text: the final ans
 Report what the goal asked for (names, numbers, prices, titles) using the current page and the action
 history. Prefer the collected evidence and facts: they may come from pages no longer open. If the goal
 asks for a syntax, signature, code, title, or exact line, quote it verbatim from the page or its
-sections; never paraphrase or reconstruct it from memory. If the goal
+sections; never paraphrase or reconstruct it from memory. If the goal asks for a number
+(population, price, count, rating, temperature), quote the exact sentence containing it. Name only
+sites and pages from the evidence, facts, or action history. If the goal
 only asked to reach a page, return its title and URL. If the requested information is not visible, say
 what is missing instead of guessing. No commentary or browser actions."""
+
+ANSWER_NUMBER_RETRY = (
+    " Your previous answer had no number. The goal asks for a number: quote the exact"
+    " sentence from the page text that contains the digits, or say the value is missing."
+    " Never round a number into vague words like 'several million'."
+)
 
 TRACK_SYSTEM = """Track progress on a multi-part browser goal. Given the ordered sub-goals, the current
 page, and recent actions, return which sub-goals are now satisfied WITH the exact value seen.

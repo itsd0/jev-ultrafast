@@ -17,6 +17,7 @@ from .model import (
     SAVE_FILE_SCHEMA,
     action_space,
     answer_context,
+    answer_needs_number,
     choose,
     choose_mercury,
     decision_provider,
@@ -35,6 +36,7 @@ from .model import (
     write_saved_file,
 )
 from .questions import (
+    ANSWER_NUMBER_RETRY,
     ANSWER_VALUE,
     GATE_SYSTEM,
     NAVIGATE_VALUE,
@@ -2192,25 +2194,37 @@ class Agent:
             if item.get("satisfied")
         ]
         step = len(state.get("history") or []) if step is None else step
+        context = answer_context(
+            state["goal"],
+            page,
+            state["history"],
+            evidence,
+            state.get("memo") or [],
+            bool(state.get("partial")),
+        )
         try:
-            text, helper = self._gen_text(
-                state,
-                step,
-                answer_context(
-                    state["goal"],
-                    page,
-                    state["history"],
-                    evidence,
-                    state.get("memo") or [],
-                    bool(state.get("partial")),
-                ),
-                ANSWER_VALUE,
-                "answer",
-            )
+            first = self._gen_text(state, step, context, ANSWER_VALUE, "answer")
         except Exception:
             self.log.info("[jev:answer] text helper failed; finishing without an answer")
             return None
-        state["text_calls"].append({**helper, "field": "final answer", "value": text})
+        attempts = [first]
+        text, helper = first
+        if answer_needs_number(state["goal"], text):
+            try:
+                second = self._gen_text(
+                    state, step, context, ANSWER_VALUE + ANSWER_NUMBER_RETRY,
+                    "answer-number-retry",
+                )
+            except Exception:
+                second = None
+            if second is not None:
+                attempts.append(second)
+                if not answer_needs_number(state["goal"], second[0]):
+                    text, helper = second
+        for attempt_text, attempt_helper in attempts:
+            state["text_calls"].append(
+                {**attempt_helper, "field": "final answer", "value": attempt_text}
+            )
         return text
 
     def _unblock_scroll(self, state, page, decision):
