@@ -50,7 +50,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     final_text TEXT,
     answer_text TEXT,
     decisions_count INTEGER,
-    blocked_reason TEXT
+    blocked_reason TEXT,
+    partial INTEGER
 );
 CREATE TABLE IF NOT EXISTS steps (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -81,6 +82,7 @@ class Store:
                 ("answer_text", "TEXT"),
                 ("decisions_count", "INTEGER"),
                 ("blocked_reason", "TEXT"),
+                ("partial", "INTEGER"),
             ):
                 if column not in have:
                     self.conn.execute(f"ALTER TABLE tasks ADD COLUMN {column} {ctype}")
@@ -463,6 +465,7 @@ class Runner:
             answer_text=snapshot.get("answer"),
             decisions_count=len(snapshot.get("decisions") or []),
             blocked_reason=snapshot.get("blocked_reason"),
+            partial=int(bool(snapshot.get("partial"))),
             verified_by_agent=int(status == "done"),
             input_tokens=prompt,
             output_tokens=completion,

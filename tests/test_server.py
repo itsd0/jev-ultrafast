@@ -441,6 +441,7 @@ def test_finish_stores_bench_evidence(start_service):
         finished["page"] = {"url": "https://example.test/", "text": "Hello bench"}
         finished["answer"] = "The answer is 42."
         finished["blocked_reason"] = None
+        finished["partial"] = True
         return finished
 
     base, _ = start_service(script)
@@ -450,6 +451,7 @@ def test_finish_stores_bench_evidence(start_service):
     assert done["answer_text"] == "The answer is 42."
     assert done["decisions_count"] == 2
     assert done["blocked_reason"] is None
+    assert done["partial"] == 1
     _, listed = api(base, "GET", "/api/tasks")
     assert "final_text" not in listed[0]
 

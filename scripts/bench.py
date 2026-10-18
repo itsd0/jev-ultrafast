@@ -134,6 +134,7 @@ def run_once(client, task, rep, timeout_s):
         "cost_usd": evidence.get("cost_usd_estimate") or 0,
         "final_url": evidence.get("final_url"),
         "blocked_reason": evidence.get("blocked_reason"),
+        "partial": bool(evidence.get("partial")),
         "error": (evidence.get("error") or "")[:200],
         "checks": checks,
         "reason": classify(task, evidence, checks, timed_out),
@@ -153,7 +154,9 @@ def report(suite, records):
         if not runs:
             continue
         ok = sum(1 for r in runs if r["reason"] is None)
-        failures = ", ".join(f"r{r['rep']}:{r['reason']}" for r in runs if r["reason"]) or "-"
+        failures = ", ".join(
+            f"r{r['rep']}:{r['reason']}{'*' if r.get('partial') else ''}" for r in runs if r["reason"]
+        ) or "-"
         lines.append(
             f"| {task['id']} | {ok}/{len(runs)}"
             f" | {med([r['wall_s'] for r in runs])}s"
@@ -164,7 +167,7 @@ def report(suite, records):
             f" | {failures} |"
         )
     ok = sum(1 for r in records if r["reason"] is None)
-    lines.append(f"\nTotal: {ok}/{len(records)} passed.")
+    lines.append(f"\nTotal: {ok}/{len(records)} passed. (* = partial answer attached)")
     return "\n".join(lines)
 
 
