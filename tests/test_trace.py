@@ -262,6 +262,8 @@ def test_no_print_statements_in_the_package():
     root = Path(__file__).resolve().parent.parent / "jev_ultrafast"
     offenders = []
     for path in sorted(root.glob("*.py")):
+        if path.name.startswith("._"):
+            continue  # AppleDouble metadata, not source.
         for number, line in enumerate(path.read_text().splitlines(), 1):
             if re.match(r"\s*print\(", line):
                 offenders.append(f"{path.name}:{number}")

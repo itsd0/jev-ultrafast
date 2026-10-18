@@ -557,7 +557,7 @@ def test_fill_already_set_skips_the_mutation_and_holds(runner, monkeypatch):
     runner.state["browser"].act.assert_not_called()
     assert runner.state["history"][-1]["note"] == "value already set"
     assert runner.state["history"][-1]["page_changed"] is False
-    assert runner.state["held_actions"]["e5"] == 2
+    assert runner.state["held_actions"][loop.noop_key({"kind": "fill", "label": "Departure"})] == 2
     assert runner.state["status"] == "ready"
 
 
@@ -578,7 +578,9 @@ def test_click_with_unchanged_value_is_held(runner):
     runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
     runner.state["browser"].act.assert_called_once()
     assert runner.state["history"][-1]["note"] == "value unchanged"
-    assert runner.state["held_actions"]["e6"] == 2
+    assert runner.state["held_actions"][loop.noop_key({"kind": "click", "label": "Open Departure"})] == 2
+    # The hold survives the id shift: the same control reappears as e9.
+    assert "e9" not in [a["id"] for a in loop.offered_actions(after["actions"], runner.state["held_actions"])]
 
 
 def test_executed_action_resets_blocked_streak(runner):
@@ -634,6 +636,7 @@ def test_executor_rejects_a_stale_page_before_browser_input(monkeypatch):
 
     b = browser.Browser.__new__(browser.Browser)
     b.fresh = Mock(return_value=False)
+    b.settle_dom = Mock()
     operation = Mock()
     monkeypatch.setattr(browser, "browser_operation", operation)
     with pytest.raises(StalePage):
@@ -710,16 +713,42 @@ def test_navigation_during_prediction_reobserves_without_action(runner):
     runner.state["browser"].act.assert_not_called()
 
 
-def test_stale_execution_target_is_held_before_the_retry(runner, monkeypatch):
+def test_stale_target_retargets_without_a_hold_or_new_decision(runner, monkeypatch):
+    """A stale target is the same control under a shifted id: re-observe, retarget,
+    and execute in the same tick. No stale hold, no new decision consumed."""
     monkeypatch.setattr(loop, "choose", lambda *_args, **_kwargs: decision("e3"))
     runner.state["browser"].fresh.return_value = True
-    runner.state["browser"].observe.side_effect = [page(), page()]
+    shifted = page()
+    shifted["actions"] = [
+        {**a, "id": f"n{i}"} if a["id"].startswith("e") else a
+        for i, a in enumerate(shifted["actions"])
+    ]
+    runner.state["browser"].observe.side_effect = [shifted, shifted]
+    runner.state["browser"].act.side_effect = [
+        StalePage("Target changed or is covered. Observe again."),
+        {"executed": "n2"},
+    ]
+    runner.command("tick")
+    assert "stale hold" not in (runner.state.get("hold_reasons") or {}).values()
+    assert runner.state["history"][-1]["choice"] == "n2"
+    assert len(runner.state["decisions"]) == 1
+
+
+def test_stale_ambiguous_target_redecides_without_a_hold(runner, monkeypatch):
+    """Two identical controls after a re-render: no unique retarget, so the run
+    re-decides next tick instead of guessing. Still no stale hold."""
+    monkeypatch.setattr(loop, "choose", lambda *_args, **_kwargs: decision("e3"))
+    runner.state["browser"].fresh.return_value = True
+    twin = page()
+    go = next(a for a in twin["actions"] if a["id"] == "e3")
+    twin["actions"] = [go, {**go, "id": "e3b"}]
+    twin["fingerprint"] = fingerprint(twin)
+    runner.state["browser"].observe.side_effect = [twin, twin]
     runner.state["browser"].act.side_effect = StalePage("Target changed or is covered. Observe again.")
     runner.command("tick")
-    assert runner.state["held_actions"]["e3"] == 2
-    runner.state["browser"].act.side_effect = None
-    runner.command("tick")
-    assert runner.state["history"][-1]["choice"] == "e3"
+    assert runner.state.get("held_actions", {}) == {}
+    assert runner.state["history"] == []
+    assert runner.state["status"] == "ready"
 
 
 def test_debug_log_reports_tokens_per_second(monkeypatch, caplog):
@@ -920,7 +949,7 @@ def test_reload_without_change_waits_before_the_next_decision(monkeypatch, runne
     runner.command("act", {"fingerprint": "fp1"})
     runner.state["browser"].wait_for_refresh.assert_called_once()
     assert runner.state["history"][-1]["page_changed"] is False
-    assert runner.state["held_actions"]["e31"] == 2
+    assert runner.state["held_actions"][loop.noop_key({"kind": "click", "label": "Reload"})] == 2
 
 
 def test_invalid_text_retries_once_at_low_effort_then_succeeds(monkeypatch):
@@ -1253,6 +1282,7 @@ def test_observe_backs_off_through_navigation(monkeypatch):
     browser = browser_mod.Browser.__new__(browser_mod.Browser)
     browser.session = "sess-test"
     browser.config = {}
+    browser.settle_dom = Mock()
     calls, sleeps = [], []
 
     def flaky(request):
@@ -1269,13 +1299,14 @@ def test_observe_backs_off_through_navigation(monkeypatch):
     assert len(calls) == 3
 
 
-def _stall_step(operation, label, kind="click", progress=False, step_id="e9"):
+def _stall_step(operation, label, kind="click", progress=False, step_id="e9", role="button"):
     return {
         "key": (operation, label, "u", "t"),
         "identity": ("u", "t"),
         "id": step_id,
         "label": label,
         "kind": kind,
+        "role": role,
         "progress": progress,
     }
 
@@ -1284,7 +1315,9 @@ def test_detect_control_stall_rules():
     from jev_ultrafast.agent import detect_control_stall
 
     stuck = [_stall_step("CLICK", "Open Return")] * 3
-    assert detect_control_stall(stuck)["id"] == "e9"
+    assert detect_control_stall(stuck)["key"] == loop.noop_key(
+        {"kind": "click", "label": "Open Return", "role": "button"}
+    )
     moving = [_stall_step("CLICK", "Open Return"), _stall_step("CLICK", "Open Return", progress=True)]
     assert detect_control_stall(moving + [_stall_step("CLICK", "Open Return")]) is None
     assert detect_control_stall([_stall_step("TYPE_TEXT", "Departure", kind="fill")] * 3) is None
@@ -1296,7 +1329,9 @@ def test_detect_control_stall_rules():
 
 def test_stall_check_holds_and_advises_typing(runner, monkeypatch):
     seen = {}
-    runner.state["loop_window"] = [_stall_step("CLICK", "Open Search", step_id="e2")] * 3
+    runner.state["loop_window"] = [
+        _stall_step("CLICK", "Open Search", step_id="e2", role="textbox")
+    ] * 3
     runner.state["history"] = [{"action": "x", "url": "https://example.test/"}]
 
     def fake_choose(*args, **kwargs):
@@ -1305,7 +1340,8 @@ def test_stall_check_holds_and_advises_typing(runner, monkeypatch):
 
     monkeypatch.setattr(loop, "choose", fake_choose)
     runner.command("predict", {})
-    assert runner.state["held_actions"]["e2"] == 4  # Held for 5, decayed once by this predict.
+    key = loop.noop_key({"kind": "click", "label": "Open Search", "role": "textbox"})
+    assert runner.state["held_actions"][key] == 4  # Held for 5, decayed once by this predict.
     assert any("typing the value in Search" in item for item in seen["guidance"])
 
 
@@ -1548,9 +1584,7 @@ def _link_page():
                 **({"nav": True} if nav else {}),
             }
         )
-        guard = [None] * 14
-        guard[12] = href
-        guards[f"f0:{node}"] = guard
+        guards[f"f0:{node}"] = {"role": "link", "name": label.lower(), "tag": "A", "href": href}
     return {"url": "https://shop.test/search", "title": "", "text": "", "fingerprint": "fp",
             "actions": actions, "guards": guards}
 
@@ -1577,23 +1611,29 @@ def test_compute_suppressed_rules():
                      {"id": 1, "text": "seller rating of usb-c hub"}],
         "page_target": None,
     }
+    def key(label):
+        return loop.noop_key({"kind": "click", "label": label, "role": "link"})
+
     dropped = compute_suppressed(state, page)
-    assert dropped == {"e1", "e2"}  # Zero-signal nav links hidden; result item and navigate kept.
+    assert dropped == {key("Electronics"), key("Help")}  # Zero-signal nav hidden; results kept.
     state["tried_links"] = ["shop.test/itm/hub-8in1"]
     # The tried item joins the drop set, but one untried result link remains, so no strand guard.
-    assert compute_suppressed(state, page) == {"e0", "e1", "e2"}
+    assert compute_suppressed(state, page) == {key("USB-C Hub 8-in-1"), key("Electronics"), key("Help")}
     state["tried_links"] = ["shop.test/itm/hub-8in1", "shop.test/itm/hub-pro"]
     assert compute_suppressed(state, page) == set()  # All links would drop: keep all instead.
     state["page_target"] = 3
     assert compute_suppressed(state, page) == set()  # Pagination follows the counter.
     state["page_target"] = None
     state["force_navigate"] = True
-    assert compute_suppressed(state, page) == {"e0", "e1", "e2", "e3"}
+    assert compute_suppressed(state, page) == {
+        key("USB-C Hub 8-in-1"), key("Electronics"), key("Help"), key("USB-C Hub Pro")
+    }
 
 
 def test_page_for_choice_suppression_by_fingerprint(runner):
     runner.state["suppressed_fp"] = runner.state["page"]["fingerprint"]
-    runner.state["suppressed_ids"] = {"e3"}
+    go = next(a for a in runner.state["page"]["actions"] if a["id"] == "e3")
+    runner.state["suppressed_keys"] = {loop.noop_key(go)}
     offered = loop.page_for_choice(runner.state)
     assert [a["id"] for a in offered["actions"]] == ["e1", "e2", "wait"]
     runner.state["suppressed_fp"] = "other"
@@ -1608,8 +1648,10 @@ def test_force_navigate_updates_suppression(runner):
     runner.state["leave_site_url"] = runner.state["page"]["url"]
     runner._update_suppression(runner.state)
     assert runner.state["force_navigate"] is True
-    assert runner.state["suppressed_ids"] == {"e1", "e2", "e3", "wait"}
-    runner.state["held_actions"] = {"navigate": 2}
+    assert runner.state["suppressed_keys"] == {
+        loop.noop_key(a) for a in runner.state["page"]["actions"] if a["kind"] != "navigate"
+    }
+    runner.state["held_actions"] = {loop.noop_key({"kind": "navigate", "label": "Go to URL"}): 2}
     runner._update_suppression(runner.state)
     assert runner.state["force_navigate"] is False
 
@@ -1696,7 +1738,10 @@ def test_stall_advice_prefers_keyboard_in_grids(runner):
         {"id": "e9", "kind": "click", "role": "gridcell", "label": "Thursday, June 18, 2027",
          "node": 99, "frame": "f0", "in_grid": True}
     )
-    advice = runner._stall_advice(runner.state, {"id": "e9", "label": "Thursday, June 18, 2027"})
+    stall = loop.detect_control_stall(
+        [_stall_step("CLICK", "Thursday, June 18, 2027", role="gridcell")] * 3
+    )
+    advice = runner._stall_advice(runner.state, stall)
     assert "Arrow keys" in advice and "Enter" in advice
 
 

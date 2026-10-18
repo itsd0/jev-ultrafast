@@ -41,20 +41,24 @@ def reload_like(action):
 
 
 def note_no_progress(holds, action, page_changed, reasons=None, reason="no-progress hold"):
-    """Hide an unchanged action for the next two decisions. A wait stays available."""
+    """Hide an unchanged action for the next two decisions. A wait stays available.
+
+    Keyed by noop_key, never by positional id: the hold must survive a re-render
+    that shifts every id.
+    """
     holds = dict(holds or {})
-    action_id = action.get("id")
-    if page_changed or not action_id or action.get("kind") == "wait":
+    if page_changed or not action.get("id") or action.get("kind") == "wait":
         return holds
-    holds[action_id] = 2
+    key = noop_key(action)
+    holds[key] = 2
     if reasons is not None:
-        reasons[action_id] = reason
+        reasons[key] = reason
     return holds
 
 
 def offered_actions(actions, holds):
     held = holds or {}
-    return [action for action in actions if held.get(action.get("id"), 0) <= 0]
+    return [action for action in actions if held.get(noop_key(action), 0) <= 0]
 
 
 def decay_holds(holds):
@@ -86,6 +90,7 @@ def loop_step(decision, action, page, progress):
         "id": action.get("id"),
         "label": action.get("label") or "?",
         "kind": action.get("kind"),
+        "role": action.get("role"),
         "progress": bool(progress),
     }
 
@@ -111,17 +116,19 @@ def detect_cycle(window, periods=LOOP_PERIODS, repeats=LOOP_REPEATS):
             return {
                 "ids": [step.get("id") for step in pattern],
                 "labels": [step.get("label") or "?" for step in pattern],
+                "keys": [noop_key(step) for step in pattern],
             }
     return None
 
 
-def hold_actions(holds, action_ids, steps=LOOP_HOLD_STEPS, reasons=None, reason="held"):
+def hold_actions(holds, keys, steps=LOOP_HOLD_STEPS, reasons=None, reason="held"):
+    """Hold noop_keys (kind+label+role), never positional ids."""
     holds = dict(holds or {})
-    for action_id in action_ids:
-        if action_id:
-            holds[action_id] = max(holds.get(action_id, 0), steps)
+    for key in keys:
+        if key:
+            holds[key] = max(holds.get(key, 0), steps)
             if reasons is not None:
-                reasons[action_id] = reason
+                reasons[key] = reason
     return holds
 
 
@@ -183,7 +190,7 @@ def detect_control_stall(window):
     keys = {step.get("key")[:2] for step in tail if step.get("key")}
     if len(keys) != 1:
         return None
-    return {"id": tail[0].get("id"), "label": tail[0].get("label") or "?"}
+    return {"key": noop_key(tail[0]), "label": tail[0].get("label") or "?"}
 
 
 def goal_page_target(goal):
@@ -331,12 +338,57 @@ def control_unchanged(action, before, after):
     return None
 
 
+def norm_label(label):
+    """Label identity: whitespace-collapsed and case-folded, so re-renders match."""
+    return " ".join((label or "").split()).casefold()
+
+
 def noop_key(action):
-    """A no-op toggle's identity across snapshots. Positional ids shift; kind+label do not.
+    """A control's identity across snapshots. Positional ids shift; kind+label+role do not.
 
     A plain string: state must stay JSON-serializable for the inspector.
+    Every hold (loop, stall, no-progress, suppression) is keyed by this.
     """
-    return f"{action.get('kind') or ''}\u0000{action.get('label') or ''}"
+    return f"{action.get('kind') or ''}\u0000{norm_label(action.get('label'))}\u0000{action.get('role') or ''}"
+
+
+def pending_locator(page, choice):
+    """The decided control's identity for stale retargeting. None when the choice
+    is terminal, coordinate-based, or unknown: those re-decide instead."""
+    if choice in {None, "DONE", "BLOCKED", "VISION_CLICK"}:
+        return None
+    action = next((a for a in (page.get("actions") or []) if a.get("id") == choice), None)
+    if action is None:
+        return None
+    return {
+        "kind": action.get("kind"),
+        "role": action.get("role"),
+        "label": action.get("label"),
+        "frame": action.get("frame") or "f0",
+        "old_id": action.get("id"),
+    }
+
+
+def retarget_action(page, locator):
+    """Re-resolve a stale target in a fresh page by kind+role+label+frame.
+
+    Returns (action, candidate_count). Only a unique match retargets; zero or
+    several candidates mean the page genuinely changed, so the run re-decides.
+    """
+    if not locator:
+        return None, 0
+    wanted = norm_label(locator.get("label"))
+    matches = [
+        action
+        for action in (page.get("actions") or [])
+        if action.get("kind") == locator.get("kind")
+        and (action.get("role") or None) == (locator.get("role") or None)
+        and norm_label(action.get("label")) == wanted
+        and (action.get("frame") or "f0") == (locator.get("frame") or "f0")
+    ]
+    if len(matches) == 1:
+        return matches[0], 1
+    return None, len(matches)
 
 
 def page_entity_match(page, todo):
@@ -350,14 +402,11 @@ def page_entity_match(page, todo):
     return bool(words & hay)
 
 
-GUARD_HREF_INDEX = 12
-
-
 def action_url(page, action):
     guards = page.get("guards") or {}
     guard = guards.get(f"{action.get('frame') or 'f0'}:{action.get('node')}")
-    if isinstance(guard, list) and len(guard) > GUARD_HREF_INDEX:
-        return guard[GUARD_HREF_INDEX] or ""
+    if isinstance(guard, dict):
+        return guard.get("href") or ""
     return ""
 
 
@@ -368,11 +417,11 @@ def current_todo(state):
 
 
 def suppression_reasons(state, page):
-    """Suppressed action id -> reason. Forced-NAVIGATE keeps only navigate;
+    """Suppressed noop_key -> reason. Forced-NAVIGATE keeps only navigate;
     otherwise zero-signal nav links and tried detours are hidden while choices remain."""
     actions = page.get("actions") or []
     if state.get("force_navigate"):
-        return {a.get("id"): "forced NAVIGATE" for a in actions if a.get("kind") != "navigate"}
+        return {noop_key(a): "forced NAVIGATE" for a in actions if a.get("kind") != "navigate"}
     if state.get("subgoals") is None or state.get("page_target"):
         # Pagination runs follow the page counter, not link scores.
         return {}
@@ -387,12 +436,12 @@ def suppression_reasons(state, page):
     for action in links:
         norm = normalize_link_url(action_url(page, action))
         if norm and norm in tried:
-            drop[action.get("id")] = "tried link"
+            drop[noop_key(action)] = "tried link"
             continue
         score = score_link(action.get("label"), action_url(page, action), True, todo_words, tried)
         if action.get("nav") and score <= 0:
-            drop[action.get("id")] = "nav suppression"
-    if set(drop) >= {a.get("id") for a in links}:
+            drop[noop_key(action)] = "nav suppression"
+    if set(drop) >= {noop_key(a) for a in links}:
         return {}
     return drop
 
@@ -432,9 +481,9 @@ def page_for_choice(state):
     actions = state["page"]["actions"]
     if holds:
         actions = offered_actions(actions, holds)
-    suppressed = state.get("suppressed_ids") or set()
+    suppressed = state.get("suppressed_keys") or set()
     if suppressed and state.get("suppressed_fp") == state["page"].get("fingerprint"):
-        actions = [a for a in actions if a.get("id") not in suppressed]
+        actions = [a for a in actions if noop_key(a) not in suppressed]
     dead = (state.get("noop_page") or {}).get(state["page"].get("url") or "")
     if dead:
         kept = [a for a in actions if noop_key(a) not in dead]
@@ -610,13 +659,14 @@ class Agent:
 
     def _emit_offered(self, state, step, shown):
         ids = {action.get("id") for action in shown.get("actions") or []}
+        shown_keys = {noop_key(action) for action in shown.get("actions") or []}
         holds = state.get("held_actions") or {}
         reasons = state.get("hold_reasons") or {}
-        held = {action_id: reasons.get(action_id, "held") for action_id, left in holds.items() if left > 0}
+        held = {key: reasons.get(key, "held") for key, left in holds.items() if left > 0}
         suppressed = {
-            action_id: reason
-            for action_id, reason in (state.get("suppression_reasons") or {}).items()
-            if action_id not in ids
+            key: reason
+            for key, reason in (state.get("suppression_reasons") or {}).items()
+            if key not in shown_keys
         }
         fields = {
             "offered": [compact_action(action) for action in shown.get("actions") or []],
@@ -777,33 +827,17 @@ class Agent:
         body = body or {}
         state = self.state
         if name == "tick":
-            pending = None
+            step = len(state.get("history") or []) + 1
             try:
                 self.command("predict", {})
-                if state["status"] in {"done", "blocked"}:
-                    return self.snapshot()
-                pending = (state.get("decision") or {}).get("choice")
-                result = self.command("act", {"fingerprint": state["page"]["fingerprint"]})
-                self.trace.flush()
-                return result
             except StalePage as error:
-                step = len(state.get("history") or []) + 1
                 self.trace.emit(
                     "error", step=step, type="StalePage", message=str(error)[:300],
-                    where="tick", retried=True,
+                    where="predict", retried=True,
                     stack=traceback.format_exc(limit=5) if self.trace.level >= 2 else None,
                 )
                 state["decision"] = None
                 state["status"] = "ready"
-                if pending and pending not in {"DONE", "BLOCKED"}:
-                    # This target stopped matching at execution time. Re-picking
-                    # it against the same page would loop forever.
-                    reasons = dict(state.get("hold_reasons") or {})
-                    state["held_actions"] = note_no_progress(
-                        state.get("held_actions"), {"id": pending, "kind": None}, False,
-                        reasons, "stale hold",
-                    )
-                    state["hold_reasons"] = reasons
                 try:
                     started = time.perf_counter()
                     state["page"] = state["browser"].observe(screenshot=self.screenshots)
@@ -816,6 +850,12 @@ class Agent:
                 state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
                 self.trace.flush()
                 return self.snapshot()
+            if state["status"] in {"done", "blocked"}:
+                return self.snapshot()
+            decision = state.get("decision") or {}
+            locator = pending_locator(state["page"], decision.get("choice"))
+            return self._act_resilient(state, step, decision, locator)
+
         elif name == "predict":
             if not state["browser"]:
                 raise ValueError("Start a demo first")
@@ -839,7 +879,7 @@ class Agent:
             if cycle:
                 reasons = dict(state.get("hold_reasons") or {})
                 state["held_actions"] = hold_actions(
-                    state.get("held_actions"), cycle["ids"], reasons=reasons, reason="loop hold"
+                    state.get("held_actions"), cycle["keys"], reasons=reasons, reason="loop hold"
                 )
                 state["hold_reasons"] = reasons
                 state["loop_fires"] = state.get("loop_fires", 0) + 1
@@ -929,9 +969,8 @@ class Agent:
             selected = decision["choice"]
             step = len(state.get("history") or []) + 1
             if selected in {"DONE", "BLOCKED"}:
-                if not state["browser"].fresh(page):
-                    state["status"] = "ready"
-                    raise StalePage("Page changed since the decision. Choose again.")
+                # Terminal choices are never freshness-gated: DONE must not go
+                # stale on a live page, and BLOCKED must stay decidable.
                 if selected == "BLOCKED" and self.blocked_streak < 3:
                     # A loading page looks identical to a dead end. Only trust
                     # BLOCKED once the page has settled; otherwise look again.
@@ -1150,7 +1189,7 @@ class Agent:
             reasons = dict(state.get("hold_reasons") or {})
             state["held_actions"] = note_no_progress(
                 state.get("held_actions"),
-                {"id": selected, "kind": action.get("kind")},
+                action,
                 False if unchanged else changed,
                 reasons,
                 unchanged if unchanged in ("already selected", "already open") else "no-progress hold",
@@ -1224,7 +1263,7 @@ class Agent:
         )
         reasons = dict(state.get("hold_reasons") or {})
         state["held_actions"] = note_no_progress(
-            state.get("held_actions"), {"id": selected, "kind": action.get("kind")}, False,
+            state.get("held_actions"), action, False,
             reasons, "already set",
         )
         state["hold_reasons"] = reasons
@@ -1321,28 +1360,28 @@ class Agent:
 
     def _stall_check(self, state, step=None):
         stall = detect_control_stall(state.get("loop_window") or [])
-        if not stall or not stall["id"]:
+        if not stall or not stall["key"]:
             return
         notified = state.get("stall_notified") or {}
         step = len(state.get("history") or []) if step is None else step
-        if notified.get("id") == stall["id"] and step - notified.get("step", 0) < 6:
+        if notified.get("key") == stall["key"] and step - notified.get("step", 0) < 6:
             return
-        state["stall_notified"] = {"id": stall["id"], "step": step}
+        state["stall_notified"] = {"key": stall["key"], "step": step}
         reasons = dict(state.get("hold_reasons") or {})
         state["held_actions"] = hold_actions(
-            state.get("held_actions"), [stall["id"]], STALL_HOLD_STEPS, reasons, "stall"
+            state.get("held_actions"), [stall["key"]], STALL_HOLD_STEPS, reasons, "stall"
         )
         state["hold_reasons"] = reasons
         advice = self._stall_advice(state, stall)
         add_event_note(state, advice)
         self.trace.emit(
-            "guard", step=step, type="stall", id=stall["id"], label=stall["label"],
+            "guard", step=step, type="stall", key=stall["key"], label=stall["label"],
             evidence=f"same control {STALL_REPEATS}x with no progress; {advice}"[:200],
         )
 
     def _stall_advice(self, state, stall):
         actions = state["page"].get("actions", [])
-        action = next((item for item in actions if item.get("id") == stall["id"]), {})
+        action = next((item for item in actions if noop_key(item) == stall["key"]), {})
         if action.get("in_grid"):
             return (
                 f"{stall['label'][:60]} is not responding; focus a day and use the Arrow keys "
@@ -1530,7 +1569,10 @@ class Agent:
     def _update_suppression(self, state, step=None):
         subgoals = state.get("subgoals") or []
         todo = any(not item.get("satisfied") for item in subgoals)
-        held_nav = (state.get("held_actions") or {}).get("navigate", 0) > 0
+        held_nav = any(
+            left > 0 and key.split("\u0000", 1)[0] == "navigate"
+            for key, left in (state.get("held_actions") or {}).items()
+        )
         forced = bool(
             todo
             and state.get("leave_site")
@@ -1546,7 +1588,7 @@ class Agent:
         state["force_navigate"] = forced
         state["suppressed_fp"] = state["page"].get("fingerprint")
         state["suppression_reasons"] = suppression_reasons(state, state["page"])
-        state["suppressed_ids"] = set(state["suppression_reasons"])
+        state["suppressed_keys"] = set(state["suppression_reasons"])
         url_now = state["page"].get("url") or ""
         if state.get("noop_url") != url_now:
             state["noop_url"] = url_now
@@ -1671,6 +1713,71 @@ class Agent:
         state["status"] = "ready"
         return self.snapshot()
 
+    def _act_resilient(self, state, step, decision, locator, attempts=2):
+        """Execute the decision; on StalePage re-observe and retarget the same
+        control without spending a decision. Never holds the stale target:
+        it is usually the correct one under a shifted id."""
+        page_before = state["page"]
+        for attempt in range(attempts + 1):
+            try:
+                result = self.command("act", {"fingerprint": state["page"]["fingerprint"]})
+                self.trace.flush()
+                return result
+            except StalePage as error:
+                self.trace.emit(
+                    "error", step=step, type="StalePage", message=str(error)[:300],
+                    where="tick", retried=attempt < attempts and locator is not None,
+                    stack=traceback.format_exc(limit=5) if self.trace.level >= 2 else None,
+                )
+                try:
+                    started = time.perf_counter()
+                    state["page"] = state["browser"].observe(screenshot=self.screenshots)
+                    indexer_ms = round((time.perf_counter() - started) * 1000)
+                except StalePage:
+                    return self._block(state, "page never settled", step)
+                self._emit_snapshot(state, step, indexer_ms, page_changed=True)
+                state["decision"] = None
+                state["status"] = "ready"
+                match, candidates = retarget_action(state["page"], locator)
+                if attempt >= attempts or locator is None or match is None:
+                    if locator is None or attempt >= attempts:
+                        resolution = "re-decide"
+                    elif candidates > 1:
+                        resolution = "ambiguous"
+                    else:
+                        resolution = "missing"
+                    self._emit_stale(state, step, locator, page_before, candidates, resolution, attempt)
+                    state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
+                    self.trace.flush()
+                    return self.snapshot()
+                remapped = dict(decision.get("probabilities") or {})
+                if locator.get("old_id") in remapped:
+                    remapped[match["id"]] = remapped.pop(locator["old_id"])
+                else:
+                    remapped.setdefault(match["id"], 1.0)
+                state["decision"] = {**decision, "choice": match["id"], "probabilities": remapped}
+                self._emit_stale(
+                    state, step, locator, page_before, candidates, "retargeted", attempt, new_id=match["id"]
+                )
+                page_before = state["page"]
+                decision = state["decision"]
+        raise AssertionError("unreachable stale loop")
+
+    def _emit_stale(self, state, step, locator, page_before, candidates, resolution, attempt, new_id=None):
+        """A stale event with a field-level diff: the decided target vs the fresh page."""
+        before = page_before or {}
+        after = state["page"] or {}
+        self.trace.emit(
+            "stale", step=step, attempt=attempt, resolution=resolution,
+            pending=locator or {},
+            candidates=candidates,
+            new_id=new_id,
+            diff={
+                "url": [before.get("url"), after.get("url")],
+                "title": [before.get("title"), after.get("title")],
+                "controls": [len(before.get("actions") or []), len(after.get("actions") or [])],
+            },
+        )
     def run(self):
         while self.state["status"] not in {"done", "blocked"}:
             yield self.command("tick")

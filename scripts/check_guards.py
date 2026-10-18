@@ -34,24 +34,50 @@ def main():
         assert browser.fresh(page)
         passed.append("unrelated offscreen text does not invalidate")
 
-        mutations = {
+        stays_fresh = {
             "visible context": "document.querySelector('#context').textContent='Cart total: $100'",
-            "accessible label": "document.querySelector('#target').setAttribute('aria-label','Delete account')",
             "field property": "document.querySelector('#field').value='London'",
             "checkbox property": "document.querySelector('#toggle').checked=true",
-            "disabled target": "document.querySelector('#target').disabled=true",
             "read-only field": "document.querySelector('#field').readOnly=true",
-            "hidden target": "document.querySelector('#target').style.display='none'",
-            "replaced node": "document.querySelector('#target').outerHTML=document.querySelector('#target').outerHTML",
             "dropdown option": "document.querySelector('select').options[1].text='Coastal'",
         }
-        for label, expression in mutations.items():
+        invalidates = {
+            "accessible label": "document.querySelector('#target').setAttribute('aria-label','Delete account')",
+            "replaced node": "document.querySelector('#target').outerHTML=document.querySelector('#target').outerHTML",
+        }
+        for label in stays_fresh:
             browser.evaluate("document.querySelector('#target').style.display='block'; "
                              "document.querySelector('#target').disabled=false")
             page = browser.observe(screenshot=False)
+            target = next(a for a in page["actions"] if a["label"] == "Continue")
+            browser.evaluate(stays_fresh[label])
+            assert browser.fresh(page, target), label
+            assert browser.fresh(page), label
+            passed.append(label + " keeps the target fresh")
+        for label in invalidates:
+            browser.evaluate("document.querySelector('#target').style.display='block'; "
+                             "document.querySelector('#target').disabled=false")
+            page = browser.observe(screenshot=False)
+            target = next(a for a in page["actions"] if a["label"] in {"Continue", "Delete account"})
+            browser.evaluate(invalidates[label])
+            assert not browser.fresh(page, target), label
+            passed.append(label + " invalidates the target")
+        for label, expression in {
+            "disabled target": "document.querySelector('#target').disabled=true",
+            "hidden target": "document.querySelector('#target').style.display='none'",
+        }.items():
+            page = browser.observe(screenshot=False)
+            target = next(a for a in page["actions"] if a["label"] in {"Continue", "Delete account"})
             browser.evaluate(expression)
-            assert not browser.fresh(page), label
-            passed.append(label + " invalidates")
+            assert browser.fresh(page, target), label
+            try:
+                browser.act(target, page)
+                raise AssertionError(label + " was not refused")
+            except StalePage:
+                pass
+            passed.append(label + " stays fresh but execution refuses it")
+            browser.evaluate("document.querySelector('#target').disabled=false; "
+                             "document.querySelector('#target').style.display='block'")
 
         browser.evaluate("document.querySelector('#target').disabled=false; "
                          "document.querySelector('#target').style.display='block'")
@@ -89,19 +115,37 @@ def main():
         buy = next(a for a in page["actions"] if a["label"] == "Buy")
         browser.evaluate("document.querySelector('#unrelated').textContent='New unrelated news'")
         assert browser.fresh(page, buy)
-        assert not browser.fresh(page)
-        passed.append("click guard accepts unrelated visible updates; terminal guard rejects them")
+        assert browser.fresh(page)
+        passed.append("unrelated updates keep the target and document identity fresh")
         for label, expression in {
             "nearby price": "document.querySelector('#price').textContent='Total $100'",
             "form value": "document.querySelector('#query').value='changed'",
             "form toggle": "document.querySelector('#check').checked=true",
-            "target replacement": "document.querySelector('#buy').outerHTML=document.querySelector('#buy').outerHTML",
         }.items():
             page = browser.observe(screenshot=False)
             buy = next(a for a in page["actions"] if a["label"] == "Buy")
             browser.evaluate(expression)
-            assert not browser.fresh(page, buy), label
-            passed.append(label + " invalidates action-specific guard")
+            assert browser.fresh(page, buy), label
+            passed.append(label + " keeps the target fresh")
+        page = browser.observe(screenshot=False)
+        buy = next(a for a in page["actions"] if a["label"] == "Buy")
+        browser.evaluate("document.querySelector('#buy').outerHTML=document.querySelector('#buy').outerHTML")
+        assert not browser.fresh(page, buy)
+        passed.append("target replacement invalidates the target")
+        page = browser.observe(screenshot=False)
+        assert browser.fresh(page, {"kind": "scroll", "label": "Scroll down"})
+        passed.append("scroll is gated on document identity, not page content")
+        width = browser.evaluate("window.innerWidth")
+        browser.call(
+            "Emulation.setDeviceMetricsOverride", width=width + 8, height=800,
+            deviceScaleFactor=1, mobile=False,
+        )
+        try:
+            buy = next(a for a in page["actions"] if a["label"] == "Buy")
+            assert browser.fresh(page, buy) and browser.fresh(page)
+        finally:
+            browser.call("Emulation.clearDeviceMetricsOverride")
+        passed.append("8px viewport jitter keeps the page fresh")
 
         page = browser.observe(screenshot=False)
         actions = page["actions"]

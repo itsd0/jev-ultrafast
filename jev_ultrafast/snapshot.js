@@ -142,6 +142,7 @@
   function localCache(win) {
     const store = win.__jevFast ||= {ids:new WeakMap(), nodes:new Map(), next:1, frameWins:cache.frameWins};
     store.guard = cache.guard;
+    store.describeNode = node => describe(store.nodes.get(node));
     return store;
   }
   const identity = e => {
@@ -224,9 +225,7 @@
   };
   function documentKey(doc) {
     const win = doc.defaultView || window;
-    return [win.performance.timeOrigin, doc.location.href, win.scrollX, win.scrollY, win.innerWidth, win.innerHeight,
-      queryAllDeep(doc,'input,textarea,select').filter(safe)
-        .map(e=>[identity(e),e.value,e.checked,e.selectedIndex,e.disabled,e.readOnly])];
+    return [win.performance.timeOrigin, doc.location.href];
   }
   cache.pageKey=()=>{
     const keys=[documentKey(document)];
@@ -241,14 +240,18 @@
     }
     return keys;
   };
-  cache.guard=e=>{
-    if (!e?.isConnected || !visible(e)) return null;
-    const scope=e.closest('form,dialog,[role="dialog"],article,li,tr,[role="row"]') || e.parentElement;
-    return [identity(e),role(e),name(e),e.value??null,e.checked??null,e.selectedIndex??null,
-      e.readOnly??null,e.matches(':disabled'),e.getAttribute('aria-disabled'),
-      e.getAttribute('aria-expanded'),e.getAttribute('aria-checked'),e.getAttribute('aria-selected'),
-      e.getAttribute('href'),scope?.innerText?.slice(0,6000)||''];
+  const normName=s=>(s||'').replace(/\s+/g,' ').trim().toLowerCase();
+  const describe=e=>{
+    if (!e?.isConnected) return null;
+    return {role:role(e), name:normName(name(e)), tag:e.tagName};
   };
+  cache.guard=e=>{
+    const id=describe(e);
+    if (!id) return null;
+    id.href=e.getAttribute('href');
+    return id;
+  };
+  cache.describeNode=node=>describe(cache.nodes.get(node));
   const actions=[];
   const seenNodes=new Set();
   function consider(e, frameId, ox, oy) {
@@ -401,10 +404,9 @@
     const store=win.__jevFast;
     guards[key]=store ? store.guard(store.nodes.get(a.node)) : null;
   }
-  // Compare meaning and identity. Geometry is always resolved and hit-tested just before input.
-  const semantics=actions.map(({rect,...action})=>action);
-  const marker=[performance.timeOrigin,location.href,scrollX,scrollY,innerWidth,innerHeight,
-    document.title,text,semantics,page_key];
+  // Document identity only. Live text, values and viewport geometry never invalidate
+  // a decision; targeted actions re-resolve element identity just before input.
+  const marker=[performance.timeOrigin,location.href];
   const omitted_actions=Math.max(0,actions.length-250);
   actions.splice(250);
   actions.forEach((a,i)=>{

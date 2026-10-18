@@ -194,6 +194,7 @@ class Browser:
         return response.get("result", {}).get("value")
 
     def observe(self, screenshot=True):
+        self.settle_dom()
         if getattr(self, "after_input", None):
             action, self.after_input = self.after_input, None
             # This is read-only and happens after execution was logged, even if navigation interrupts it.
@@ -295,14 +296,14 @@ class Browser:
         merged["fingerprint"] = fingerprint(merged)
         return merged
 
-    def _guard_expression(self, action):
+    def _identity_expression(self, action):
         frame = json.dumps(action.get("frame") or "f0")
         node = int(action["node"])
         return (
-            "(() => { const c=window.__jevFast; if (!c||!c.guard) return null; "
+            "(() => { const c=window.__jevFast; if (!c||!c.pageKey) return null; "
             f"const win=(c.frameWins&&c.frameWins[{frame}])||window; const local=win.__jevFast; "
-            f"if (!local||!local.guard) return null; "
-            f"return [c.pageKey(), local.guard(local.nodes.get({node}))]; }})()"
+            f"if (!local||!local.describeNode) return null; "
+            f"return [c.pageKey(), local.describeNode({node})]; }})()"
         )
 
     def _oopif_keys_fresh(self, page):
@@ -315,26 +316,69 @@ class Browser:
         return True
 
     def fresh(self, page, action=None):
+        """Element identity for targeted actions; document identity otherwise.
+
+        Live text, input values and viewport geometry never invalidate a
+        decision. Navigation, tab switches and terminal choices are not gated.
+        """
         if not self._oopif_keys_fresh(page):
             return False
-        if action is not None and action.get("route"):
-            node = action.get("node")
-            if type(node) is not int:
-                return False
+        if action is None:
+            return self._doc_fresh(page)
+        kind = action.get("kind")
+        if kind in {"scroll", "key", "wait", "vision"}:
+            return self._doc_fresh(page)
+        if kind not in {"click", "fill", "select", "select_option", "check", "upload"}:
+            return True
+        return self._target_fresh(page, action)
+
+    def _doc_fresh(self, page):
+        return self.evaluate("[performance.timeOrigin, location.href]") == page.get("marker")
+
+    def settle_dom(self, quiet_ms=150, cap_ms=1500):
+        """Wait for 150 ms of DOM quiet, capped at 1.5 s. Never raises."""
+        expression = (
+            "new Promise(resolve => {"
+            f" const cap=setTimeout(done,{int(cap_ms)}); let quiet=0; let obs=null;"
+            " const done=()=>{clearTimeout(cap);clearTimeout(quiet);"
+            " try{obs&&obs.disconnect();}catch(e){} resolve(true);};"
+            f" const arm=()=>{{clearTimeout(quiet);quiet=setTimeout(done,{int(quiet_ms)});}};"
+            " try{obs=new MutationObserver(arm);"
+            " obs.observe(document,{childList:true,subtree:true,characterData:true});}"
+            " catch(e){done();return;}"
+            " arm(); })"
+        )
+        try:
+            self.call(
+                "Runtime.evaluate", expression=expression, awaitPromise=True, returnByValue=True,
+            )
+        except (RuntimeError, KeyError, TypeError):
+            pass
+
+    def _target_fresh(self, page, action):
+        node = action.get("node")
+        if type(node) is not int:
+            return self._doc_fresh(page)
+        if action.get("route"):
             session = self.frame_sessions.get(action["route"])
             if not session:
                 return False
-            current = self.evaluate(self._guard_expression(action), session)
+            current = self.evaluate(self._identity_expression(action), session)
             guard_key = f"{action['route']}:{action.get('frame') or 'f0'}:{node}"
-            return current == [page.get("frame_keys", {}).get(action["route"]), page.get("guards", {}).get(guard_key)]
-        if action is not None and action["kind"] in {"click", "select"}:
-            node = action["node"]
-            if type(node) is not int:
-                return False
-            current = self.evaluate(self._guard_expression(action))
+            expected_key = page.get("frame_keys", {}).get(action["route"])
+        else:
+            current = self.evaluate(self._identity_expression(action))
             guard_key = f"{action.get('frame') or 'f0'}:{node}"
-            return current == [page["page_key"], page["guards"].get(guard_key)]
-        return self.evaluate(marker_expression(self.config)) == page["marker"]
+            expected_key = page.get("page_key")
+        if not isinstance(current, list) or len(current) != 2:
+            return False
+        live_key, identity = current
+        if live_key != expected_key:
+            return False
+        expected = (page.get("guards") or {}).get(guard_key) or {}
+        if not isinstance(identity, dict) or not isinstance(expected, dict):
+            return False
+        return identity.get("role") == expected.get("role") and identity.get("name") == expected.get("name")
 
     def wait_for_refresh(self, previous_fingerprint, timeout=3.0, screenshot=False):
         """After a reload-like click, wait for a DOM change or for network traffic to finish.
@@ -434,6 +478,7 @@ class Browser:
 
     def act(self, action, page, text=None):
         cloud_mode = (getattr(self, "config", None) or {}).get("browser") == "cloud"
+        self.settle_dom()
         probe = None
         if cloud_mode and action["kind"] in {"click", "fill", "select"}:
             # One cloud call rechecks the guard, resolves geometry, and reads the
