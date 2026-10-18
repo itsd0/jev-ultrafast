@@ -8,7 +8,7 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import quote
 
-from jev_ultrafast.browser import Browser, StalePage, combo_options_expression
+from jev_ultrafast.browser import Browser, CoveredTarget, StalePage, combo_options_expression
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures"
 
@@ -94,7 +94,7 @@ def main():
         assert browser.fresh(page)
         try:
             browser.act(action, page)
-        except (RuntimeError, StalePage):
+        except CoveredTarget:
             pass
         else:
             raise AssertionError("Covered target was clicked")
@@ -375,6 +375,29 @@ def main():
             assert page["url"].startswith("http://127.0.0.1:"), page["url"]
             assert "Inside shadow" in [a["label"] for a in page["actions"]]
             passed.append("navigate round-trips a local page and records success")
+            covered = f"http://127.0.0.1:{server.server_port}/covered.html"
+            browser.navigate(covered)
+            browser.wait_until_ready()
+            page = browser.observe(screenshot=False)
+            buried = next(a for a in page["actions"] if a.get("label") == "Buried report")
+            assert buried.get("role") == "link", buried
+            result = browser.act(buried, page)
+            assert result.get("covered_navigate") is True, result
+            assert result.get("url") == target, result
+            browser.wait_until_ready()
+            assert browser.evaluate("location.href") == target
+            passed.append("covered link navigates to its resolved href")
+            browser.navigate(covered)
+            browser.wait_until_ready()
+            page = browser.observe(screenshot=False)
+            stuck = next(a for a in page["actions"] if a.get("label") == "Stuck action")
+            try:
+                browser.act(stuck, page)
+            except CoveredTarget as error:
+                assert "covered" in str(error).lower()
+            else:
+                raise AssertionError("covered button must raise CoveredTarget")
+            passed.append("covered non-link raises CoveredTarget, not StalePage")
         finally:
             server.shutdown()
             thread.join(timeout=5)

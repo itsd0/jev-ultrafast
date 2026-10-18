@@ -33,6 +33,10 @@ class StalePage(ValueError):
     """A decision no longer refers to the observed page."""
 
 
+class CoveredTarget(ValueError):
+    """The target is live but another element paints over its click point."""
+
+
 class Browser:
     def __init__(self, url, config=None):
         self.config = config or resolve_config()
@@ -1792,7 +1796,7 @@ def action_probe_expression(action, expected):
       }
       const hit=window.__jevFast?.hit ? window.__jevFast.hit(x,y) : document.elementFromPoint(x,y);
       const covered=window.__jevFast?.owns ? !window.__jevFast.owns(e,hit) : !e.contains(hit);
-      if (covered) return {fresh:true,target:null};
+      if (covered) return {fresh:true,target:null,covered:true};
       if (action.kind==='select') {
         if (e.tagName!=='SELECT' || ![...e.options].some(o=>o.value===action.value &&
             !o.disabled && !o.closest('optgroup[disabled]'))) return {fresh:true,target:null};
@@ -1805,6 +1809,43 @@ def action_probe_expression(action, expected):
         : null;
       return {fresh:true,target:{x,y},previous};
     })(""" + payload + ")"
+
+
+def scroll_into_view_expression(action):
+    return (
+        "(action => { const fast=window.__jevFast; "
+        "const e=fast?.resolve ? fast.resolve(action) : fast?.nodes.get(action.node); "
+        "if (!e?.isConnected) return false; "
+        "e.scrollIntoView({block:'center',behavior:'instant'}); return true; })("
+        + json.dumps(action)
+        + ")"
+    )
+
+
+def link_href_expression(action):
+    locator = {k: action[k] for k in ("node", "frame") if k in action}
+    return (
+        "(action => { const fast=window.__jevFast; "
+        "const e=fast?.resolve ? fast.resolve(action) : fast?.nodes.get(action.node); "
+        "if (!e || e.tagName!=='A' || !e.href) return null; return e.href; })("
+        + json.dumps(locator)
+        + ")"
+    )
+
+
+def covered_link_fallback(call, evaluate, action):
+    """A covered link still has its href: navigate there instead of clicking."""
+    if action.get("role") == "link":
+        href = evaluate(link_href_expression(action))
+        if href:
+            try:
+                target = validate_navigate_url(href)
+            except ValueError:
+                target = None
+            if target:
+                call("Page.navigate", url=target)
+                return {"executed": action["id"], "covered_navigate": True, "url": target}
+    raise CoveredTarget("Target is covered by another element. Observe again.")
 
 
 def browser_operation(request):
@@ -1911,25 +1952,16 @@ def browser_operation(request):
             previous = None
             if action.get("offscreen"):
                 # Pager below the fold: scroll it into view, then resolve fresh.
-                scrolled = evaluate(
-                    "(action => { const fast=window.__jevFast; "
-                    "const e=fast?.resolve ? fast.resolve(action) : fast?.nodes.get(action.node); "
-                    "if (!e?.isConnected) return false; "
-                    "e.scrollIntoView({block:'center',behavior:'instant'}); return true; })("
-                    + json.dumps(action)
-                    + ")"
-                )
-                if not scrolled:
+                if not evaluate(scroll_into_view_expression(action)):
                     raise StalePage("Target changed or is covered. Observe again.")
             probe = request.get("probe") if kind in {"click", "fill", "select"} else None
-            if probe:
-                probed = evaluate(action_probe_expression(action, probe))
-                if not probed or not probed.get("fresh"):
-                    raise StalePage("Page changed since this decision. Observe again.")
-                target = probed.get("target")
-                if kind == "fill":
-                    previous = probed.get("previous")
-            else:
+
+            def resolve_target():
+                if probe:
+                    probed = evaluate(action_probe_expression(action, probe))
+                    if not probed or not probed.get("fresh"):
+                        raise StalePage("Page changed since this decision. Observe again.")
+                    return probed.get("target"), bool(probed.get("covered")), probed.get("previous")
                 # Code-owned node IDs refer to actual observed elements, never model-generated selectors.
                 target = evaluate("""(action => {
                   const fast=window.__jevFast;
@@ -1942,7 +1974,7 @@ def browser_operation(request):
                   if (!r.width || !r.height || x<0 || y<0 || x>=innerWidth || y>=innerHeight) return null;
                   const hit=window.__jevFast?.hit ? window.__jevFast.hit(x,y) : document.elementFromPoint(x,y);
                   const covered=window.__jevFast?.owns ? !window.__jevFast.owns(e,hit) : !e.contains(hit);
-                  if (covered) return null;
+                  if (covered) return {covered:true};
                   if (action.kind==='select') {
                     if (e.tagName!=='SELECT' || ![...e.options].some(o=>o.value===action.value &&
                         !o.disabled && !o.closest('optgroup[disabled]'))) return null;
@@ -1952,6 +1984,20 @@ def browser_operation(request):
                   }
                   return {x,y};
                 })(""" + json.dumps(action) + ")")
+                if isinstance(target, dict) and target.get("covered"):
+                    return None, True, None
+                return target, False, None
+
+            target, covered, probed_previous = resolve_target()
+            if kind == "fill" and probe is not None:
+                previous = probed_previous
+            if covered and evaluate(scroll_into_view_expression(action)):
+                # Covered is paint, not staleness: center it and retry once.
+                target, covered, probed_previous = resolve_target()
+                if kind == "fill" and probe is not None:
+                    previous = probed_previous
+            if covered:
+                return covered_link_fallback(call, evaluate, action)
             if target is None:
                 if kind == "select":
                     raise RuntimeError("Dropdown execution was not confirmed; inspect before retrying.")

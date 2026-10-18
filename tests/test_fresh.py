@@ -4,7 +4,7 @@ from unittest.mock import Mock
 
 from jev_ultrafast import agent as loop
 from jev_ultrafast import browser as browser_module
-from jev_ultrafast.browser import Browser, StalePage, modal_observed_empty
+from jev_ultrafast.browser import Browser, CoveredTarget, StalePage, modal_observed_empty
 
 
 def page():
@@ -190,6 +190,57 @@ def test_stale_act_gives_up_to_redecide_after_two_retargets():
     assert browser.act.call_count == 3  # initial try plus two retargets
     assert out["status"] == "ready" and out["decision"] is None
     assert agent.state.get("held_actions", {}) == {}
+
+
+def test_covered_is_not_stale():
+    assert not isinstance(CoveredTarget("covered"), StalePage)
+
+
+def test_covered_act_redecides_without_stale_budget_then_holds():
+    import time
+
+    from jev_ultrafast.trace import Trace, get_logger
+
+    agent = loop.Agent.__new__(loop.Agent)
+    agent.trace = Trace(run_id="test-fresh", level=0)
+    agent.log = get_logger("agent")
+    agent.screenshots = False
+    agent.pending_text = None
+    agent.blocked_streak = 0
+    agent.config = {}
+    p = page()
+    browser = Mock()
+    browser.observe.return_value = p
+    browser.act.side_effect = CoveredTarget("Target is covered by another element.")
+    agent.state = {
+        "browser": browser, "page": p, "history": [], "status": "predicted",
+        "started_at": time.perf_counter(), "text_calls": [], "loop_window": [],
+        "decision": None,
+    }
+    locator = {"kind": "click", "role": "button", "label": "Buy", "frame": "f0", "old_id": "e1"}
+    key = loop.noop_key(locator)
+
+    def decide():
+        agent.state["decision"] = {
+            "choice": "e1", "operation": "CLICK", "target": "1",
+            "confidence": 1.0, "probabilities": {"e1": 1.0},
+            "latency_ms": 1, "usage": {},
+        }
+
+    decide()
+    out = agent._act_resilient(agent.state, 1, agent.state["decision"], locator)
+    assert browser.act.call_count == 1  # no retarget: the page is fresh
+    assert out["status"] == "ready" and out["decision"] is None
+    assert agent.state.get("stale_used", 0) == 0
+    assert agent.state.get("held_actions", {}) == {}
+    assert agent.state["covered_fails"] == {key: 1}
+    decide()
+    out = agent._act_resilient(agent.state, 1, agent.state["decision"], locator)
+    assert out["status"] == "ready" and out["decision"] is None
+    assert agent.state["held_actions"] == {key: loop.COVERED_HOLD_STEPS}
+    assert agent.state["hold_reasons"] == {key: "covered"}
+    assert agent.state.get("covered_fails", {}) == {}
+    assert agent.state.get("stale_used", 0) == 0
 
 
 def test_modal_observed_empty_triggers_only_on_a_control_free_modal():

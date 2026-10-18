@@ -10,7 +10,7 @@ import traceback
 from pathlib import Path
 from urllib.parse import parse_qsl, quote_plus, urlparse
 
-from .browser import Browser, StalePage
+from .browser import Browser, CoveredTarget, StalePage
 from .config import parse_search_engines, resolve_config
 from .model import (
     INVALID_RESPONSE,
@@ -152,6 +152,7 @@ STALL_HOLD_STEPS = 5
 STALL_KINDS = {"click", "key", "select", "select_option", "navigate", "vision", "check"}
 MAX_BACKS = 3
 PAGER_HOLD_STEPS = 3
+COVERED_HOLD_STEPS = 5
 
 _SCORE_STOPWORDS = frozenset(
     "the a an to of and for on in with or by from click open link page more next result results show all".split()
@@ -1803,6 +1804,7 @@ class Agent:
                 and isinstance(result, dict)
                 and result.get("navigated") is False
             )
+            covered_navigated = isinstance(result, dict) and result.get("covered_navigate")
             same_date = (
                 action["kind"] == "fill"
                 and isinstance(result, dict)
@@ -1843,6 +1845,7 @@ class Agent:
                         "already selected" if check_set else None,
                         "value unchanged" if check_failed else None,
                         "navigation failed" if navigate_failed else None,
+                        "navigated to href (covered)" if covered_navigated else None,
                         "used search fallback" if fallback_used else None,
                         "scrolled inside the dialog" if modal_routed else None,
                         date_note,
@@ -2860,6 +2863,31 @@ class Agent:
                 result = self.command("act", {"fingerprint": state["page"]["fingerprint"]})
                 self.trace.flush()
                 return result
+            except CoveredTarget as error:
+                # Covered is paint, not staleness: the page stands, so this
+                # costs no stale budget and needs no re-observe. Re-decide;
+                # hold the control once it fails twice.
+                key = noop_key(locator) if locator else None
+                fails = state.setdefault("covered_fails", {})
+                if key:
+                    fails[key] = fails.get(key, 0) + 1
+                count = fails.get(key, 0) if key else 0
+                if count >= 2:
+                    reasons = dict(state.get("hold_reasons") or {})
+                    state["held_actions"] = hold_actions(
+                        state.get("held_actions"), [key], COVERED_HOLD_STEPS, reasons, "covered"
+                    )
+                    state["hold_reasons"] = reasons
+                    fails.pop(key, None)
+                state["decision"] = None
+                state["status"] = "ready"
+                self.trace.emit(
+                    "guard", step=step, type="covered", key=key, held=count >= 2,
+                    failures=count,
+                    evidence=f"{type(error).__name__}: {error}"[:200],
+                )
+                self.trace.flush()
+                return self.snapshot()
             except StalePage as error:
                 self.trace.emit(
                     "error", step=step, type="StalePage", message=str(error)[:300],

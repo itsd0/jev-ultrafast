@@ -11,7 +11,9 @@ from jev_ultrafast.browser import (
     commit_key_expression,
     detect_slider,
     field_value_expression,
+    link_href_expression,
     parse_date,
+    scroll_into_view_expression,
     slider_fill,
     slider_geometry_expression,
     slider_set_native_expression,
@@ -238,6 +240,22 @@ def test_slider_expressions_are_valid_javascript(tmp_path):
     ]
     for index, expression in enumerate(expressions):
         path = tmp_path / f"slider_{index}.js"
+        path.write_text(expression)
+        proc = subprocess.run(
+            ["node", "--check", str(path)], capture_output=True, text=True, timeout=30
+        )
+        assert proc.returncode == 0, proc.stderr
+
+
+@needs_node
+def test_covered_expressions_are_valid_javascript(tmp_path):
+    action = {"node": 3, "frame": "f0"}
+    expressions = [
+        scroll_into_view_expression(action),
+        link_href_expression(action),
+    ]
+    for index, expression in enumerate(expressions):
+        path = tmp_path / f"covered_{index}.js"
         path.write_text(expression)
         proc = subprocess.run(
             ["node", "--check", str(path)], capture_output=True, text=True, timeout=30
