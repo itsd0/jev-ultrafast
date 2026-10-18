@@ -243,6 +243,44 @@ def test_covered_act_redecides_without_stale_budget_then_holds():
     assert agent.state.get("stale_used", 0) == 0
 
 
+def test_covered_guard_reports_the_covering_element():
+    import time
+
+    from jev_ultrafast.trace import get_logger
+
+    agent = loop.Agent.__new__(loop.Agent)
+    agent.trace = Mock()
+    agent.log = get_logger("agent")
+    agent.screenshots = False
+    agent.pending_text = None
+    agent.blocked_streak = 0
+    agent.config = {}
+    p = page()
+    browser = Mock()
+    browser.observe.return_value = p
+    browser.act.side_effect = CoveredTarget(
+        "Target is covered by another element.", cover={"tag": "DIV", "role": "dialog"}
+    )
+    agent.state = {
+        "browser": browser, "page": p, "history": [], "status": "predicted",
+        "started_at": time.perf_counter(), "text_calls": [], "loop_window": [],
+        "decision": {
+            "choice": "e1", "operation": "CLICK", "target": "1",
+            "confidence": 1.0, "probabilities": {"e1": 1.0},
+            "latency_ms": 1, "usage": {},
+        },
+    }
+    locator = {"kind": "click", "role": "button", "label": "Buy", "frame": "f0", "old_id": "e1"}
+    out = agent._act_resilient(agent.state, 1, agent.state["decision"], locator)
+    assert out["status"] == "ready"
+    guard = next(
+        call for call in agent.trace.emit.call_args_list if call.args[0] == "guard"
+    )
+    assert guard.kwargs["type"] == "covered"
+    assert guard.kwargs["cover_tag"] == "DIV"
+    assert guard.kwargs["cover_role"] == "dialog"
+
+
 def test_modal_observed_empty_triggers_only_on_a_control_free_modal():
     wait = {"id": "wait", "kind": "wait", "label": "Wait for the page to update"}
     assert modal_observed_empty({"modal_scoped": True, "actions": [wait]}) is True

@@ -87,8 +87,17 @@ def one_line(event):
             + (f" next: {item.get('next_strategy')}" if item.get("next_strategy") else "")
         )
     if kind == "guard":
-        return (f"{head} guard {item.get('type')}: {item.get('pattern') or item.get('label') or ''}"
+        line = (f"{head} guard {item.get('type')}: {item.get('pattern') or item.get('label') or ''}"
                 f" {item.get('evidence') or ''}".rstrip())
+        if item.get("type") == "covered" and item.get("cover_tag"):
+            line += f" by <{item.get('cover_tag')}>/{item.get('cover_role')}"
+        return line
+    if kind == "stale":
+        target = (item.get("diff") or {}).get("target") or [None, None]
+        return (
+            f"{head} stale {item.get('resolution')} {target[0]} -> {target[1]}"
+            f" candidates={item.get('candidates')}"
+        )
     if kind == "progress":
         dropped = item.get("ungrounded") or []
         suffix = f" ungrounded={dropped}" if dropped else ""

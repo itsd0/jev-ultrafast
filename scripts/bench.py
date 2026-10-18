@@ -229,9 +229,13 @@ def summarize(suite, records):
     }
 
 
-def git_info():
-    """The tree the bench ran on: HEAD sha, dirty flag, and diff hash."""
-    root = Path(__file__).resolve().parent.parent
+def git_info(root=None):
+    """The tree the bench ran on: HEAD sha, dirty flag, and diff hash.
+
+    The diff hash covers tracked changes plus the untracked file list and
+    contents, so two runs compare equal only on identical trees.
+    """
+    root = Path(root) if root is not None else Path(__file__).resolve().parent.parent
     try:
         sha = subprocess.run(
             ["git", "rev-parse", "HEAD"], cwd=root, capture_output=True, text=True
@@ -242,12 +246,27 @@ def git_info():
         diff = subprocess.run(
             ["git", "diff", "HEAD"], cwd=root, capture_output=True
         ).stdout
+        raw_others = subprocess.run(
+            ["git", "ls-files", "--others", "--exclude-standard", "-z"],
+            cwd=root, capture_output=True,
+        ).stdout
     except OSError:
-        return {"sha": None, "dirty": None, "diff_hash": None}
+        return {"sha": None, "dirty": None, "diff_hash": None, "untracked": None}
+    others = sorted(
+        name for name in raw_others.decode("utf-8", "replace").split("\0") if name
+    )
+    digest = hashlib.sha256(diff)
+    for name in others:
+        digest.update(b"\0" + name.encode("utf-8", "replace"))
+        try:
+            digest.update((root / name).read_bytes())
+        except OSError:
+            pass
     return {
         "sha": sha or None,
         "dirty": bool(porcelain),
-        "diff_hash": hashlib.sha256(diff).hexdigest(),
+        "diff_hash": digest.hexdigest(),
+        "untracked": others,
     }
 
 

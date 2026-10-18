@@ -771,6 +771,23 @@ def test_stale_observation_preserves_executed_action(runner):
     runner.state["browser"].act.assert_called_once()
 
 
+def test_stale_event_carries_the_target_before_and_after(runner):
+    runner.trace = Mock()
+    locator = {"kind": "click", "role": "link", "label": "Earth", "frame": "f0", "old_id": "e5"}
+    match = {"id": "e9", "kind": "click", "role": "link", "label": "Earth facts"}
+    runner._emit_stale(
+        runner.state, 2, locator, runner.state["page"], 1, "retargeted", 0,
+        new_id="e9", match=match,
+    )
+    assert runner.trace.emit.call_args.args[0] == "stale"
+    assert runner.trace.emit.call_args.kwargs["diff"]["target"] == [
+        {"kind": "click", "role": "link", "label": "Earth"},
+        {"kind": "click", "role": "link", "label": "Earth facts"},
+    ]
+    runner._emit_stale(runner.state, 2, locator, runner.state["page"], 0, "missing", 1)
+    assert runner.trace.emit.call_args.kwargs["diff"]["target"][1] is None
+
+
 def test_blocked_choice_reobserves_instead_of_stopping(runner):
     runner.state["decision"] = {**decision("BLOCKED"), "operation": "BLOCKED"}
     runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})

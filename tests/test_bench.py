@@ -2,7 +2,11 @@
 
 import importlib.util
 import re
+import shutil
+import subprocess
 from pathlib import Path
+
+import pytest
 
 bench = importlib.util.module_from_spec(
     spec := importlib.util.spec_from_file_location(
@@ -133,6 +137,33 @@ def test_git_info_reports_sha_dirty_and_diff():
     assert re.fullmatch(r"[0-9a-f]{40}", git["sha"] or "")
     assert isinstance(git["dirty"], bool)
     assert re.fullmatch(r"[0-9a-f]{64}", git["diff_hash"] or "")
+    assert isinstance(git["untracked"], list)
+
+
+def test_git_info_hashes_untracked_names_and_contents(tmp_path):
+    git = shutil.which("git")
+    if git is None:
+        pytest.skip("git not installed")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    def run(*args):
+        return subprocess.run(
+            [git, *args], cwd=repo, capture_output=True, text=True, check=True
+        )
+    run("init", "-q")
+    run("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "init")
+    (repo / "note.txt").write_text("first")
+    hashed_with_file = bench.git_info(root=repo)
+    assert hashed_with_file["untracked"] == ["note.txt"]
+    (repo / "note.txt").write_text("second")
+    hashed_changed = bench.git_info(root=repo)
+    assert hashed_changed["diff_hash"] != hashed_with_file["diff_hash"]
+    (repo / "note.txt").unlink()
+    hashed_clean = bench.git_info(root=repo)
+    assert hashed_clean["untracked"] == []
+    assert hashed_clean["diff_hash"] != hashed_with_file["diff_hash"]
+    assert hashed_clean["dirty"] is False
 
 
 def test_bangkok_accepts_digit_form_population():

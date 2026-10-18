@@ -291,3 +291,34 @@ def test_diagnose_maps_each_cause():
     )
     assert diagnose_trace([_event("end", status="done")]) == (None, "")
     assert diagnose_trace([_event("snapshot", step=1)]) == ("no end event", "trace cut off before the run finished")
+
+
+def test_trace_view_shows_stale_targets_and_covers():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "trace_view", Path(__file__).resolve().parent.parent / "scripts" / "trace_view.py"
+    )
+    view = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(view)
+    stale = {
+        "kind": "stale", "step": 4,
+        "data": {
+            "resolution": "retargeted", "candidates": 1,
+            "diff": {
+                "target": [
+                    {"kind": "click", "role": "link", "label": "Earth"},
+                    {"kind": "click", "role": "link", "label": "Earth facts"},
+                ],
+            },
+        },
+    }
+    line = view.one_line(stale)
+    assert "retargeted" in line and "Earth" in line and "Earth facts" in line
+    covered = {
+        "kind": "guard", "step": 5,
+        "data": {"type": "covered", "cover_tag": "DIV", "cover_role": "dialog", "evidence": "x"},
+    }
+    assert "by <DIV>/dialog" in view.one_line(covered)
+    legacy = {"kind": "stale", "step": 6, "data": {"resolution": "missing", "diff": {}}}
+    assert "missing" in view.one_line(legacy)

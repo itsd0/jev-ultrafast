@@ -9,6 +9,7 @@ import pytest
 from jev_ultrafast.browser import (
     commit_date,
     commit_key_expression,
+    cover_info_expression,
     detect_slider,
     field_value_expression,
     link_href_expression,
@@ -253,6 +254,7 @@ def test_covered_expressions_are_valid_javascript(tmp_path):
     expressions = [
         scroll_into_view_expression(action),
         link_href_expression(action),
+        cover_info_expression(action),
     ]
     for index, expression in enumerate(expressions):
         path = tmp_path / f"covered_{index}.js"

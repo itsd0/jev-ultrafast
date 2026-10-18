@@ -36,6 +36,10 @@ class StalePage(ValueError):
 class CoveredTarget(ValueError):
     """The target is live but another element paints over its click point."""
 
+    def __init__(self, message, cover=None):
+        super().__init__(message)
+        self.cover = cover
+
 
 class Browser:
     def __init__(self, url, config=None):
@@ -1833,6 +1837,24 @@ def link_href_expression(action):
     )
 
 
+def cover_info_expression(action):
+    locator = {k: action[k] for k in ("node", "frame") if k in action}
+    return (
+        "(action => { const fast=window.__jevFast; "
+        "const e=fast?.resolve ? fast.resolve(action) : fast?.nodes.get(action.node); "
+        "if (!e) return null; "
+        "const point=fast?.toTop ? fast.toTop(e) : null; "
+        "const r=e.getBoundingClientRect(); "
+        "const x=point?point.x:r.x+r.width/2, y=point?point.y:r.y+r.height/2; "
+        "const hit=fast?.hit ? fast.hit(x,y) : document.elementFromPoint(x,y); "
+        "const covered=fast?.owns ? !fast.owns(e,hit) : !e.contains(hit); "
+        "if (!covered) return null; "
+        "return {tag: hit.tagName, role: hit.getAttribute ? hit.getAttribute('role') : null}; })("
+        + json.dumps(locator)
+        + ")"
+    )
+
+
 def covered_link_fallback(call, evaluate, action):
     """A covered link still has its href: navigate there instead of clicking."""
     if action.get("role") == "link":
@@ -1997,7 +2019,11 @@ def browser_operation(request):
                 if kind == "fill" and probe is not None:
                     previous = probed_previous
             if covered:
-                return covered_link_fallback(call, evaluate, action)
+                try:
+                    return covered_link_fallback(call, evaluate, action)
+                except CoveredTarget as error:
+                    error.cover = evaluate(cover_info_expression(action))
+                    raise
             if target is None:
                 if kind == "select":
                     raise RuntimeError("Dropdown execution was not confirmed; inspect before retrying.")

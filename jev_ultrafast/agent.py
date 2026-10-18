@@ -2932,9 +2932,11 @@ class Agent:
                     fails.pop(key, None)
                 state["decision"] = None
                 state["status"] = "ready"
+                cover = getattr(error, "cover", None) or {}
                 self.trace.emit(
                     "guard", step=step, type="covered", key=key, held=count >= 2,
                     failures=count,
+                    cover_tag=cover.get("tag"), cover_role=cover.get("role"),
                     evidence=f"{type(error).__name__}: {error}"[:200],
                 )
                 self.trace.flush()
@@ -2974,13 +2976,17 @@ class Agent:
                     remapped.setdefault(match["id"], 1.0)
                 state["decision"] = {**decision, "choice": match["id"], "probabilities": remapped}
                 self._emit_stale(
-                    state, step, locator, page_before, candidates, "retargeted", attempt, new_id=match["id"]
+                    state, step, locator, page_before, candidates, "retargeted", attempt,
+                    new_id=match["id"], match=match,
                 )
                 page_before = state["page"]
                 decision = state["decision"]
         raise AssertionError("unreachable stale loop")
 
-    def _emit_stale(self, state, step, locator, page_before, candidates, resolution, attempt, new_id=None):
+    def _emit_stale(
+        self, state, step, locator, page_before, candidates, resolution, attempt,
+        new_id=None, match=None,
+    ):
         """A stale event with a field-level diff: the decided target vs the fresh page."""
         before = page_before or {}
         after = state["page"] or {}
@@ -2993,6 +2999,12 @@ class Agent:
                 "url": [before.get("url"), after.get("url")],
                 "title": [before.get("title"), after.get("title")],
                 "controls": [len(before.get("actions") or []), len(after.get("actions") or [])],
+                "target": [
+                    {key: (locator or {}).get(key) for key in ("kind", "role", "label")},
+                    {key: (match or {}).get(key) for key in ("kind", "role", "label")}
+                    if match
+                    else None,
+                ],
             },
         )
     def run(self):

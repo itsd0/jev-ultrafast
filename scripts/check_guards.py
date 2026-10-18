@@ -395,6 +395,7 @@ def main():
                 browser.act(stuck, page)
             except CoveredTarget as error:
                 assert "covered" in str(error).lower()
+                assert (error.cover or {}).get("tag") == "DIV", error.cover
             else:
                 raise AssertionError("covered button must raise CoveredTarget")
             passed.append("covered non-link raises CoveredTarget, not StalePage")
