@@ -224,6 +224,18 @@ def page_identity(url):
     return f"{base}?{query}"
 
 
+_GUIDANCE_CLICK_ROLES = frozenset({"link", "button", "tab", "menuitem"})
+_GUIDANCE_WIDGET_ROLES = frozenset({"radio", "checkbox", "switch", "option", "combobox"})
+
+
+def guidance_candidate(action):
+    """A control worth ranking for the todo: links and buttons plus widgets."""
+    role = action.get("role")
+    if action.get("kind") == "click" and role in _GUIDANCE_CLICK_ROLES:
+        return True
+    return role in _GUIDANCE_WIDGET_ROLES
+
+
 def score_link(label, url, nav, todo_words, tried, stem=False):
     """Rank a link for the current sub-goal. Result items win by word overlap;
     nav chrome and already-tried detours lose."""
@@ -668,7 +680,7 @@ def compose_guidance(state):
             (
                 a
                 for a in (state.get("page") or {}).get("actions", [])
-                if a.get("kind") == "click" and a.get("role") in {"link", "button", "tab", "menuitem"}
+                if guidance_candidate(a)
             ),
             key=lambda a: score_link(
                 a.get("label"), action_url(state["page"], a), a.get("nav"), todo_words, tried, stem=True

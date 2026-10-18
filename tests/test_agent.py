@@ -2223,6 +2223,45 @@ def test_page_counter_guidance():
     assert compose_guidance(state) == ["Overshot to page 5: go back to page 3."]
 
 
+def test_guidance_ranks_sort_radios_for_the_todo():
+    from jev_ultrafast.agent import compose_guidance, guidance_candidate
+
+    assert guidance_candidate({"kind": "click", "role": "link"}) is True
+    assert guidance_candidate({"kind": "click", "role": "button"}) is True
+    assert guidance_candidate({"kind": "check", "role": "radio"}) is True
+    assert guidance_candidate({"kind": "check", "role": "checkbox"}) is True
+    assert guidance_candidate({"kind": "select", "role": "option"}) is True
+    assert guidance_candidate({"kind": "fill", "role": "combobox"}) is True
+    assert guidance_candidate({"kind": "fill", "role": "textbox"}) is False
+    assert guidance_candidate({"kind": "click", "role": "slider"}) is False
+    state = {
+        "history": [],
+        "subgoals": [{"id": 0, "text": "sort by lowest prices", "required": True}],
+        "page": {
+            "url": "https://example.test/hotels",
+            "guards": {},
+            "actions": [
+                {"id": "e1", "kind": "click", "label": "All filters", "role": "button"},
+                {
+                    "id": "e2", "kind": "check", "label": "Set Lowest price (Sort by)",
+                    "role": "radio", "checked": "false",
+                },
+                {
+                    "id": "e3", "kind": "check", "label": "Set Highest price (Sort by)",
+                    "role": "radio", "checked": "false",
+                },
+                {"id": "e4", "kind": "click", "label": "Search", "role": "button"},
+            ],
+        },
+    }
+    line = next(
+        text for text in compose_guidance(state) if text.startswith("For 'sort by lowest prices'")
+    )
+    assert "Set Lowest price (Sort by)" in line
+    assert line.index("Set Lowest price (Sort by)") < line.index("Set Highest price (Sort by)")
+    assert "All filters" not in line and "Search" not in line
+
+
 def _link_page():
     guards = {}
     actions = []
