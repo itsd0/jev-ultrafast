@@ -72,6 +72,63 @@ def reasoning_tokens(usage):
     return 0
 
 
+def price_env_name(model):
+    """JEV_PRICE_<MODEL> prefix for a model id: uppercased, split on runs of
+    non-alphanumerics. Empty when the model is unknown."""
+    slug = re.sub(r"[^A-Z0-9]+", "_", (model or "").upper()).strip("_")
+    return f"JEV_PRICE_{slug}" if slug else ""
+
+
+def _price_env(name):
+    try:
+        value = float(os.environ.get(name) or "")
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(value) or value < 0:
+        return None
+    return value
+
+
+def model_rate_per_1m(model, direction):
+    """Per-1M-token rate for a model, or None when unset. Blank unless the
+    operator sets JEV_PRICE_<MODEL>_IN/OUT: the repo ships no rates."""
+    prefix = price_env_name(model)
+    if not prefix:
+        return None
+    return _price_env(f"{prefix}_{direction}")
+
+
+def cloud_rate_per_hour():
+    """Cloud browser $/hour, or None when unset. Browser Use docs list
+    $0.02/browser-hour metered by the minute; the default stays blank."""
+    return _price_env("JEV_CLOUD_PRICE_PER_HOUR")
+
+
+def priced_cost(calls):
+    """(cost_usd, priced) for (model, prompt, completion) token calls. priced is
+    True when at least one call matched a JEV_PRICE_<MODEL>_IN/OUT rate.
+    Otherwise the legacy JEV_COST_PER_1K_TOKENS flat rate applies as a fallback;
+    with neither set the cost is 0 and priced is False."""
+    total = 0.0
+    priced = False
+    prompt_total = completion_total = 0
+    for model, prompt, completion in calls:
+        prompt_total += prompt
+        completion_total += completion
+        rate_in = model_rate_per_1m(model, "IN")
+        rate_out = model_rate_per_1m(model, "OUT")
+        if rate_in is None and rate_out is None:
+            continue
+        priced = True
+        total += prompt / 1_000_000 * (rate_in or 0) + completion / 1_000_000 * (rate_out or 0)
+    if not priced:
+        legacy = _price_env("JEV_COST_PER_1K_TOKENS")
+        if legacy is not None:
+            priced = True
+            total = (prompt_total + completion_total) / 1000 * legacy
+    return round(total, 6), priced
+
+
 def decision_provider():
     """Unset and "typesafe" keep the original TypeSafe request. "mercury" is opt-in."""
     value = os.environ.get("DECISION_PROVIDER", "typesafe").strip().lower()
@@ -651,9 +708,11 @@ def decompose_goal(goal):
         ):
             raise ValueError("invalid requirements")
         decompose_goal.last_usage = result.get("usage", {}) if isinstance(result, dict) else {}
+        decompose_goal.last_model = payload["model"]
         return [item.strip() for item in requirements]
     except (RuntimeError, ValueError, KeyError, TypeError, json.JSONDecodeError):
         decompose_goal.last_usage = {}
+        decompose_goal.last_model = None
         return [goal]
 
 

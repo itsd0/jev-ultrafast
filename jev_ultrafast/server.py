@@ -28,7 +28,13 @@ from .agent import Agent
 from .browser import Browser, full_text_expression
 from .config import env_bool
 from .demo import load_environment
-from .model import redact_secrets, token_counts, validate_save_filename
+from .model import (
+    cloud_rate_per_hour,
+    priced_cost,
+    redact_secrets,
+    token_counts,
+    validate_save_filename,
+)
 from .trace import configure_logging, get_logger, trace_dir
 
 LOG = get_logger("server")
@@ -90,6 +96,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     total_input_tokens INTEGER NOT NULL DEFAULT 0,
     total_output_tokens INTEGER NOT NULL DEFAULT 0,
     total_cost_usd REAL NOT NULL DEFAULT 0,
+    total_cloud_seconds REAL NOT NULL DEFAULT 0,
+    total_cloud_cost_usd REAL NOT NULL DEFAULT 0,
     share_token TEXT,
     last_url TEXT,
     last_tabs TEXT
@@ -107,6 +115,9 @@ CREATE TABLE IF NOT EXISTS messages (
     input_tokens INTEGER,
     output_tokens INTEGER,
     cost_usd_estimate REAL,
+    priced INTEGER,
+    cloud_seconds REAL,
+    cloud_cost_usd REAL,
     duration_ms INTEGER,
     error TEXT,
     blocked_reason TEXT,
@@ -130,16 +141,29 @@ class Store:
         self.lock = threading.Lock()
         with self.lock:
             self.conn.executescript(SCHEMA)
-            have = {r[1] for r in self.conn.execute("PRAGMA table_info(tasks)")}
-            for column, ctype in (
-                ("final_text", "TEXT"),
-                ("answer_text", "TEXT"),
-                ("decisions_count", "INTEGER"),
-                ("blocked_reason", "TEXT"),
-                ("partial", "INTEGER"),
-            ):
-                if column not in have:
-                    self.conn.execute(f"ALTER TABLE tasks ADD COLUMN {column} {ctype}")
+            migrations = {
+                "tasks": (
+                    ("final_text", "TEXT"),
+                    ("answer_text", "TEXT"),
+                    ("decisions_count", "INTEGER"),
+                    ("blocked_reason", "TEXT"),
+                    ("partial", "INTEGER"),
+                ),
+                "messages": (
+                    ("priced", "INTEGER"),
+                    ("cloud_seconds", "REAL"),
+                    ("cloud_cost_usd", "REAL"),
+                ),
+                "sessions": (
+                    ("total_cloud_seconds", "REAL"),
+                    ("total_cloud_cost_usd", "REAL"),
+                ),
+            }
+            for table, columns in migrations.items():
+                have = {r[1] for r in self.conn.execute(f"PRAGMA table_info({table})")}
+                for column, ctype in columns:
+                    if column not in have:
+                        self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ctype}")
             self.conn.commit()
 
     def create_task(self, goal, url, browser, max_decisions, task_id=None):
@@ -259,13 +283,25 @@ class Store:
                         (run_id,),
                     )] if run_id else []
         session["messages"] = messages
+        # NULL priced = pre-pricing row: keep the legacy $ display.
+        session["priced"] = max(
+            [1 if m.get("priced") is None else m.get("priced") for m in messages] or [1]
+        )
+        session["cloud_priced"] = (
+            1 if any(m.get("cloud_cost_usd") is not None for m in messages) else 0
+        )
         return session
 
     def list_sessions(self, limit=50):
         with self.lock:
             rows = self.conn.execute(
                 "SELECT s.*, (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id)"
-                " AS message_count FROM sessions s ORDER BY last_active_at DESC LIMIT ?",
+                " AS message_count,"
+                " COALESCE((SELECT MAX(m.priced) FROM messages m WHERE m.session_id = s.id), 1)"
+                " AS priced,"
+                " COALESCE((SELECT MAX(m.cloud_cost_usd IS NOT NULL) FROM messages m"
+                " WHERE m.session_id = s.id), 0)"
+                " AS cloud_priced FROM sessions s ORDER BY last_active_at DESC LIMIT ?",
                 (limit,),
             ).fetchall()
         sessions = []
@@ -367,6 +403,10 @@ class Store:
                 " THEN m.id END) AS turns,"
                 " COALESCE(SUM(m.input_tokens + m.output_tokens), 0) AS tokens,"
                 " COALESCE(SUM(m.cost_usd_estimate), 0) AS cost,"
+                " COALESCE(MAX(m.priced), 1) AS priced,"
+                " COALESCE(SUM(m.cloud_seconds), 0) AS cloud_seconds,"
+                " COALESCE(SUM(m.cloud_cost_usd), 0) AS cloud_cost,"
+                " COALESCE(MAX(m.cloud_cost_usd IS NOT NULL), 0) AS cloud_priced,"
                 " (SELECT COUNT(*) FROM steps s JOIN messages m2 ON s.task_id = m2.run_id"
                 "  WHERE date(m2.created_at, 'unixepoch')"
                 "  = date(m.created_at, 'unixepoch')) AS steps"
@@ -392,13 +432,25 @@ def tally_tokens(snapshot):
     return prompt, completion
 
 
-def cost_estimate_usd(prompt, completion):
-    """Token-count cost. The rate is 0 unless JEV_COST_PER_1K_TOKENS is set."""
-    try:
-        rate = float(os.environ.get("JEV_COST_PER_1K_TOKENS") or 0)
-    except ValueError:
-        rate = 0
-    return round((prompt + completion) / 1000 * max(rate, 0), 6)
+def price_message(snapshot):
+    """(token_cost_usd, priced) for one finished turn. Each decision and text call
+    is priced against its recorded model's JEV_PRICE_<MODEL>_IN/OUT rate."""
+    calls = []
+    for item in snapshot.get("decisions") or []:
+        usages = [
+            (item.get("model"), item.get("usage")),
+            (item.get("verifier_model"), item.get("verifier_usage")),
+            (item.get("decompose_model"), item.get("decompose_usage")),
+        ]
+        for model, usage in usages:
+            pin, pout = token_counts(usage)
+            if pin or pout:
+                calls.append((model, pin, pout))
+    for item in snapshot.get("text_calls") or []:
+        pin, pout = token_counts(item.get("usage"))
+        if pin or pout:
+            calls.append((item.get("model"), pin, pout))
+    return priced_cost(calls)
 
 
 def reclaim_daemon(name):
@@ -1601,10 +1653,17 @@ class SessionRunner:
         return len(history)
 
     def _finish_message(self, session_id, message_id, snapshot, status, error, trace, started, browser):
+        session = self.store.get_session(session_id, with_steps=False) or {}
         prompt, completion = tally_tokens(snapshot)
-        cost = cost_estimate_usd(prompt, completion)
+        cost, priced = price_message(snapshot)
         reply = compose_reply(snapshot, status, error)
         duration_ms = round((time.monotonic() - started) * 1000)
+        cloud_seconds = cloud_cost = None
+        if session.get("browser") == "cloud" and browser is not None:
+            cloud_seconds = round(duration_ms / 1000, 3)
+            rate = cloud_rate_per_hour()
+            if rate is not None:
+                cloud_cost = round(cloud_seconds / 3600 * rate, 6)
         page = snapshot.get("page") or {}
         final_text = final_text_for(browser, page)
         self._capture_final_frame(session_id, message_id)
@@ -1616,6 +1675,9 @@ class SessionRunner:
             input_tokens=prompt,
             output_tokens=completion,
             cost_usd_estimate=cost,
+            priced=int(priced),
+            cloud_seconds=cloud_seconds,
+            cloud_cost_usd=cloud_cost,
             duration_ms=duration_ms,
             error=error,
             blocked_reason=snapshot.get("blocked_reason"),
@@ -1642,12 +1704,13 @@ class SessionRunner:
             blocked_reason=snapshot.get("blocked_reason"),
             partial=int(bool(snapshot.get("partial"))),
         )
-        session = self.store.get_session(session_id, with_steps=False) or {}
         fields = {
             "last_active_at": time.time(),
             "total_input_tokens": (session.get("total_input_tokens") or 0) + prompt,
             "total_output_tokens": (session.get("total_output_tokens") or 0) + completion,
             "total_cost_usd": (session.get("total_cost_usd") or 0) + cost,
+            "total_cloud_seconds": (session.get("total_cloud_seconds") or 0) + (cloud_seconds or 0),
+            "total_cloud_cost_usd": (session.get("total_cloud_cost_usd") or 0) + (cloud_cost or 0),
             "last_tabs": json.dumps(session_tabs(browser)),
         }
         landed = (snapshot.get("page") or {}).get("url") or self._browser_url(browser)
@@ -1914,6 +1977,11 @@ class Handler(BaseHTTPRequestHandler):
                 "agent_reply": message.get("agent_reply"),
                 "status": message.get("status"),
                 "cost": message.get("cost_usd_estimate"),
+                "priced": message.get("priced"),
+                "input_tokens": message.get("input_tokens"),
+                "output_tokens": message.get("output_tokens"),
+                "cloud_seconds": message.get("cloud_seconds"),
+                "cloud_cost_usd": message.get("cloud_cost_usd"),
                 "duration_ms": message.get("duration_ms"),
                 "final_url": message.get("final_url"),
                 "steps": message.get("steps") or [],

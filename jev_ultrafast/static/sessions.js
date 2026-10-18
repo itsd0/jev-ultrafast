@@ -40,13 +40,45 @@ function toast(message) {
   toast.timer = setTimeout(() => { el.hidden = true; }, 3500);
 }
 
-function fmtCost(value) {
+function fmtCost(value, priced) {
+  if (priced === 0) return "price not set";
   if (value == null) return "$0";
   const num = Number(value);
   if (!isFinite(num)) return "$0";
   if (num === 0) return "$0";
   if (num < 0.01) return "$" + num.toFixed(4);
   return "$" + num.toFixed(2);
+}
+
+function fmtCloud(seconds, cost, priced) {
+  if (seconds == null && cost == null) return "";
+  if (!(seconds > 0) && !(cost > 0)) return "";
+  const dur = seconds != null ? fmtDur(seconds * 1000) : "?";
+  const price = (cost == null || priced === 0) ? "price not set" : fmtCost(cost, 1);
+  return `browser ${dur} · ${price}`;
+}
+
+function fmtTurnCost(message) {
+  const tokens = (message.input_tokens || 0) + (message.output_tokens || 0);
+  const parts = [`${tokens} tokens`, fmtCost(message.cost_usd_estimate, message.priced)];
+  const cloud = fmtCloud(message.cloud_seconds, message.cloud_cost_usd, 1);
+  if (cloud) parts.push(cloud);
+  return parts.join(" · ");
+}
+
+function fmtSessionCost(session) {
+  const tokens = (session.total_input_tokens || 0) + (session.total_output_tokens || 0);
+  const parts = [`${tokens} tokens`, fmtCost(session.total_cost_usd, session.priced)];
+  const cloud = fmtCloud(session.total_cloud_seconds, session.total_cloud_cost_usd, session.cloud_priced);
+  if (cloud) parts.push(cloud);
+  return parts.join(" · ");
+}
+
+function fmtUsageCost(row) {
+  const parts = [fmtCost(row.cost, row.priced)];
+  const cloud = fmtCloud(row.cloud_seconds, row.cloud_cost, row.cloud_priced);
+  if (cloud) parts.push(cloud);
+  return parts.join(" · ");
 }
 
 function fmtDur(ms) {
@@ -125,7 +157,7 @@ async function loadSessions() {
     if (S.current && session.id === S.current.id) li.className = "active";
     const btn = document.createElement("button");
     btn.innerHTML = `<span class="t">${esc(session.title)}</span>` +
-      `<span class="m">${esc(fmtTime(session.last_active_at))} · ${esc(fmtCost(session.total_cost_usd))}</span>`;
+      `<span class="m">${esc(fmtTime(session.last_active_at))} · ${esc(fmtCost(session.total_cost_usd, session.priced))}</span>`;
     btn.onclick = () => openSession(session.id, true);
     li.appendChild(btn);
     list.appendChild(li);
@@ -173,7 +205,7 @@ function renderSession() {
     return;
   }
   $("session-title").textContent = session.title || "Session";
-  const cost = fmtCost(session.total_cost_usd);
+  const cost = fmtSessionCost(session);
   $("session-meta").textContent = `${session.browser} · ${session.status} · ${session.messages.length} turns · ${cost}`;
   $("composer-cost").textContent = "cost so far " + cost;
   thread.innerHTML = "";
@@ -202,7 +234,7 @@ function renderTurn(message) {
   const worked = message.duration_ms != null ? fmtDur(message.duration_ms) : null;
   head.innerHTML =
     (worked ? `Worked for ${esc(worked)} · ` : "") +
-    `${steps.length} steps · ${esc(fmtCost(message.cost_usd_estimate))} ` +
+    `${steps.length} steps · ${esc(fmtTurnCost(message))} ` +
     `<span class="status ${esc(message.status)}">${esc(message.status)}</span>`;
   div.appendChild(head);
   if (steps.length) {
@@ -580,7 +612,7 @@ async function renderUsage() {
       body.innerHTML = "<p>No usage yet.</p>";
       return;
     }
-    const totals = {sessions: 0, turns: 0, steps: 0, tokens: 0, cost: 0};
+    const totals = {sessions: 0, turns: 0, steps: 0, tokens: 0, cost: 0, priced: 0, cloud_seconds: 0, cloud_cost: 0};
     let html = `<table class="usage"><tr><th>Day</th><th>Sessions</th><th>Turns</th><th>Steps</th><th>Tokens</th><th>Cost</th></tr>`;
     for (const row of rows) {
       totals.sessions += row.sessions || 0;
@@ -588,11 +620,14 @@ async function renderUsage() {
       totals.steps += row.steps || 0;
       totals.tokens += row.tokens || 0;
       totals.cost += row.cost || 0;
+      if (row.priced === 1) totals.priced = 1;
+      totals.cloud_seconds += row.cloud_seconds || 0;
+      totals.cloud_cost += row.cloud_cost || 0;
       html += `<tr><td>${esc(row.day)}</td><td>${row.sessions}</td><td>${row.turns}</td>` +
-        `<td>${row.steps}</td><td>${row.tokens}</td><td>${esc(fmtCost(row.cost))}</td></tr>`;
+        `<td>${row.steps}</td><td>${row.tokens}</td><td>${esc(fmtUsageCost(row))}</td></tr>`;
     }
     html += `<tr><td><strong>Total</strong></td><td>${totals.sessions}</td><td>${totals.turns}</td>` +
-      `<td>${totals.steps}</td><td>${totals.tokens}</td><td>${esc(fmtCost(totals.cost))}</td></tr></table>`;
+      `<td>${totals.steps}</td><td>${totals.tokens}</td><td>${esc(fmtUsageCost(totals))}</td></tr></table>`;
     body.innerHTML = html;
   } catch (e) {
     if (e.message !== "unauthorized") body.innerHTML = "<p>Could not load usage.</p>";
@@ -670,7 +705,7 @@ async function renderShare(token) {
       const steps = turn.steps || [];
       div.innerHTML = `<div class="turn-head">` +
         (turn.duration_ms != null ? `Worked for ${esc(fmtDur(turn.duration_ms))} · ` : "") +
-        `${steps.length} steps · ${esc(fmtCost(turn.cost))} ` +
+        `${steps.length} steps · ${esc(fmtTurnCost({...turn, cost_usd_estimate: turn.cost}))} ` +
         `<span class="status ${esc(turn.status)}">${esc(turn.status)}</span></div>`;
       if (steps.length) {
         const details = document.createElement("details");

@@ -101,7 +101,9 @@ uv run --env-file .env python examples/run.py \
 uv run --env-file .env jev-server
 ```
 
-Serves **http://127.0.0.1:8770** (loopback only). Local tasks drive one Chrome through a dedicated `jev-server` browser-harness daemon; set `BU_CDP_URL=http://127.0.0.1:9222` to pin which Chrome. `JEV_MAX_CONCURRENT` (default 2) caps running tasks, `JEV_SERVER_TOKEN` adds an optional bearer token, and `JEV_COST_PER_1K_TOKENS` enables the cost estimate. `GET /api/health` reports `{"status": "ok"}`.
+Serves **http://127.0.0.1:8770** (loopback only). Local tasks drive one Chrome through a dedicated `jev-server` browser-harness daemon; set `BU_CDP_URL=http://127.0.0.1:9222` to pin which Chrome. `JEV_MAX_CONCURRENT` (default 2) caps running tasks, `JEV_SERVER_TOKEN` adds an optional bearer token, cost is per model (see below). `GET /api/health` reports `{"status": "ok"}`.
+
+Cost: set `JEV_PRICE_<MODEL>_IN` / `JEV_PRICE_<MODEL>_OUT` per 1M tokens, where `<MODEL>` is the model id uppercased with non-alphanumerics as underscores (e.g. `JEV_PRICE_MERCURY_2_5_IN` for `mercury-2.5`); the legacy `JEV_COST_PER_1K_TOKENS` flat rate still works as a fallback. Cloud browser time is priced with `JEV_CLOUD_PRICE_PER_HOUR` (Browser Use docs list $0.02/browser-hour metered by the minute). All rates default to blank; without a rate the UI shows token counts and "price not set" instead of $0.
 
 ### Deploy
 

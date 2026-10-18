@@ -589,3 +589,203 @@ def test_bus_replays_events(tmp_path):
     assert kinds[0] == "message" and kinds[-1] == "reply"
     assert runner.replay(sid, since=10**9) == []
     assert runner.replay("nope") == []
+
+
+def _priced_snapshot():
+    return {
+        "status": "done",
+        "history": [],
+        "answer": "The region has 10,722,000 residents.",
+        "decisions": [
+            {
+                "model": "mercury-2.5",
+                "usage": {"prompt_tokens": 1000000, "completion_tokens": 500000},
+                "decompose_model": "mercury-2.5",
+                "decompose_usage": {"prompt_tokens": 2000000, "completion_tokens": 0},
+            },
+        ],
+        "text_calls": [
+            {"model": "mercury-2.5", "usage": {"prompt_tokens": 0, "completion_tokens": 1000000}},
+        ],
+        "page": {"url": "https://example.test/", "title": "Example"},
+    }
+
+
+def _scripted_factory(snapshot):
+    def factory(url, goal, browser=None, background=""):
+        return FakeAgent(url, goal, browser=browser, background=background, script=lambda: snapshot)
+
+    return factory
+
+
+def _clear_prices(monkeypatch):
+    for name in (
+        "JEV_PRICE_MERCURY_2_5_IN",
+        "JEV_PRICE_MERCURY_2_5_OUT",
+        "JEV_COST_PER_1K_TOKENS",
+        "JEV_CLOUD_PRICE_PER_HOUR",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
+def test_price_env_name_slugs_model_ids():
+    from jev_ultrafast.model import price_env_name
+
+    assert price_env_name("mercury-2.5") == "JEV_PRICE_MERCURY_2_5"
+    assert price_env_name("jev-latest") == "JEV_PRICE_JEV_LATEST"
+    assert price_env_name("") == ""
+    assert price_env_name(None) == ""
+
+
+def test_priced_cost_per_model_in_out(monkeypatch):
+    from jev_ultrafast.model import priced_cost
+
+    _clear_prices(monkeypatch)
+    monkeypatch.setenv("JEV_PRICE_MERCURY_2_5_IN", "1.0")
+    monkeypatch.setenv("JEV_PRICE_MERCURY_2_5_OUT", "4.0")
+    cost, priced = priced_cost([("mercury-2.5", 1000000, 500000)])
+    assert priced is True
+    assert cost == 3.0
+
+
+def test_priced_cost_unset_is_unpriced(monkeypatch):
+    from jev_ultrafast.model import priced_cost
+
+    _clear_prices(monkeypatch)
+    assert priced_cost([("mercury-2.5", 100, 50)]) == (0.0, False)
+    assert priced_cost([(None, 100, 50)]) == (0.0, False)
+
+
+def test_priced_cost_invalid_rate_is_unset(monkeypatch):
+    from jev_ultrafast.model import priced_cost
+
+    _clear_prices(monkeypatch)
+    monkeypatch.setenv("JEV_PRICE_MERCURY_2_5_IN", "abc")
+    monkeypatch.setenv("JEV_PRICE_MERCURY_2_5_OUT", "-1")
+    assert priced_cost([("mercury-2.5", 100, 50)]) == (0.0, False)
+
+
+def test_priced_cost_legacy_flat_fallback(monkeypatch):
+    from jev_ultrafast.model import priced_cost
+
+    _clear_prices(monkeypatch)
+    monkeypatch.setenv("JEV_COST_PER_1K_TOKENS", "0.01")
+    cost, priced = priced_cost([(None, 20, 10)])
+    assert priced is True
+    assert cost == 0.0003
+
+
+def test_price_message_uses_recorded_models(monkeypatch):
+    _clear_prices(monkeypatch)
+    monkeypatch.setenv("JEV_PRICE_MERCURY_2_5_IN", "1.0")
+    monkeypatch.setenv("JEV_PRICE_MERCURY_2_5_OUT", "4.0")
+    cost, priced = hosted.price_message(_priced_snapshot())
+    assert priced is True
+    # 1M+2M in at $1, 0.5M+1M out at $4.
+    assert cost == 9.0
+
+
+def test_message_records_priced_cost_and_session_totals(tmp_path, monkeypatch):
+    _clear_prices(monkeypatch)
+    monkeypatch.setenv("JEV_PRICE_MERCURY_2_5_IN", "1.0")
+    monkeypatch.setenv("JEV_PRICE_MERCURY_2_5_OUT", "4.0")
+    runner = _runner(tmp_path, agent_factory=_scripted_factory(_priced_snapshot()))
+    sid = runner.create_session("local")
+    _inject(runner, sid, FakeBrowser("https://example.test/"))
+    mid = runner.submit_message(sid, "find the population")
+    message = _wait_done(runner, sid, mid)
+    assert message["priced"] == 1
+    assert message["cost_usd_estimate"] == 9.0
+    assert message["input_tokens"] == 3000000
+    assert message["output_tokens"] == 1500000
+    assert message["cloud_seconds"] is None
+    session = runner.store.get_session(sid, with_steps=False)
+    assert session["priced"] == 1
+    assert session["total_cost_usd"] == 9.0
+    assert "10,722,000" in message["agent_reply"]
+
+
+def test_message_unpriced_without_rates(tmp_path, monkeypatch):
+    _clear_prices(monkeypatch)
+    runner = _runner(tmp_path, agent_factory=_scripted_factory(_priced_snapshot()))
+    sid = runner.create_session("local")
+    _inject(runner, sid, FakeBrowser("https://example.test/"))
+    mid = runner.submit_message(sid, "find the population")
+    message = _wait_done(runner, sid, mid)
+    assert message["priced"] == 0
+    assert message["cost_usd_estimate"] == 0.0
+    session = runner.store.get_session(sid, with_steps=False)
+    assert session["priced"] == 0
+
+
+def test_cloud_message_records_browser_seconds_and_cost(tmp_path, monkeypatch):
+    _clear_prices(monkeypatch)
+    monkeypatch.setenv("JEV_CLOUD_PRICE_PER_HOUR", "0.02")
+    runner = _runner(tmp_path, agent_factory=_scripted_factory(_priced_snapshot()))
+    sid = runner.create_session("cloud")
+    _inject(runner, sid, FakeBrowser("https://example.test/", cloud=True))
+    mid = runner.submit_message(sid, "open x.com")
+    message = _wait_done(runner, sid, mid)
+    assert message["cloud_seconds"] is not None and message["cloud_seconds"] >= 0
+    assert message["cloud_cost_usd"] == round(message["cloud_seconds"] / 3600 * 0.02, 6)
+    session = runner.store.get_session(sid, with_steps=False)
+    assert session["total_cloud_seconds"] == message["cloud_seconds"]
+    assert session["total_cloud_cost_usd"] == message["cloud_cost_usd"]
+
+
+def test_cloud_message_without_rate_leaves_cost_unset(tmp_path, monkeypatch):
+    _clear_prices(monkeypatch)
+    runner = _runner(tmp_path, agent_factory=_scripted_factory(_priced_snapshot()))
+    sid = runner.create_session("cloud")
+    _inject(runner, sid, FakeBrowser("https://example.test/", cloud=True))
+    mid = runner.submit_message(sid, "open x.com")
+    message = _wait_done(runner, sid, mid)
+    assert message["cloud_seconds"] is not None
+    assert message["cloud_cost_usd"] is None
+
+
+def test_usage_reports_priced_and_cloud(tmp_path):
+    store = hosted.Store(tmp_path / "runs.db")
+    sid = store.create_session("t", "cloud")
+    mid = store.create_message(sid, "hi")
+    store.update_message(
+        mid, run_id=mid, status="done", input_tokens=10, output_tokens=4,
+        cost_usd_estimate=0.001, priced=1, cloud_seconds=60.0, cloud_cost_usd=0.0003,
+    )
+    rows = store.usage_by_day()
+    assert rows[0]["priced"] == 1
+    assert rows[0]["cloud_seconds"] == 60.0
+    assert rows[0]["cloud_cost"] == 0.0003
+    assert rows[0]["cloud_priced"] == 1
+
+
+def test_cloud_priced_flags_unset_rate(tmp_path):
+    store = hosted.Store(tmp_path / "runs.db")
+    sid = store.create_session("t", "cloud")
+    mid = store.create_message(sid, "hi")
+    store.update_message(
+        mid, run_id=mid, status="done", input_tokens=10, output_tokens=4,
+        cost_usd_estimate=0.0, priced=0, cloud_seconds=55.0, cloud_cost_usd=None,
+    )
+    session = store.get_session(sid, with_steps=False)
+    assert session["cloud_priced"] == 0
+    assert store.list_sessions()[0]["cloud_priced"] == 0
+    assert store.usage_by_day()[0]["cloud_priced"] == 0
+    assert store.usage_by_day()[0]["cloud_seconds"] == 55.0
+
+
+def test_old_db_gains_pricing_columns(tmp_path):
+    import sqlite3
+
+    path = tmp_path / "old.db"
+    conn = sqlite3.connect(str(path))
+    conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, goal TEXT)")
+    conn.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY, title TEXT)")
+    conn.execute("CREATE TABLE messages (id TEXT PRIMARY KEY, session_id TEXT, n INTEGER)")
+    conn.commit()
+    conn.close()
+    store = hosted.Store(path)
+    cols = {r[1] for r in store.conn.execute("PRAGMA table_info(messages)")}
+    assert {"priced", "cloud_seconds", "cloud_cost_usd"} <= cols
+    cols = {r[1] for r in store.conn.execute("PRAGMA table_info(sessions)")}
+    assert {"total_cloud_seconds", "total_cloud_cost_usd"} <= cols

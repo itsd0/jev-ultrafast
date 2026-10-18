@@ -1233,6 +1233,7 @@ class Agent:
         )
         if fresh_requirements:
             decision["decompose_usage"] = getattr(decompose_goal, "last_usage", {}) or {}
+            decision["decompose_model"] = getattr(decompose_goal, "last_model", None)
         progress = {}
         for item in decision.get("requirements") or []:
             if item.get("id"):
