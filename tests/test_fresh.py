@@ -3,7 +3,8 @@
 from unittest.mock import Mock
 
 from jev_ultrafast import agent as loop
-from jev_ultrafast.browser import Browser, StalePage
+from jev_ultrafast import browser as browser_module
+from jev_ultrafast.browser import Browser, StalePage, modal_observed_empty
 
 
 def page():
@@ -189,3 +190,45 @@ def test_stale_act_gives_up_to_redecide_after_two_retargets():
     assert browser.act.call_count == 3  # initial try plus two retargets
     assert out["status"] == "ready" and out["decision"] is None
     assert agent.state.get("held_actions", {}) == {}
+
+
+def test_modal_observed_empty_triggers_only_on_a_control_free_modal():
+    wait = {"id": "wait", "kind": "wait", "label": "Wait for the page to update"}
+    assert modal_observed_empty({"modal_scoped": True, "actions": [wait]}) is True
+    assert modal_observed_empty({"modal_scoped": True, "actions": []}) is True
+    assert modal_observed_empty(None) is False
+    assert modal_observed_empty({"modal_scoped": False, "actions": [wait]}) is False
+    assert modal_observed_empty({"actions": [wait]}) is False
+    filled = [wait, {"id": "e1", "kind": "click", "label": "Close"}]
+    assert modal_observed_empty({"modal_scoped": True, "actions": filled}) is False
+
+
+def test_observe_re_settles_an_empty_modal_once(monkeypatch):
+    tab = browser()
+    tab.settle_dom = Mock()
+    tab._finish_observation = Mock(side_effect=lambda state: state)
+    empty = {"modal_scoped": True, "actions": [{"id": "wait", "kind": "wait"}]}
+    filled = {"modal_scoped": True, "actions": [{"id": "e1", "kind": "click"}]}
+    monkeypatch.setattr(
+        browser_module, "browser_operation",
+        Mock(side_effect=[empty, filled, filled]),
+    )
+    assert tab.observe(screenshot=False) is filled
+    assert browser_module.browser_operation.call_count == 2
+    assert tab.settle_dom.call_count == 2
+    assert tab.settle_dom.call_args_list[1].kwargs["quiet_ms"] == 300
+    assert tab.observe(screenshot=False) is filled
+    assert browser_module.browser_operation.call_count == 3
+
+
+def test_observe_keeps_the_first_snapshot_when_the_modal_retry_goes_stale(monkeypatch):
+    tab = browser()
+    tab.settle_dom = Mock()
+    tab._finish_observation = Mock(side_effect=lambda state: state)
+    empty = {"modal_scoped": True, "actions": [{"id": "wait", "kind": "wait"}]}
+    monkeypatch.setattr(
+        browser_module, "browser_operation",
+        Mock(side_effect=[empty, StalePage("navigating"), empty]),
+    )
+    assert tab.observe(screenshot=False) is empty
+    assert browser_module.browser_operation.call_count == 2

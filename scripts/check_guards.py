@@ -429,6 +429,42 @@ def main():
         browser.act(more, page)
         assert browser.evaluate("window.moreClicked") is True
         passed.append("offscreen pager click scrolls into view first")
+
+        browser.call("Page.navigate", url="data:text/html," + quote((FIXTURES / "slider.html").read_text()))
+        browser.wait_until_ready()
+        page = browser.observe(screenshot=False)
+        price = next(a for a in page["actions"] if a.get("label") == "Max price")
+        assert price.get("kind") == "fill" and price.get("role") == "slider", price
+        assert price.get("slider") == {
+            "min": 0, "max": 500, "now": 150, "valuetext": None, "step": 10,
+        }, price
+        rating = next(a for a in page["actions"] if a.get("label") == "Rating")
+        assert rating.get("role") == "slider", rating
+        assert rating.get("slider", {}).get("now") == 7, rating
+        passed.append("native range and aria sliders index as fills with state")
+        result = browser.act(price, page, text="200")
+        assert result.get("text_verified") is True, result
+        assert result.get("slider_moves") == 0, result
+        assert browser.evaluate("document.querySelector('#price').value") == "200"
+        assert (browser.evaluate("window.priceMoves") or 0) >= 1
+        passed.append("slider fill sets a native range without keys and verifies")
+        page = browser.observe(screenshot=False)
+        rating = next(a for a in page["actions"] if a.get("label") == "Rating")
+        result = browser.act(rating, page, text="9")
+        assert result.get("text_verified") is True, result
+        assert browser.evaluate("document.querySelector('#aria').getAttribute('aria-valuenow')") == "9"
+        passed.append("slider fill moves an aria slider with arrows and verifies")
+        page = browser.observe(screenshot=False)
+        low = next(a for a in page["actions"] if a.get("label") == "Min price")
+        result = browser.act(low, page, text="50")
+        assert result.get("text_verified") is True, result
+        assert browser.evaluate("document.querySelector('#minp').value") == "50"
+        page = browser.observe(screenshot=False)
+        high = next(a for a in page["actions"] if a.get("label") == "Max stay price")
+        result = browser.act(high, page, text="450")
+        assert result.get("text_verified") is True, result
+        assert browser.evaluate("document.querySelector('#maxp').value") == "450"
+        passed.append("dual-thumb min/max sliders fill to their amounts")
     finally:
         browser.close()
     print("\n".join(passed))

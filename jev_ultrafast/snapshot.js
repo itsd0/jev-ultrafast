@@ -228,7 +228,7 @@
   };
   // @test-export-start: role-mapping
   const roles=['button','link','checkbox','radio','switch','tab','menuitem','menuitemradio',
-    'option','gridcell','combobox','textbox','searchbox','spinbutton'];
+    'option','gridcell','combobox','textbox','searchbox','spinbutton','slider'];
   const selector='a[href],button,input,textarea,select,summary,[contenteditable="true"],'+
     roles.map(role=>'[role="'+role+'"]').join(',');
   const role = e => {
@@ -244,11 +244,31 @@
       if (['button','submit','reset','image'].includes(e.type)) return 'button';
       if (e.type==='search') return 'searchbox';
       if (e.type==='number') return 'spinbutton';
+      if (e.type==='range') return 'slider';
       if (['text','email','url','tel'].includes(e.type)) return 'textbox';
     }
     return null;
   };
   // @test-export-end: role-mapping
+  // @test-export-start: slider-state
+  const sliderState = e => {
+    const pick = (...raws) => {
+      for (const raw of raws) {
+        const num = typeof raw === 'number' ? raw : parseFloat(raw);
+        if (Number.isFinite(num)) return num;
+      }
+      return null;
+    };
+    const attr = name => (e.getAttribute ? e.getAttribute(name) : null);
+    return {
+      min: pick(attr('aria-valuemin'), e.min),
+      max: pick(attr('aria-valuemax'), e.max),
+      now: pick(attr('aria-valuenow'), e.value),
+      valuetext: attr('aria-valuetext'),
+      step: pick(e.step),
+    };
+  };
+  // @test-export-end: slider-state
   function documentKey(doc) {
     const win = doc.defaultView || window;
     return [win.performance.timeOrigin, doc.location.href];
@@ -363,6 +383,9 @@
       actions.push({...base, kind:'check', desired:true, value:'', label:'Set '+base.label});
       if (base.checked==='true')
         actions.push({...base, kind:'check', desired:false, value:'', label:'Clear '+base.label});
+    } else if (rname==='slider') {
+      const slider=sliderState(e);
+      actions.push({...base, kind:'fill', value:slider.now===null?'':String(slider.now), slider});
     } else {
       const editable=!e.readOnly && e.getAttribute('aria-readonly')!=='true' &&
         (['textbox','searchbox','spinbutton'].includes(rname) ||

@@ -883,10 +883,48 @@ def parse_field_text(result):
     return value
 
 
+_CURRENCY_CANONICAL = {
+    "$": "USD", "USD": "USD",
+    "€": "EUR", "EUR": "EUR",
+    "£": "GBP", "GBP": "GBP",
+    "¥": "JPY", "JPY": "JPY",
+    "CHF": "CHF", "CAD": "CAD", "AUD": "AUD", "INR": "INR", "CNY": "CNY",
+}
+_CURRENCY_CODES = "USD|EUR|GBP|JPY|CHF|CAD|AUD|INR|CNY"
+
+
+def text_currency(text):
+    """First currency marker in a string, canonicalized. None when absent."""
+    if not isinstance(text, str):
+        return None
+    for symbol in ("$", "€", "£", "¥"):
+        if symbol in text:
+            return _CURRENCY_CANONICAL[symbol]
+    match = re.search(rf"\b({_CURRENCY_CODES})\b", text)
+    return match.group(1) if match else None
+
+
+def page_currency(page):
+    """The page's dominant currency: the most frequent marker, canonicalized."""
+    text = f"{page.get('title') or ''} {page.get('text') or ''}"
+    counts = {symbol: text.count(symbol) for symbol in ("$", "€", "£", "¥")}
+    for code in re.findall(rf"\b({_CURRENCY_CODES})\b", text):
+        counts[code] = counts.get(code, 0) + 1
+    if not any(counts.values()):
+        return None
+    return _CURRENCY_CANONICAL[max(counts, key=lambda marker: counts[marker])]
+
+
 def field_context(goal, action, page, history):
+    field = {k: action.get(k) for k in ("label", "role", "value")}
+    if action.get("role") == "slider":
+        field["slider"] = action.get("slider")
+        goal_ccy, page_ccy = text_currency(goal), page_currency(page)
+        if goal_ccy and page_ccy and goal_ccy != page_ccy:
+            field["note"] = f"Write the amount in the page currency ({page_ccy})."
     return {
         "goal": goal,
-        "field": {k: action.get(k) for k in ("label", "role", "value")},
+        "field": field,
         "page": {"title": page["title"], "text": page["text"][:6000]},
         "recent_actions": [{k: h.get(k) for k in ("action", "text")} for h in history[-6:]],
     }

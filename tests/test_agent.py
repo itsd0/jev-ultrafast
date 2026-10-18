@@ -658,6 +658,37 @@ def test_quoted_task_text_still_uses_the_llm(monkeypatch):
     assert sent["goal"] == 'Fly from "Zurich" to London'
 
 
+def test_slider_fill_context_notes_a_currency_mismatch():
+    action = {
+        "label": "Max price",
+        "role": "slider",
+        "value": "150",
+        "slider": {"min": 0, "max": 500, "now": 150, "step": 10},
+    }
+    page = {"title": "Hotels", "text": "Prices in EUR. Max €450. From €120."}
+    context = model.field_context("Max price $200", action, page, [])
+    assert context["field"]["slider"] == {"min": 0, "max": 500, "now": 150, "step": 10}
+    assert context["field"]["note"] == "Write the amount in the page currency (EUR)."
+
+
+def test_slider_fill_context_has_no_note_without_a_mismatch():
+    action = {"label": "Max price", "role": "slider", "slider": {"now": 150}}
+    same = {"title": "", "text": "Max $500. From $120."}
+    assert "note" not in model.field_context("Max price $200", action, same, [])["field"]
+    assert "note" not in model.field_context("Max price USD 200", action, same, [])["field"]
+    assert "note" not in model.field_context("Max price 200", action, same, [])["field"]
+    assert "note" not in model.field_context(
+        "Max price $200", action, {"title": "", "text": "no prices here"}, []
+    )["field"]
+
+
+def test_page_currency_is_the_dominant_marker_canonicalized():
+    assert model.page_currency({"title": "", "text": "$10, €50, €60"}) == "EUR"
+    assert model.page_currency({"title": "", "text": "€120"}) == "EUR"
+    assert model.page_currency({"title": "", "text": "120 EUR"}) == "EUR"
+    assert model.page_currency({"title": "", "text": "nothing"}) is None
+
+
 def test_missing_text_credential_stops_before_guessing(monkeypatch):
     monkeypatch.delenv("TEXT_MODEL_API_KEY", raising=False)
     monkeypatch.delenv("INCEPTION_API_KEY", raising=False)

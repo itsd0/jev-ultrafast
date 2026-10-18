@@ -242,18 +242,26 @@ class Browser:
                 )
             except RuntimeError:
                 pass
+        request = {
+            "operation": "observe",
+            "session": self.session,
+            "screenshot": screenshot,
+            "config": self.config,
+            "counter": getattr(self, "cdp_counter", None),
+        }
         for attempt in range(12):
             try:
-                state = browser_operation(
-                    {
-                        "operation": "observe",
-                        "session": self.session,
-                        "screenshot": screenshot,
-                        "config": self.config,
-                        "counter": getattr(self, "cdp_counter", None),
-                    }
-                )
-                return self._finish_observation(state)
+                state = self._finish_observation(browser_operation(request))
+                if modal_observed_empty(state):
+                    # A freshly opened dialog can snapshot before its controls
+                    # paint; settle once more and re-observe instead of
+                    # deciding on an empty modal.
+                    self.settle_dom(quiet_ms=300, cap_ms=2000)
+                    try:
+                        state = self._finish_observation(browser_operation(request))
+                    except StalePage:
+                        pass
+                return state
             except StalePage:
                 if attempt == 11:
                     raise
@@ -1150,6 +1158,183 @@ def commit_key_expression(action, key="Enter"):
     )
 
 
+def modal_observed_empty(state):
+    """A modal dialog whose snapshot caught no controls: observe once more."""
+    if not (state or {}).get("modal_scoped"):
+        return False
+    return not any(
+        action.get("kind") not in {"wait", "scroll"}
+        for action in state.get("actions") or []
+    )
+
+
+def detect_slider(action):
+    """A slider fill: role slider, set natively or via keys, not inserted text."""
+    return (action or {}).get("role") == "slider"
+
+
+def _parse_amount(text):
+    """First number in text ($150 -> 150.0). None when there is none."""
+    if not isinstance(text, str):
+        return None
+    match = re.search(r"-?\d[\d,]*(?:\.\d+)?", text)
+    if not match:
+        return None
+    try:
+        return float(match.group(0).replace(",", ""))
+    except ValueError:
+        return None
+
+
+def slider_geometry_expression(action):
+    locator = {k: action[k] for k in ("node", "frame") if k in action}
+    return (
+        "(action => { const fast=window.__jevFast; "
+        "const e=fast?.resolve ? fast.resolve(action) : fast?.nodes.get(action.node); "
+        "if (!e) return null; const r=e.getBoundingClientRect(); "
+        "return {x:r.x, y:r.y, width:r.width, height:r.height}; })("
+        + json.dumps(locator) + ")"
+    )
+
+
+def slider_value_expression(action):
+    locator = {k: action[k] for k in ("node", "frame") if k in action}
+    return (
+        "(action => { const fast=window.__jevFast; "
+        "const e=fast?.resolve ? fast.resolve(action) : fast?.nodes.get(action.node); "
+        "if (!e) return null; "
+        "const aria=e.getAttribute ? e.getAttribute('aria-valuenow') : null; "
+        "const raw=aria ?? (('value' in e) ? e.value : null); "
+        "const num=parseFloat(raw); return Number.isFinite(num) ? num : null; })("
+        + json.dumps(locator) + ")"
+    )
+
+
+# Commit keys for sliders: raw input only, never offered to the decision model.
+_COMMIT_KEYS = {"Home": 36, "End": 35, "PageUp": 33, "PageDown": 34}
+
+
+def _dispatch_commit_key(call, name):
+    for event in ("keyDown", "keyUp"):
+        call(
+            "Input.dispatchKeyEvent", type=event, key=name, code=name,
+            windowsVirtualKeyCode=_COMMIT_KEYS[name],
+        )
+
+
+def slider_set_native_expression(action, target):
+    locator = {k: action[k] for k in ("node", "frame") if k in action}
+    return (
+        "((action, target) => { const fast=window.__jevFast; "
+        "const e=fast?.resolve ? fast.resolve(action) : fast?.nodes.get(action.node); "
+        "if (!e || !('value' in e)) return null; "
+        "const proto=e.tagName==='INPUT' ? window.HTMLInputElement.prototype : "
+        "(e.tagName==='TEXTAREA' ? window.HTMLTextAreaElement.prototype : null); "
+        "try { const desc=proto ? Object.getOwnPropertyDescriptor(proto, 'value') : null; "
+        "if (desc && desc.set) desc.set.call(e, String(target)); else e.value=String(target); "
+        "e.dispatchEvent(new Event('input', {bubbles:true})); "
+        "e.dispatchEvent(new Event('change', {bubbles:true})); } catch (err) { return null; } "
+        "const num=parseFloat(e.value); return Number.isFinite(num) ? num : null; })("
+        + json.dumps(locator) + ", " + json.dumps(target) + ")"
+    )
+
+
+_SLIDER_MAX_KEYS = 200
+
+
+def slider_fill(call, evaluate, action, text):
+    """Move a slider to the target amount and verify by value.
+
+    Native sliders get the native value setter first; everything else is
+    trusted keyboard (click-to-position, then Home/End/PageUp/PageDown and
+    arrows) with a read-back after each round. Bounded at 200 keys.
+    """
+    target = _parse_amount(text)
+    slider = action.get("slider") or {}
+    current = slider.get("now")
+    if current is None:
+        current = _parse_amount(slider.get("valuetext"))
+    if target is None or not isinstance(current, (int, float)):
+        return {"text_verified": False, "typed": current}
+    minimum, maximum = slider.get("min"), slider.get("max")
+    step = slider.get("step") or 1
+    if not isinstance(step, (int, float)) or step <= 0:
+        step = 1
+    if isinstance(minimum, (int, float)):
+        target = max(target, minimum)
+    if isinstance(maximum, (int, float)):
+        target = min(target, maximum)
+    moves = 0
+
+    def read():
+        value = evaluate(slider_value_expression(action))
+        return value if isinstance(value, (int, float)) else None
+
+    def within(value):
+        return abs(value - target) <= step / 2 + 1e-9
+
+    def arrows(count):
+        nonlocal moves
+        name = "ArrowRight" if count > 0 else "ArrowLeft"
+        for _ in range(min(abs(count), _SLIDER_MAX_KEYS - moves)):
+            dispatch_key(call, name)
+            moves += 1
+
+    def plan(value, jumps_dead):
+        need = round((target - value) / step)
+        if jumps_dead:
+            return None, need
+        options = [(None, need)]
+        if isinstance(minimum, (int, float)) and isinstance(maximum, (int, float)):
+            options.append(("Home", round((target - minimum) / step)))
+            options.append(("End", -round((maximum - target) / step)))
+        return min(options, key=lambda option: (option[0] is not None) + abs(option[1]))
+
+    native = evaluate(slider_set_native_expression(action, target))
+    if isinstance(native, (int, float)):
+        current = native
+        if within(current):
+            return {"text_verified": True, "typed": current, "slider_moves": 0}
+    if (
+        isinstance(minimum, (int, float))
+        and isinstance(maximum, (int, float))
+        and maximum > minimum
+    ):
+        geometry = evaluate(slider_geometry_expression(action)) or {}
+        width = geometry.get("width") or 0
+        if width > 0:
+            fraction = max(0.0, min(1.0, (target - minimum) / (maximum - minimum)))
+            x = geometry.get("x", 0) + fraction * width
+            y = geometry.get("y", 0) + (geometry.get("height") or 0) / 2
+            for event in ("mousePressed", "mouseReleased"):
+                call("Input.dispatchMouseEvent", type=event, x=x, y=y, button="left", clickCount=1)
+            current = read()
+    jumps_dead = False
+    for _ in range(8):
+        if current is None:
+            break
+        if within(current):
+            return {"text_verified": True, "typed": current, "slider_moves": moves}
+        if moves >= _SLIDER_MAX_KEYS:
+            break
+        jump, count = plan(current, jumps_dead)
+        if jump is not None:
+            _dispatch_commit_key(call, jump)
+            moves += 1
+        elif abs(count) > 10 and not jumps_dead:
+            # A long way with no cheap jump: page keys first, then re-read;
+            # their stride is widget-defined so arrows follow next round.
+            _dispatch_commit_key(call, "PageUp" if count > 0 else "PageDown")
+            moves += 1
+            count = 0
+        arrows(count)
+        before, current = current, read()
+        if current == before and (jump is not None or count == 0):
+            jumps_dead = True
+    verified = current is not None and within(current)
+    return {"text_verified": verified, "typed": current, "slider_moves": moves}
+
+
 def commit_date(call, evaluate, action, expected, previous):
     """Commit a typed date: when the field doesn't show it but the focused twin
     does, commit with Enter in keydown-beforeinput order and re-poll once."""
@@ -1782,23 +1967,30 @@ def browser_operation(request):
                             if request.get("keyboard", True)
                             else None
                         )
-                    call(
-                        "Input.dispatchKeyEvent",
-                        type="keyDown",
-                        key="a",
-                        code="KeyA",
-                        modifiers=4 if sys.platform == "darwin" else 2,
-                        commands=["selectAll"],
-                    )
-                    call(
-                        "Input.dispatchKeyEvent",
-                        type="keyUp",
-                        key="a",
-                        code="KeyA",
-                        modifiers=4 if sys.platform == "darwin" else 2,
-                    )
-                    call("Input.insertText", text=request["text"])
-                    if request.get("keyboard", True):
+                    if detect_slider(action) and request.get("keyboard", True):
+                        extra.update(
+                            slider_fill(
+                                call, evaluate, action, request.get("text") or ""
+                            )
+                        )
+                    else:
+                        call(
+                            "Input.dispatchKeyEvent",
+                            type="keyDown",
+                            key="a",
+                            code="KeyA",
+                            modifiers=4 if sys.platform == "darwin" else 2,
+                            commands=["selectAll"],
+                        )
+                        call(
+                            "Input.dispatchKeyEvent",
+                            type="keyUp",
+                            key="a",
+                            code="KeyA",
+                            modifiers=4 if sys.platform == "darwin" else 2,
+                        )
+                        call("Input.insertText", text=request["text"])
+                    if request.get("keyboard", True) and not detect_slider(action):
                         extra.update(
                             verify_typed_text(
                                 call,
@@ -1811,13 +2003,15 @@ def browser_operation(request):
                         )
                         extra.update(
                             commit_date(
-                                call, evaluate, action, request.get("text") or "", previous
+                                call, evaluate, action, request.get("text") or "",
+                                previous,
                             )
                         )
                         extra.update(
                             commit_combobox(
-                                call, evaluate, action, request.get("text") or "", previous,
-                                request.get("goal") or "", request.get("tiebreak"),
+                                call, evaluate, action, request.get("text") or "",
+                                previous, request.get("goal") or "",
+                                request.get("tiebreak"),
                             )
                         )
         return {"executed": action["id"], **extra}

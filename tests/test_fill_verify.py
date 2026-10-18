@@ -9,8 +9,13 @@ import pytest
 from jev_ultrafast.browser import (
     commit_date,
     commit_key_expression,
+    detect_slider,
     field_value_expression,
     parse_date,
+    slider_fill,
+    slider_geometry_expression,
+    slider_set_native_expression,
+    slider_value_expression,
     verify_typed_text,
 )
 from jev_ultrafast.questions import TEXT_VALUE
@@ -199,6 +204,10 @@ def test_text_model_is_told_to_skip_the_weekday():
     assert "without a weekday" in TEXT_VALUE
 
 
+def test_text_model_is_told_sliders_take_a_plain_number():
+    assert "plain number" in TEXT_VALUE
+
+
 def _run_reader(detached_value, editables, active):
     expression = field_value_expression({"node": 1, "frame": "f0"})
     script = (
@@ -220,6 +229,23 @@ def _run_reader(detached_value, editables, active):
 
 
 @needs_node
+def test_slider_expressions_are_valid_javascript(tmp_path):
+    action = {"node": 3, "frame": "f0"}
+    expressions = [
+        slider_set_native_expression(action, 200.0),
+        slider_geometry_expression(action),
+        slider_value_expression(action),
+    ]
+    for index, expression in enumerate(expressions):
+        path = tmp_path / f"slider_{index}.js"
+        path.write_text(expression)
+        proc = subprocess.run(
+            ["node", "--check", str(path)], capture_output=True, text=True, timeout=30
+        )
+        assert proc.returncode == 0, proc.stderr
+
+
+@needs_node
 def test_twin_input_is_read_when_it_is_the_only_editable():
     twin = {"tagName": "INPUT", "value": "Sat, Jun 12", "isConnected": True}
     assert _run_reader("Fri, Jun 11", [twin], twin) == "Sat, Jun 12"
@@ -230,3 +256,130 @@ def test_twin_input_is_ignored_when_ambiguous():
     twin = {"tagName": "INPUT", "value": "Sat, Jun 12", "isConnected": True}
     other = {"tagName": "INPUT", "value": "other", "isConnected": True}
     assert _run_reader("Fri, Jun 11", [twin, other], twin) == "Fri, Jun 11"
+
+
+def _slider(slider, text, reads):
+    calls = []
+    values = list(reads)
+
+    def call(method, **params):
+        calls.append((method, params))
+
+    def evaluate(_expression):
+        return values.pop(0)
+
+    action = {"node": 1, "frame": "f0", "role": "slider", "slider": slider}
+    return slider_fill(call, evaluate, action, text), calls
+
+
+def _presses(calls, key):
+    return sum(
+        1 for method, params in calls
+        if method == "Input.dispatchKeyEvent"
+        and params.get("type") == "keyDown"
+        and params.get("key") == key
+    )
+
+
+def test_detect_slider_matches_role_only():
+    assert detect_slider({"role": "slider"}) is True
+    assert detect_slider({"role": "textbox"}) is False
+    assert detect_slider({}) is False
+    assert detect_slider(None) is False
+
+
+def test_slider_fill_sets_native_first_without_keys():
+    slider = {"min": 0, "max": 500, "now": 150, "step": 10}
+    result, calls = _slider(slider, "200", [200])
+    assert result["text_verified"] is True
+    assert result["typed"] == 200
+    assert result["slider_moves"] == 0
+    assert calls == []
+
+
+def test_slider_fill_falls_back_to_keys_when_native_reverts():
+    slider = {"min": 0, "max": 500, "now": 150, "step": 10}
+    result, calls = _slider(slider, "170", [150, {}, 170])
+    assert result["text_verified"] is True
+    assert _presses(calls, "ArrowRight") == 2
+    assert result["slider_moves"] == 2
+
+
+def test_slider_fill_moves_with_arrows_and_verifies():
+    slider = {"min": 0, "max": 500, "now": 150, "step": 10}
+    result, calls = _slider(slider, "170", [None, {}, 170])
+    assert result["text_verified"] is True
+    assert result["typed"] == 170
+    assert result["slider_moves"] == 2
+    assert _presses(calls, "ArrowRight") == 2
+    assert _presses(calls, "ArrowLeft") == 0
+
+
+def test_slider_fill_jumps_home_when_closer():
+    slider = {"min": 0, "max": 500, "now": 480, "step": 10}
+    result, calls = _slider(slider, "10", [None, {}, 10])
+    assert result["text_verified"] is True
+    assert _presses(calls, "Home") == 1
+    assert _presses(calls, "ArrowRight") == 1
+    assert result["slider_moves"] == 2
+    assert any(params.get("windowsVirtualKeyCode") == 36 for _, params in calls)
+
+
+def test_slider_fill_uses_page_keys_for_a_long_way_without_a_jump():
+    slider = {"now": 0, "step": 1}
+    result, calls = _slider(slider, "500", [None, 500])
+    assert result["text_verified"] is True
+    assert _presses(calls, "PageUp") == 1
+    assert result["slider_moves"] == 1
+
+
+def test_slider_fill_clicks_to_position_then_adjusts():
+    slider = {"min": 0, "max": 500, "now": 0, "step": 10}
+    geometry = {"x": 10, "y": 10, "width": 200, "height": 20}
+    result, calls = _slider(slider, "250", [None, geometry, 200, 250])
+    assert result["text_verified"] is True
+    assert result["slider_moves"] == 5
+    press = next(
+        params for method, params in calls
+        if method == "Input.dispatchMouseEvent" and params["type"] == "mousePressed"
+    )
+    assert press["x"] == 110.0
+    assert press["y"] == 20.0
+    assert _presses(calls, "ArrowRight") == 5
+
+
+def test_slider_fill_parses_currency_and_clamps_to_max():
+    slider = {"min": 0, "max": 500, "now": 150, "step": 10}
+    result, calls = _slider(slider, "$900", [None, {}, 500])
+    assert result["text_verified"] is True
+    assert result["typed"] == 500
+    assert _presses(calls, "End") == 1
+    assert _presses(calls, "ArrowRight") == 0
+
+
+def test_slider_fill_reads_the_current_value_from_valuetext():
+    slider = {"min": 0, "max": 500, "now": None, "valuetext": "about $150 total", "step": 10}
+    result, calls = _slider(slider, "170", [None, {}, 170])
+    assert result["text_verified"] is True
+    assert _presses(calls, "ArrowRight") == 2
+
+
+def test_slider_fill_without_a_number_sends_nothing():
+    slider = {"min": 0, "max": 500, "now": 150, "step": 10}
+    result, calls = _slider(slider, "cheaper please", [])
+    assert result["text_verified"] is False
+    assert calls == []
+
+
+def test_slider_fill_needs_a_known_current_value():
+    result, calls = _slider({}, "150", [])
+    assert result["text_verified"] is False
+    assert result["typed"] is None
+    assert calls == []
+
+
+def test_slider_fill_is_bounded_when_the_widget_ignores_keys():
+    slider = {"min": 0, "max": 100000, "now": 0, "step": 1}
+    result, _ = _slider(slider, "99999", [None, {}, 0, 0])
+    assert result["text_verified"] is False
+    assert result["slider_moves"] == 200
