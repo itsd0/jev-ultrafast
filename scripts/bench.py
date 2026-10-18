@@ -22,7 +22,12 @@ from urllib.parse import urlparse
 import httpx
 import yaml
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from jev_ultrafast.trace import diagnose_trace
+
 TERMINAL = {"done", "blocked", "failed"}
+TRACE_CAUSE_LABELS = {"budget": "hit budget", "blocked: gave up": "gave up"}
 
 
 def final_host(final_url):
@@ -74,10 +79,18 @@ def run_checks(task, evidence):
     return results
 
 
-def classify(task, evidence, check_results, timed_out):
-    """One failure reason per failed run; None when all checks pass."""
+def classify(task, evidence, check_results, timed_out, trace_events=None):
+    """One failure reason per failed run; None when all checks pass.
+
+    A trace classifies from evidence (verify failures, guards, errors) instead
+    of the old by-hand status mapping, which stays as the fallback.
+    """
     if all(r["passed"] for r in check_results):
         return None
+    if trace_events:
+        cause, _evidence = diagnose_trace(trace_events)
+        if cause:
+            return TRACE_CAUSE_LABELS.get(cause, cause)
     if timed_out:
         return "timeout"
     if evidence.get("status") == "failed":
@@ -122,10 +135,18 @@ def run_once(client, task, rep, timeout_s):
         time.sleep(2)
     checks = run_checks(task, evidence)
     steps = evidence.get("steps") or []
+    try:
+        trace_events = client.get(f"/api/tasks/{task_id}/trace").raise_for_status().json().get("events") or []
+    except Exception:
+        trace_events = []
+    cause, diagnosis = diagnose_trace(trace_events) if trace_events else (None, "")
     return {
         "task": task["id"],
         "rep": rep,
         "task_id": task_id,
+        "run_id": task_id,
+        "diagnosis": f"{cause} — {diagnosis}" if cause else "",
+        "trace_events": len(trace_events),
         "wall_s": round(time.monotonic() - started, 1),
         "status": evidence.get("status"),
         "steps": len(steps),
@@ -137,7 +158,7 @@ def run_once(client, task, rep, timeout_s):
         "partial": bool(evidence.get("partial")),
         "error": (evidence.get("error") or "")[:200],
         "checks": checks,
-        "reason": classify(task, evidence, checks, timed_out),
+        "reason": classify(task, evidence, checks, timed_out, trace_events),
     }
 
 
