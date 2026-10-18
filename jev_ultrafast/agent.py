@@ -29,7 +29,14 @@ from .model import (
     token_counts,
     track_context,
 )
-from .questions import ANSWER_VALUE, GATE_SYSTEM, NAVIGATE_VALUE, TEXT_VALUE, TRACK_SYSTEM
+from .questions import (
+    ANSWER_VALUE,
+    GATE_SYSTEM,
+    NAVIGATE_VALUE,
+    PICK_OPTION_VALUE,
+    TEXT_VALUE,
+    TRACK_SYSTEM,
+)
 from .trace import Trace, cost_estimate_usd, get_logger
 from .vision import confirm_point, needs_vision, propose
 
@@ -1283,7 +1290,13 @@ class Agent:
                 result = state["browser"].vision_click(action["x"], action["y"])
             else:
                 # Browser.act checks freshness immediately before input, including after text generation.
-                result = state["browser"].act(action, page, text=text)
+                extra_act = {}
+                if action["kind"] == "fill":
+                    def tiebreak(typed, choices, goal, field):
+                        return self._pick_option(state, step, typed, choices, goal, field)
+
+                    extra_act = {"goal": state["goal"], "tiebreak": tiebreak}
+                result = state["browser"].act(action, page, text=text, **extra_act)
             act_ms = round((time.perf_counter() - act_started) * 1000)
             cdp_after, cdp_ms_after = self._cdp(state["browser"])
             cdp_calls, cdp_ms = cdp_after - cdp_calls, round(cdp_ms_after - cdp_ms)
@@ -1870,6 +1883,30 @@ class Agent:
         else:
             self._rejudge_after_back(state, step, url)
         add_event_note(state, f"Captcha wall on {host or 'this page'}; leaving it alone.")
+
+    def _pick_option(self, state, step, typed, choices, goal, field):
+        """A near-tie between suggestions: the text model picks by entity, not position."""
+        try:
+            number, helper = self._gen_text(
+                state,
+                step,
+                {
+                    "goal": goal,
+                    "field": field,
+                    "typed": typed,
+                    "options": [{"n": index + 1, "text": text} for index, text in enumerate(choices)],
+                },
+                PICK_OPTION_VALUE,
+                "tiebreak",
+            )
+        except (ValueError, RuntimeError):
+            return None
+        state["text_calls"].append({**helper, "field": "option tiebreak", "value": number})
+        match = re.search(r"\d+", number or "")
+        if not match:
+            return None
+        index = int(match.group(0)) - 1
+        return index if 0 <= index < len(choices) else None
 
     def _validated_navigate_url(self, state, text, todo, step):
         """The model's URL, unless it revisits a seen page or a blocked host. Then a search fallback."""

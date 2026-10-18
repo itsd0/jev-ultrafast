@@ -8,7 +8,7 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import quote
 
-from jev_ultrafast.browser import Browser, StalePage
+from jev_ultrafast.browser import Browser, StalePage, combo_options_expression
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures"
 
@@ -346,12 +346,18 @@ def main():
         page = browser.observe(screenshot=False)
         city = next(a for a in page["actions"] if a.get("kind") == "fill" and a.get("label") == "Destination")
         result = browser.act(city, page, text="Xyz")
-        assert result.get("commit") == "arrow-enter", result
-        assert result.get("committed") is False, result
-        assert result.get("reverted") is True, result
-        assert result.get("retried") is True, result
-        assert browser.evaluate("document.querySelector('#city').value") == "Lisbon, Portugal"
-        passed.append("unmatched typing reverts on blur without committing a wrong option")
+        assert result.get("commit") == "keep-typed", result
+        assert result.get("picked") is None, result
+        assert result.get("committed") is True, result
+        assert result.get("retried") is False, result
+        assert browser.evaluate("document.querySelector('#city').value") == "Xyz"
+        passed.append("unmatched typing keeps its value without clicking a wrong option")
+        browser.evaluate("document.querySelector('#city').value=''; document.querySelector('#city').focus()")
+        browser.call("Input.insertText", text="L")
+        shown = browser.evaluate(combo_options_expression())
+        assert any(option.get("secondary") == "City in Portugal" for option in shown), shown
+        assert all("\n" not in (option.get("label") or "") for option in shown), shown
+        passed.append("listbox options expose first-line labels and secondary text")
 
         class Quiet(SimpleHTTPRequestHandler):
             def log_message(self, *_args):

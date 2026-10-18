@@ -21,6 +21,12 @@ Use the user's entire goal, field values, nearby text, and recent actions. This 
 a target for that operation; another question decides which operation to execute. Do not choose
 a field that already contains the requested value. Choose only an offered element index."""
 
+PICK_OPTION_VALUE = """Return a JSON object with exactly one key, text: the number of the best option.
+The user typed text into a field and several suggestions tied on match score. Choose the
+suggestion that names the entity the goal and field ask for (for example, a city for a
+destination, not a hotel that happens to contain the typed words). Reply with only the
+option number, like {"text": "2"}. No commentary, code, or browser actions."""
+
 TEXT_VALUE = """Return a JSON object with exactly one key, text: the exact string to enter in the selected field.
 Infer the value from the original goal and field meaning, using current page context and history.
 For dates output the date only, without a weekday (for example "June 12 2027").

@@ -70,6 +70,37 @@ def cloud_browser(monkeypatch, calls):
     return Browser("https://example.test/"), ensured
 
 
+def test_local_run_uses_a_fresh_browser_context(monkeypatch):
+    calls = []
+
+    def call(method, **params):
+        calls.append((method, params))
+        if method == "Target.createBrowserContext":
+            return {"browserContextId": "ctx1"}
+        if method == "Target.createTarget":
+            return {"targetId": "t1"}
+        if method == "Target.attachToTarget":
+            return {"sessionId": "s1"}
+        if method == "Runtime.evaluate":
+            return {"result": {"value": "complete"}}
+        return {}
+
+    monkeypatch.setattr(browser_module, "cdp", call)
+    monkeypatch.setattr(browser_module, "ensure_daemon", lambda: None)
+    monkeypatch.delenv("JEV_BROWSER", raising=False)
+    monkeypatch.delenv("JEV_VISIBLE_TAB", raising=False)
+    monkeypatch.delenv("JEV_UPLOAD_FILES", raising=False)
+    tab = Browser("https://example.test/")
+    try:
+        create = next(params for method, params in calls if method == "Target.createTarget")
+        assert create["browserContextId"] == "ctx1"
+        assert create["newWindow"] is True
+    finally:
+        tab.close()
+    dispose = [params for method, params in calls if method == "Target.disposeBrowserContext"]
+    assert dispose == [{"browserContextId": "ctx1"}]
+
+
 def test_default_is_local_and_uses_ensure_daemon(local_browser, monkeypatch, fake_cloud):
     started, _ = fake_cloud
     calls, ensured = local_browser

@@ -15,9 +15,45 @@ def options(*labels):
 def test_match_prefers_exact_then_prefix_then_tokens():
     opts = options("Lisbon Falls, Maine", "Lisbon, Portugal", "Lismore, Australia")
     assert match_combobox_option("Lisbon, Portugal", opts)["label"] == "Lisbon, Portugal"
-    assert match_combobox_option("Lisbon", opts)["label"] == "Lisbon Falls, Maine"  # prefix tie: first
-    assert match_combobox_option("portugal lisbon", opts)["label"] == "Lisbon, Portugal"  # all tokens
-    assert match_combobox_option("maine boston", opts)["label"] == "Lisbon Falls, Maine"  # any token
+    # First-segment scoring: the bare city beats the longer name, not list order.
+    assert match_combobox_option("Lisbon", opts)["label"] == "Lisbon, Portugal"
+    assert match_combobox_option("portugal lisbon", opts)["label"] == "Lisbon, Portugal"  # any token
+    # "Maine" lives in the second segment: first-segment scoring finds no match.
+    assert match_combobox_option("maine boston", opts) is None
+
+
+def test_match_prefers_city_over_hotel_history_row():
+    opts = [
+        {"label": "lisbon marriott hotel", "x": 1.0, "y": 1.0},
+        {"label": "Lisbon", "secondary": "City in Portugal", "x": 2.0, "y": 2.0},
+    ]
+    goal = "On Google Hotels, search hotels in Lisbon for June 12 to June 19 2027"
+    assert match_combobox_option("lisbon", opts, goal, "Destination")["label"] == "Lisbon"
+
+
+def test_match_prefers_named_hotel_when_goal_names_it():
+    opts = [
+        {"label": "lisbon marriott hotel", "x": 1.0, "y": 1.0},
+        {"label": "Lisbon", "secondary": "City in Portugal", "x": 2.0, "y": 2.0},
+    ]
+    assert match_combobox_option(
+        "lisbon marriott", opts, "book the Lisbon Marriott Hotel", "Destination"
+    )["label"] == "lisbon marriott hotel"
+
+
+def test_match_near_tie_goes_to_the_tiebreak():
+    first = {"label": "Lisbon Inn", "secondary": "Hotel", "x": 1.0, "y": 1.0}
+    second = {"label": "Lisbon", "x": 2.0, "y": 2.0}
+    seen = {}
+
+    def tiebreak(typed, texts, goal, field):
+        seen["texts"] = texts
+        return 1
+
+    picked = match_combobox_option("lisb", [first, second], "", "Destination", tiebreak)
+    assert seen["texts"] == ["Lisbon", "Lisbon Inn"]
+    assert picked is first
+    assert match_combobox_option("lisb", [first, second], "", "Destination") is second
 
 
 def test_match_skips_empties_and_rejects_non_matches():
@@ -70,13 +106,13 @@ def test_commit_clicks_the_best_option(monkeypatch):
     )
     result = commit_combobox(call, evaluate, {"role": "combobox", "node": 3}, "Lisbon", "Porto")
     assert result["commit"] == "option-click"
-    assert result["picked"] == "Lisbon Falls, Maine"
+    assert result["picked"] == "Lisbon, Portugal"
     assert result["committed"] is True and result["reverted"] is False and result["retried"] is False
     pressed = [params for method, params in calls if method == "Input.dispatchMouseEvent"]
     assert pressed and all(params["x"] == 10.0 for params in pressed)
 
 
-def test_commit_falls_back_to_arrow_down_enter(monkeypatch):
+def test_commit_keeps_typed_text_without_listbox(monkeypatch):
     call, evaluate, _calls = _combo_script(
         monkeypatch,
         states=[{"combo": True, "expanded": "false"}],
@@ -92,9 +128,72 @@ def test_commit_falls_back_to_arrow_down_enter(monkeypatch):
         return orig_call(method, **params)
 
     result = commit_combobox(recording_call, evaluate, {"role": "combobox", "node": 3}, "12/06", "06/01")
-    assert result["commit"] == "arrow-enter"
+    assert result["commit"] == "keep-typed"
     assert result["committed"] is True
-    assert keys[:2] == ["ArrowDown", "Enter"]
+    assert keys == []
+
+
+def test_commit_submits_search_box_without_listbox(monkeypatch):
+    call, evaluate, _calls = _combo_script(
+        monkeypatch,
+        states=[{"combo": True, "expanded": "false"}],
+        option_lists=[[] for _ in range(10)],
+        values=["usb-c hub"],
+    )
+    keys = []
+    orig_call = call
+
+    def recording_call(method, **params):
+        if method == "Input.dispatchKeyEvent" and params.get("type") == "keyDown":
+            keys.append(params.get("key"))
+        return orig_call(method, **params)
+
+    result = commit_combobox(
+        recording_call, evaluate, {"role": "searchbox", "node": 3}, "usb-c hub", ""
+    )
+    assert result["commit"] == "keep-typed"
+    assert result["committed"] is True
+    assert keys == ["Enter"]
+
+
+def test_commit_empty_search_box_presses_nothing(monkeypatch):
+    call, evaluate, _calls = _combo_script(
+        monkeypatch,
+        states=[{"combo": True, "expanded": "false"}],
+        option_lists=[[] for _ in range(10)],
+        values=[""],
+    )
+    keys = []
+    orig_call = call
+
+    def recording_call(method, **params):
+        if method == "Input.dispatchKeyEvent" and params.get("type") == "keyDown":
+            keys.append(params.get("key"))
+        return orig_call(method, **params)
+
+    result = commit_combobox(recording_call, evaluate, {"role": "searchbox", "node": 3}, "", "")
+    assert result["committed"] is False
+    assert keys == []
+
+
+def test_commit_rejects_extra_tokens_and_retries_next_best(monkeypatch):
+    inn = {"label": "Lisbon Inn", "secondary": "Hotel", "x": 1.0, "y": 1.0}
+    city = {"label": "Lisbon", "x": 2.0, "y": 2.0}
+    call, evaluate, calls = _combo_script(
+        monkeypatch,
+        states=[{"combo": True, "expanded": "true"}],
+        option_lists=[[inn, city], [inn, city], [inn, city]],
+        values=["Lisbon Inn", "Lisbon Inn", "Lisbon"],
+    )
+    result = commit_combobox(
+        call, evaluate, {"role": "combobox", "node": 3, "label": "Destination"},
+        "lisb", "Porto", "", lambda *_args: 1,
+    )
+    assert result["commit"] == "option-click"
+    assert result["picked"] == "Lisbon"
+    assert result["committed"] is True and result["retried"] is True
+    pressed = [params["x"] for method, params in calls if method == "Input.dispatchMouseEvent"]
+    assert pressed[0] == 1.0 and pressed[-1] == 2.0
 
 
 def test_revert_retries_once_without_a_wrong_click(monkeypatch):
@@ -109,6 +208,33 @@ def test_revert_retries_once_without_a_wrong_click(monkeypatch):
     assert result["picked"] is None
     assert result["reverted"] is True and result["retried"] is True
     assert result["committed"] is False
+
+
+def test_plain_search_box_keeps_its_value(monkeypatch):
+    call, evaluate, calls = _combo_script(
+        monkeypatch,
+        states=[{"combo": False}],
+        option_lists=[],
+        values=[],
+    )
+    result = commit_combobox(call, evaluate, {"role": "searchbox", "node": 3}, "usb-c hub", "")
+    assert result == {}
+    assert calls == []
+
+
+def test_pick_option_parses_model_choice(monkeypatch):
+    agent = loop.Agent.__new__(loop.Agent)
+    agent.pending_text = None
+    agent.trace = Trace(run_id="test-pick", level=0)
+    agent.state = {"text_calls": []}
+    monkeypatch.setattr(loop, "field_text", Mock(return_value=("2", {"model": "t", "latency_ms": 1})))
+    assert agent._pick_option(agent.state, 1, "lisbon", ["Lisbon", "Lisbon Inn"], "g", "f") == 1
+    monkeypatch.setattr(loop, "field_text", Mock(return_value=("nope", {"model": "t", "latency_ms": 1})))
+    assert agent._pick_option(agent.state, 1, "lisbon", ["Lisbon"], "g", "f") is None
+    monkeypatch.setattr(loop, "field_text", Mock(return_value=("9", {"model": "t", "latency_ms": 1})))
+    assert agent._pick_option(agent.state, 1, "lisbon", ["Lisbon"], "g", "f") is None
+    monkeypatch.setattr(loop, "field_text", Mock(side_effect=ValueError("invalid field text")))
+    assert agent._pick_option(agent.state, 1, "lisbon", ["Lisbon"], "g", "f") is None
 
 
 def test_stale_field_reports_an_uncommitted_commit(monkeypatch):

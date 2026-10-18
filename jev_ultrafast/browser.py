@@ -44,6 +44,7 @@ class Browser:
         self._ready_after_act = False
         self.cloud = None
         self.cdp_counter = {"calls": 0, "ms": 0.0}
+        self.context = None
         cloud_mode = self.config.get("browser") == "cloud"
         if cloud_mode:
             # The cloud daemon is already attached. ensure_daemon() would spawn a
@@ -51,15 +52,27 @@ class Browser:
             self.cloud = cloud.start(self.config)
         else:
             ensure_daemon()
+            # A fresh context per run: history suggestions and cookies from the
+            # shared profile never leak into a run's comboboxes. Falls back to
+            # the default context when the daemon predates the command.
+            try:
+                response = cdp("Target.createBrowserContext")
+                self.context = response.get("browserContextId") if isinstance(response, dict) else None
+            except Exception as error:
+                get_logger("browser").warning(f"[jev:browser] no fresh context ({error}); using shared profile")
+                self.context = None
         try:
             visible_env = os.environ.get("JEV_VISIBLE_TAB")
             if visible_env is None or not visible_env.strip():
                 visible = cloud_mode
             else:
                 visible = visible_env.strip().lower() in {"1", "true", "yes", "on"}
-            self.target = cdp(
-                "Target.createTarget", url="about:blank", background=not visible, newWindow=False
-            )["targetId"]
+            params = {"url": "about:blank", "background": not visible, "newWindow": False}
+            if self.context:
+                # A context cannot share the user's window: the run gets its own.
+                params["browserContextId"] = self.context
+                params["newWindow"] = True
+            self.target = cdp("Target.createTarget", **params)["targetId"]
             self.session = cdp("Target.attachToTarget", targetId=self.target, flatten=True)["sessionId"]
             if visible:
                 cdp("Target.activateTarget", targetId=self.target)
@@ -509,7 +522,7 @@ class Browser:
         self.evaluate("history.back()")
         self.after_input = None
 
-    def act(self, action, page, text=None):
+    def act(self, action, page, text=None, goal=None, tiebreak=None):
         cloud_mode = (getattr(self, "config", None) or {}).get("browser") == "cloud"
         self.settle_dom()
         probe = None
@@ -546,6 +559,8 @@ class Browser:
             "keyboard": (getattr(self, "config", None) or {}).get("keyboard", True),
             "probe": probe,
             "verify_wait": cloud_mode,
+            "goal": goal or "",
+            "tiebreak": tiebreak,
             "counter": getattr(self, "cdp_counter", None),
         })
         if result.get("ready"):
@@ -564,6 +579,12 @@ class Browser:
             for target in targets:
                 try:
                     cdp("Target.closeTarget", targetId=target)
+                except RuntimeError:
+                    pass
+            context, self.context = self.context, None
+            if context:
+                try:
+                    cdp("Target.disposeBrowserContext", browserContextId=context)
                 except RuntimeError:
                     pass
         finally:
@@ -1088,37 +1109,121 @@ def _verify_value(call, evaluate, action, expected, previous, actual):
     return result
 
 
-def match_combobox_option(typed, options):
-    """Best listbox option for typed text: exact, prefix, all-tokens, any-token.
+_TOKEN_STOPWORDS = frozenset("the a an to of and for on in with or by from".split())
 
-    Ties go to the first option. Empty labels never match, and a list with no
-    match returns None: committing a wrong value is worse than no commit.
+
+def _stem(word):
+    if word.endswith("s") and len(word) > 3 and not word.endswith("ss"):
+        return word[:-1]
+    return word
+
+
+def _combo_words(text):
+    folded = unicodedata.normalize("NFKD", (text or "").lower())
+    stripped = "".join(char for char in folded if not unicodedata.combining(char))
+    return {word for word in re.findall(r"[a-z0-9]+", stripped) if len(word) > 1}
+
+
+def _significant_tokens(text):
+    """Stemmed content tokens: stopwords and bare numbers are not distinctive."""
+    return {
+        _stem(word)
+        for word in _combo_words(text)
+        if word not in _TOKEN_STOPWORDS and not word.isdigit()
+    }
+
+
+def _first_segment(label):
+    return re.split(r",|·|\n| - ", label or "", maxsplit=1)[0].strip()
+
+
+def _extra_tokens(first, typed, pool):
+    """First-segment tokens the typed text and goal/field do not imply.
+
+    A token is covered by exact/stem match, or when the typed text is a
+    prefix fragment of it ("lisb" typed for "Lisbon").
     """
-    words = {word for word in re.findall(r"[a-z0-9]+", (typed or "").lower()) if len(word) > 1}
+    typed_words = _combo_words(typed)
+    allowed = _significant_tokens(typed) | set(pool)
+    return {
+        token
+        for token in _significant_tokens(first)
+        if token not in allowed and not any(token.startswith(word) for word in typed_words)
+    }
+
+
+def rank_combobox_options(typed, options, goal="", field=""):
+    """Score listbox options by entity, best first. Stable: exact ties keep list order.
+
+    Scoring uses the option's first segment (before any comma, middle dot,
+    newline, or " - "): exact 3, prefix 2, all-typed-tokens 1, any-token 0.5.
+    Extra distinctive tokens cost 0.5 each unless the typed text or goal
+    implies them; rich rows gain 0.3 for secondary text and 0.5 more when it
+    agrees with the goal or field on a type word.
+    """
     target = (typed or "").strip().lower()
-    best, best_score = None, 0
+    words = _combo_words(typed)
+    pool = _significant_tokens(f"{goal} {field}")
+    typed_sig = _significant_tokens(typed)
+    ranked = []
     for option in options or []:
         label = (option.get("label") or "").strip()
         if not label:
             continue
-        low = label.lower()
+        low = _first_segment(label).lower()
         if target and low == target:
-            score = 3
+            score = 3.0
         elif target and low.startswith(target):
-            score = 2
+            score = 2.0
         elif words:
-            held = set(re.findall(r"[a-z0-9]+", low))
+            held = _combo_words(_first_segment(label))
             if words <= held:
-                score = 1
+                score = 1.0
             elif words & held:
                 score = 0.5
             else:
                 continue
         else:
             continue
-        if score > best_score:
-            best, best_score = option, score
-    return best
+        extra = _extra_tokens(_first_segment(label), typed, pool)
+        score -= 0.5 * len(extra)
+        secondary = (option.get("secondary") or "").strip()
+        if secondary:
+            score += 0.3
+            if _significant_tokens(secondary) & (pool - typed_sig):
+                score += 0.5
+        ranked.append((score, option))
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    return ranked
+
+
+def has_extra_tokens(value, typed, goal=""):
+    """The committed value names a different entity than the typed text.
+
+    Only the first segment counts: qualifier segments ("Lisbon, Portugal")
+    and added years are benign expansion, not a wrong entity.
+    """
+    return bool(_extra_tokens(_first_segment(value), typed, _significant_tokens(goal)))
+
+
+def match_combobox_option(typed, options, goal="", field="", tiebreak=None):
+    """Best listbox option for typed text. A near-tie (top two within 0.25)
+    goes to the tiebreak callback over up to 8 option texts; without one the
+    first top score wins. No match returns None: a wrong commit is worse.
+    """
+    ranked = rank_combobox_options(typed, options, goal, field)
+    if not ranked:
+        return None
+    if len(ranked) > 1 and ranked[0][0] - ranked[1][0] <= 0.25 and tiebreak is not None:
+        texts = [(option.get("label") or "") for _, option in ranked[:8]]
+        try:
+            pick = tiebreak(typed, texts, goal, field)
+        except Exception as error:
+            get_logger("browser").info(f"[jev:commit] tiebreak failed ({error}); keeping top score")
+            pick = None
+        if isinstance(pick, int) and not isinstance(pick, bool) and 0 <= pick < len(texts):
+            return ranked[pick][1]
+    return ranked[0][1]
 
 
 def combo_state_expression(action):
@@ -1137,7 +1242,7 @@ def combo_state_expression(action):
 
 
 def combo_options_expression():
-    """Visible listbox options with labels and centers. Capped at twelve."""
+    """Visible listbox options with labels, secondary text, and centers. Capped at twelve."""
     return (
         "/*__jevComboOptions*/(() => { const out=[]; "
         "for (const box of document.querySelectorAll('[role=\"listbox\"]')) { "
@@ -1145,8 +1250,11 @@ def combo_options_expression():
         "for (const o of box.querySelectorAll('[role=\"option\"]')) { "
         "const q=o.getBoundingClientRect(); "
         "if (!q.width || !q.height || q.bottom<=0 || q.top>=innerHeight) continue; "
-        "const label=(o.innerText||'').trim().slice(0,80); if (!label) continue; "
-        "out.push({label, x:q.x+q.width/2, y:q.y+q.height/2}); if (out.length>=12) break; } } "
+        "const label=(o.innerText||'').split('\\n')[0].trim().slice(0,80); if (!label) continue; "
+        "const kids=[...o.children].map(c=>(c.innerText||'').trim()).filter(Boolean); "
+        "const secondary=kids.slice(1).join(' ').trim().slice(0,80); "
+        "out.push({label, secondary, x:q.x+q.width/2, y:q.y+q.height/2}); "
+        "if (out.length>=12) break; } } "
         "return out; })()"
     )
 
@@ -1160,70 +1268,115 @@ def combo_focus_expression(action):
     )
 
 
-def commit_combobox(call, evaluate, action, typed, previous=None):
+def _commit_ok(typed, final, previous, goal):
+    """The committed value is the typed entity: semantically equal, no extra tokens.
+
+    Dates compare by date (an added year is completion, not a wrong entity);
+    other values must add no distinctive first-segment token the goal lacks.
+    """
+    if not isinstance(final, str) or not final or not (typed or "").strip():
+        return False
+    kind = _compare_values(typed, final, _numeric_order(previous))
+    if kind is None:
+        return False
+    return kind == "same_date" or not has_extra_tokens(final, typed, goal)
+
+
+def _read_combo_options(evaluate, rounds):
+    for _ in range(rounds):
+        options = [o for o in (evaluate(combo_options_expression()) or []) if isinstance(o, dict)]
+        if options:
+            return options
+        time.sleep(0.1)
+    return []
+
+
+def _click_option(call, option):
+    for event in ("mousePressed", "mouseReleased"):
+        call("Input.dispatchMouseEvent", type=event, x=option["x"], y=option["y"],
+             button="left", clickCount=1)
+
+
+def commit_combobox(call, evaluate, action, typed, previous=None, goal="", tiebreak=None):
     """Commit a combobox value after typing. Plain fields return {}.
 
     An uncommitted combobox reverts on blur, so typing alone is not done: wait
-    for the listbox and click the best-matching option, or press ArrowDown and
-    Enter when no listbox appears. Blur once to detect a revert, then retry a
-    single time with an explicit option click. Each stage is a distinct
-    strategy, never a repeated mutation.
+    for the listbox and click the best-matching option. With no listbox the
+    typed value is kept as-is (Enter only submits a non-empty search box);
+    ArrowDown and Tab would clear the field. Blur once to detect a revert,
+    then retry a single time with the next-best option. Each stage is a
+    distinct strategy, never a repeated mutation.
     """
     if action.get("role") not in {"combobox", "textbox", "searchbox"}:
         return {}
     state = evaluate(combo_state_expression(action))
     if not isinstance(state, dict):
         return {"commit": "stale", "committed": False}
+    field = action.get("label") or ""
     options = []
-    for _ in range(6 if state.get("combo") else 1):
-        options = [o for o in (evaluate(combo_options_expression()) or []) if isinstance(o, dict)]
-        if options or not state.get("combo"):
-            break
-        time.sleep(0.1)
-    commit, picked = None, None
-    if options:
-        picked = match_combobox_option(typed, options)
-        if picked is not None:
-            for event in ("mousePressed", "mouseReleased"):
-                call("Input.dispatchMouseEvent", type=event, x=picked["x"], y=picked["y"],
-                     button="left", clickCount=1)
-            commit = "option-click"
-        else:
-            commit = "no-match"
-    elif state.get("combo"):
-        dispatch_key(call, "ArrowDown")
-        dispatch_key(call, "Enter")
-        commit = "arrow-enter"
-    else:
+    if state.get("combo"):
+        options = _read_combo_options(evaluate, 6)
+    if not options and state.get("combo"):
+        # No listbox: keep the typed value. Only a search box is submitted,
+        # and only when non-empty; Tab would clear an uncommitted field.
+        value = evaluate(field_value_expression(action))
+        if value and action.get("role") == "searchbox":
+            dispatch_key(call, "Enter")
+        return {
+            "commit": "keep-typed",
+            "picked": None,
+            "committed": _commit_ok(typed, value, previous, goal),
+            "committed_value": value,
+            "reverted": False,
+            "retried": False,
+        }
+    if not options:
         return {}
+    commit, picked = None, None
+    picked = match_combobox_option(typed, options, goal, field, tiebreak)
+    if picked is not None:
+        _click_option(call, picked)
+        commit = "option-click"
+    else:
+        commit = "no-match"
     time.sleep(0.15)
     first = evaluate(field_value_expression(action))
     dispatch_key(call, "Tab")
     time.sleep(0.15)
     final = evaluate(field_value_expression(action))
     reverted = first != previous and final == previous and first != final
-    committed = bool(final) and bool((typed or "").strip()) and (typed or "").strip().lower() in str(final).lower()
+    committed = _commit_ok(typed, final, previous, goal)
     retried = False
     if not committed:
-        # One explicit retry: refocus, reopen, click the match if one exists.
+        # One retry with the next-best option: refocus, clear the rejected
+        # value so the reopened list is unfiltered, click another match.
+        # A lone option is re-clicked: the first click may simply have missed.
         retried = True
+        rejected = {(picked or {}).get("label")}
         if evaluate(combo_focus_expression(action)):
+            modifier = 4 if sys.platform == "darwin" else 2
+            call(
+                "Input.dispatchKeyEvent",
+                type="keyDown", key="a", code="KeyA", modifiers=modifier,
+                commands=["selectAll"],
+            )
+            call("Input.dispatchKeyEvent", type="keyUp", key="a", code="KeyA", modifiers=modifier)
+            dispatch_key(call, "Backspace")
             dispatch_key(call, "ArrowDown")
-            for _ in range(4):
-                options = [o for o in (evaluate(combo_options_expression()) or []) if isinstance(o, dict)]
-                if options:
-                    break
-                time.sleep(0.1)
-            retry_pick = match_combobox_option(typed, options) if options else None
+            reopened = _read_combo_options(evaluate, 4)
+            ranked = rank_combobox_options(typed, reopened, goal, field)
+            retry_pick = next(
+                (option for _, option in ranked if option.get("label") not in rejected), None
+            )
+            if retry_pick is None:
+                retry_pick = next((option for _, option in ranked), None)
             if retry_pick is not None:
                 picked = retry_pick
-                for event in ("mousePressed", "mouseReleased"):
-                    call("Input.dispatchMouseEvent", type=event, x=picked["x"], y=picked["y"],
-                         button="left", clickCount=1)
+                _click_option(call, picked)
                 commit = "option-click"
                 time.sleep(0.15)
                 final = evaluate(field_value_expression(action))
-                committed = bool(final) and (typed or "").strip().lower() in str(final).lower()
+                committed = _commit_ok(typed, final, previous, goal)
     return {
         "commit": commit or "none",
         "picked": (picked or {}).get("label"),
@@ -1581,7 +1734,10 @@ def browser_operation(request):
                             )
                         )
                         extra.update(
-                            commit_combobox(call, evaluate, action, request.get("text") or "", previous)
+                            commit_combobox(
+                                call, evaluate, action, request.get("text") or "", previous,
+                                request.get("goal") or "", request.get("tiebreak"),
+                            )
                         )
         return {"executed": action["id"], **extra}
 

@@ -59,19 +59,24 @@
     };
   }
   const city = document.querySelector('#city'), cities = document.querySelector('#cities');
-  const PLACES = ['Lisbon, Portugal', 'Lisbon Falls, Maine', 'Lismore, Australia'];
+  const PLACES = [
+    ['Lisbon, Portugal', 'City in Portugal'],
+    ['Lisbon Falls, Maine', 'Town in Maine'],
+    ['Lismore, Australia', 'City in Australia'],
+  ];
   let committed = true, lastGood = 'Porto';
   city.addEventListener('input', () => {
     committed = false;
     const query = city.value.toLowerCase();
-    const matches = PLACES.filter(place => place.toLowerCase().includes(query));
-    cities.innerHTML = matches.map(place => `<div role="option" tabindex="-1">${place}</div>`).join('');
+    const matches = PLACES.filter(([place]) => place.toLowerCase().includes(query));
+    cities.innerHTML = matches.map(([place, sub]) =>
+      `<div role="option" tabindex="-1"><div>${place}</div><div>${sub}</div></div>`).join('');
     cities.hidden = matches.length === 0;
     city.setAttribute('aria-expanded', matches.length ? 'true' : 'false');
     for (const option of cities.querySelectorAll('[role="option"]')) {
       // mousedown beats the field's blur, like production autocompletes.
       option.onmousedown = () => {
-        city.value = option.textContent;
+        city.value = option.innerText.split('\n')[0];
         committed = true;
         lastGood = city.value;
         cities.hidden = true;
