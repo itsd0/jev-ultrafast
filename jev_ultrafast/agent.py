@@ -1073,6 +1073,7 @@ class Agent:
         large_select=None,
         select_inline_max=None,
         vision=None,
+        browser=None,
     ):
         task = goals.strip() if isinstance(goals, str) else "\n".join(goals).strip()
         if not task:
@@ -1091,7 +1092,8 @@ class Agent:
             select_inline_max=select_inline_max,
             vision=vision,
         )
-        self.browser = Browser(url, config=self.config)
+        self._owns_browser = browser is None
+        self.browser = browser if browser is not None else Browser(url, config=self.config)
         self.record_dir = Path(record_dir) if record_dir else None
         self.screenshots = screenshots or bool(record_dir)
         self.log = get_logger("agent")
@@ -1107,7 +1109,8 @@ class Agent:
                 stack=traceback.format_exc(limit=5) if self.trace.level >= 2 else None,
             )
             self.trace.close()
-            self.browser.close()
+            if self._owns_browser:
+                self.browser.close()
             raise
         self.state = dict(
             browser=self.browser,
@@ -3011,12 +3014,15 @@ class Agent:
         while self.state["status"] not in {"done", "blocked"}:
             yield self.command("tick")
 
-    def close(self):
+    def close(self, keep_browser=False):
+        """Close the run. Sessions pass keep_browser so the browser outlives a turn."""
         try:
             trace = getattr(self, "trace", None)
             if trace is not None:
                 trace.close()
         finally:
+            if keep_browser or not getattr(self, "_owns_browser", True):
+                return
             try:
                 self.browser.close()
             finally:

@@ -21,7 +21,7 @@ from browser_harness import admin as harness_admin
 from browser_harness import helpers as harness_helpers
 
 from .agent import Agent
-from .browser import full_text_expression
+from .browser import Browser, full_text_expression
 from .config import env_bool
 from .demo import load_environment
 from .model import redact_secrets, token_counts
@@ -76,6 +76,39 @@ CREATE TABLE IF NOT EXISTS events (
     data TEXT NOT NULL,
     PRIMARY KEY (task_id, seq)
 );
+CREATE TABLE IF NOT EXISTS sessions (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    browser TEXT NOT NULL,
+    status TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    last_active_at REAL NOT NULL,
+    total_input_tokens INTEGER NOT NULL DEFAULT 0,
+    total_output_tokens INTEGER NOT NULL DEFAULT 0,
+    total_cost_usd REAL NOT NULL DEFAULT 0,
+    share_token TEXT,
+    last_url TEXT,
+    last_tabs TEXT
+);
+CREATE TABLE IF NOT EXISTS messages (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(id),
+    n INTEGER NOT NULL,
+    user_text TEXT NOT NULL,
+    agent_reply TEXT,
+    status TEXT NOT NULL,
+    run_id TEXT,
+    created_at REAL NOT NULL,
+    ended_at REAL,
+    input_tokens INTEGER,
+    output_tokens INTEGER,
+    cost_usd_estimate REAL,
+    duration_ms INTEGER,
+    error TEXT,
+    blocked_reason TEXT,
+    partial INTEGER
+);
+CREATE INDEX IF NOT EXISTS messages_session ON messages(session_id, n);
 """
 
 
@@ -178,6 +211,149 @@ class Store:
              "data": json.loads(row[4])}
             for row in rows
         ]
+
+    def create_session(self, title, browser):
+        session_id = uuid.uuid4().hex
+        now = time.time()
+        with self.lock:
+            self.conn.execute(
+                "INSERT INTO sessions (id, title, browser, status, created_at, last_active_at)"
+                " VALUES (?, ?, ?, 'active', ?, ?)",
+                (session_id, title, browser, now, now),
+            )
+            self.conn.commit()
+        return session_id
+
+    def get_session(self, session_id, with_steps=True):
+        with self.lock:
+            row = self.conn.execute(
+                "SELECT * FROM sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+            if row is None:
+                return None
+            session = dict(row)
+            try:
+                session["last_tabs"] = json.loads(session.get("last_tabs") or "[]")
+            except ValueError:
+                session["last_tabs"] = []
+            messages = [
+                dict(r) for r in self.conn.execute(
+                    "SELECT * FROM messages WHERE session_id = ? ORDER BY n", (session_id,)
+                )
+            ]
+            if with_steps:
+                for message in messages:
+                    run_id = message.get("run_id")
+                    message["steps"] = [dict(r) for r in self.conn.execute(
+                        "SELECT n, operation, target_label, url, ms, note FROM steps"
+                        " WHERE task_id = ? ORDER BY n",
+                        (run_id,),
+                    )] if run_id else []
+        session["messages"] = messages
+        return session
+
+    def list_sessions(self, limit=50):
+        with self.lock:
+            rows = self.conn.execute(
+                "SELECT s.*, (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id)"
+                " AS message_count FROM sessions s ORDER BY last_active_at DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        sessions = []
+        for row in rows:
+            session = dict(row)
+            session.pop("last_tabs", None)
+            sessions.append(session)
+        return sessions
+
+    def update_session(self, session_id, **fields):
+        if not fields:
+            return
+        names = ", ".join(f"{key} = ?" for key in fields)
+        with self.lock:
+            self.conn.execute(
+                f"UPDATE sessions SET {names} WHERE id = ?", (*fields.values(), session_id)
+            )
+            self.conn.commit()
+
+    def delete_session(self, session_id):
+        with self.lock:
+            runs = [
+                r[0] for r in self.conn.execute(
+                    "SELECT run_id FROM messages WHERE session_id = ? AND run_id IS NOT NULL",
+                    (session_id,),
+                )
+            ]
+            for run_id in runs:
+                self.conn.execute("DELETE FROM steps WHERE task_id = ?", (run_id,))
+                self.conn.execute("DELETE FROM events WHERE task_id = ?", (run_id,))
+            self.conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
+            self.conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+            self.conn.commit()
+
+    def create_message(self, session_id, user_text):
+        message_id = uuid.uuid4().hex
+        with self.lock:
+            row = self.conn.execute(
+                "SELECT COALESCE(MAX(n), 0) + 1 FROM messages WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            self.conn.execute(
+                "INSERT INTO messages (id, session_id, n, user_text, status, created_at)"
+                " VALUES (?, ?, ?, ?, 'queued', ?)",
+                (message_id, session_id, row[0], user_text, time.time()),
+            )
+            self.conn.execute(
+                "UPDATE sessions SET last_active_at = ?, status = 'active' WHERE id = ?",
+                (time.time(), session_id),
+            )
+            self.conn.commit()
+        return message_id
+
+    def get_message(self, message_id):
+        with self.lock:
+            row = self.conn.execute(
+                "SELECT * FROM messages WHERE id = ?", (message_id,)
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def update_message(self, message_id, **fields):
+        if not fields:
+            return
+        names = ", ".join(f"{key} = ?" for key in fields)
+        with self.lock:
+            self.conn.execute(
+                f"UPDATE messages SET {names} WHERE id = ?", (*fields.values(), message_id)
+            )
+            self.conn.commit()
+
+    def session_messages(self, session_id):
+        with self.lock:
+            rows = self.conn.execute(
+                "SELECT user_text, agent_reply, status FROM messages"
+                " WHERE session_id = ? ORDER BY n",
+                (session_id,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def usage_by_day(self, days=30):
+        """Totals per day for the Usage page. Costs roll up from messages."""
+        with self.lock:
+            rows = self.conn.execute(
+                "SELECT date(m.created_at, 'unixepoch') AS day,"
+                " COUNT(DISTINCT m.session_id) AS sessions,"
+                " COUNT(DISTINCT CASE WHEN m.status IN ('done', 'blocked', 'failed')"
+                " THEN m.id END) AS turns,"
+                " COALESCE(SUM(m.input_tokens + m.output_tokens), 0) AS tokens,"
+                " COALESCE(SUM(m.cost_usd_estimate), 0) AS cost,"
+                " (SELECT COUNT(*) FROM steps s JOIN messages m2 ON s.task_id = m2.run_id"
+                "  WHERE date(m2.created_at, 'unixepoch')"
+                "  = date(m.created_at, 'unixepoch')) AS steps"
+                " FROM messages m WHERE m.created_at >= strftime('%s', 'now', ?)"
+                " GROUP BY day ORDER BY day DESC",
+                (f"-{int(days)} days",),
+            ).fetchall()
+        return [dict(r) for r in rows]
 
 
 def tally_tokens(snapshot):
@@ -644,6 +820,534 @@ class Runner:
                 self._cond.notify()
             if entry is not None and entry.get("viewer") is not None:
                 entry["viewer"].shutdown()
+
+
+def session_title(text):
+    """A chat title from the first message: first line, capped, no newlines."""
+    title = (text or "").strip().splitlines()[0:1]
+    title = title[0] if title else "New session"
+    return title if len(title) <= 60 else title[:57] + "..."
+
+
+def session_tabs(browser):
+    """Live tab list for context and the tab strip. Titles arrive in the tabs pass."""
+    tabs = getattr(browser, "tabs", None) or {}
+    active = getattr(browser, "active", None)
+    return [
+        {"key": key, "url": tab.get("url") or "", "title": "", "active": key == active}
+        for key, tab in tabs.items()
+    ]
+
+
+def session_context(prior, url, tabs, message):
+    """The goal a follow-up runs with: past turns plus where the browser is."""
+    lines = []
+    for turn in (prior or [])[-4:]:
+        lines.append(f"- They asked: {(turn.get('user_text') or '')[:300]}")
+        if turn.get("agent_reply"):
+            lines.append(f"  You did: {(turn['agent_reply'] or '')[:300]}")
+    lines.append(f"Current page: {url or 'a blank page'}.")
+    if tabs:
+        lines.append("Open tabs: " + ", ".join(
+            f"{tab['key']}{'*' if tab['active'] else ''} {tab['url'] or 'blank'}"
+            for tab in tabs
+        ))
+    context = "Session so far:\n" + "\n".join(lines)
+    return f"{context}\n\nNew request: {message}" if prior else message
+
+
+def _first_sentences(text, limit=2, cap=500):
+    short = " ".join((text or "").split())
+    if not short:
+        return ""
+    parts, current = [], ""
+    for chunk in short.replace("! ", ". ").replace("? ", ". ").split(". "):
+        current = f"{current}. {chunk}".strip(". ") if current else chunk
+        parts.append(current)
+        if len(parts) >= limit:
+            break
+    reply = parts[-1] if parts else short
+    if not reply.endswith((".", "!", "?")):
+        reply += "."
+    return reply if len(reply) <= cap else reply[: cap - 3] + "..."
+
+
+def compose_reply(snapshot, status, error):
+    """One or two plain sentences from the run outcome. Never raw JSON."""
+    answer = (snapshot.get("answer") or "").strip()
+    if status == "done" and answer:
+        return _first_sentences(answer) or "Done."
+    if status == "done":
+        return "Done."
+    reason = snapshot.get("blocked_reason") or error or "I got stuck"
+    reason = str(reason).strip().rstrip(".")
+    if snapshot.get("partial") and answer:
+        return f"I couldn't fully finish ({reason}). So far: {_first_sentences(answer, limit=1)}"
+    if answer:
+        return f"I couldn't finish ({reason}). What I found: {_first_sentences(answer, limit=1)}"
+    return f"I couldn't finish ({reason})."
+
+
+class SessionBus:
+    """One session's SSE backlog. Bounded; replayable from any seq."""
+
+    def __init__(self, limit=500):
+        self.limit = limit
+        self.events = []
+        self.seq = 0
+        self.cond = threading.Condition()
+
+    def publish(self, event):
+        with self.cond:
+            self.seq += 1
+            self.events.append((self.seq, event))
+            del self.events[: max(0, len(self.events) - self.limit)]
+            self.cond.notify_all()
+        return self.seq
+
+    def replay(self, since=0):
+        with self.cond:
+            return [(seq, event) for seq, event in self.events if seq > since]
+
+
+class SessionRunner:
+    """Chat sessions. One browser per session, reused across messages.
+
+    Each message runs an Agent against the session browser with the goal set
+    to the message plus session context. Idle browsers close after
+    JEV_SESSION_IDLE_MIN minutes; cloud browsers always stop on close.
+    """
+
+    def __init__(self, store, max_concurrent=2, agent_factory=None, daemon_name=None,
+                 files_root=None, idle_min=None):
+        self.store = store
+        self.max_concurrent = max(1, int(max_concurrent))
+        self.agent_factory = agent_factory or Agent
+        self.pump = FramePump(daemon_name or os.environ.get("BU_NAME", "default"))
+        self.files_root = Path(files_root) if files_root else Path.cwd() / "artifacts" / "sessions"
+        if idle_min is None:
+            try:
+                idle_min = float(os.environ.get("JEV_SESSION_IDLE_MIN", "10") or 10)
+            except ValueError:
+                idle_min = 10
+        self.idle_min = max(0.05, idle_min)
+        self._sessions = {}
+        self._cond = threading.Condition()
+        self._running = 0
+        self._create_lock = threading.Lock()
+        reaper = threading.Thread(target=self._reap_loop, daemon=True)
+        reaper.start()
+
+    def session_files_dir(self, session_id):
+        path = self.files_root / session_id / "files"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def create_session(self, browser="local", title=None):
+        if browser not in {"local", "cloud"}:
+            raise ValueError("browser must be local or cloud")
+        session_id = self.store.create_session(title or "New session", browser)
+        with self._cond:
+            self._sessions[session_id] = {
+                "browser": None, "agent": None, "stop": threading.Event(),
+                "thread": None, "message_id": None, "viewer": None,
+                "live_url": None, "lock": threading.Lock(), "bus": SessionBus(),
+                "last_active": time.time(),
+            }
+        LOG.info(f"[jev:server] session {session_id[:8]} created ({browser})")
+        return session_id
+
+    def _entry(self, session_id):
+        with self._cond:
+            entry = self._sessions.get(session_id)
+        if entry is None and self.store.get_session(session_id, with_steps=False) is not None:
+            with self._cond:
+                entry = self._sessions.setdefault(session_id, {
+                    "browser": None, "agent": None, "stop": threading.Event(),
+                    "thread": None, "message_id": None, "viewer": None,
+                    "live_url": None, "lock": threading.Lock(), "bus": SessionBus(),
+                    "last_active": time.time(),
+                })
+        return entry
+
+    def _publish(self, session_id, event):
+        entry = self._entry(session_id)
+        if entry is not None:
+            entry["bus"].publish(event)
+
+    def replay(self, session_id, since=0):
+        entry = self._entry(session_id)
+        return entry["bus"].replay(since) if entry is not None else []
+
+    def _wait_slot(self, stopper):
+        with self._cond:
+            while self._running >= self.max_concurrent and not stopper.is_set():
+                self._cond.wait(timeout=0.2)
+            if stopper.is_set():
+                return False
+            self._running += 1
+            return True
+
+    def _release_slot(self):
+        with self._cond:
+            self._running = max(0, self._running - 1)
+            self._cond.notify_all()
+
+    def submit_message(self, session_id, text, max_decisions=None):
+        text = (text or "").strip()
+        if not text or len(text) > 4000:
+            raise ValueError("Enter a message of 1-4,000 characters")
+        if max_decisions is not None and not 1 <= int(max_decisions) <= 10000:
+            raise ValueError("max_decisions must be 1-10,000")
+        entry = self._entry(session_id)
+        if entry is None:
+            return None
+        message_id = self.store.create_message(session_id, text)
+        session = self.store.get_session(session_id, with_steps=False)
+        if session is not None and len(session["messages"]) == 1:
+            self.store.update_session(session_id, title=session_title(text))
+        worker = threading.Thread(
+            target=self._run_message,
+            args=(session_id, message_id, text, max_decisions),
+            daemon=True,
+        )
+        with self._cond:
+            entry["message_id"] = message_id
+            entry["thread"] = worker
+            entry["stop"].clear()
+        worker.start()
+        self._publish(session_id, {"type": "message", "message_id": message_id, "status": "queued"})
+        return message_id
+
+    def stop(self, session_id):
+        entry = self._entry(session_id)
+        if entry is None:
+            return False
+        entry["stop"].set()
+        return True
+
+    def close_session(self, session_id):
+        """Stop any running turn and close the browser. Cloud browsers stop here."""
+        entry = self._entry(session_id)
+        if entry is None:
+            return False
+        entry["stop"].set()
+        thread = entry.get("thread")
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=10)
+        with entry["lock"]:
+            viewer, entry["viewer"] = entry.get("viewer"), None
+            browser, entry["browser"] = entry.get("browser"), None
+        if viewer is not None:
+            try:
+                viewer.shutdown()
+            except Exception:
+                pass
+        if browser is not None:
+            try:
+                browser.close()
+            except Exception:
+                pass
+        try:
+            browser_stop = getattr(browser, "stop_cloud", None)
+            if callable(browser_stop):
+                browser_stop()
+        except Exception:
+            pass
+        self.store.update_session(session_id, status="closed")
+        self._publish(session_id, {"type": "status", "status": "closed"})
+        LOG.info(f"[jev:server] session {session_id[:8]} closed")
+        return True
+
+    def delete_session(self, session_id):
+        self.close_session(session_id)
+        self.store.delete_session(session_id)
+        with self._cond:
+            self._sessions.pop(session_id, None)
+
+    def _reap_loop(self):
+        while True:
+            time.sleep(30)
+            self.reap_idle()
+
+    def reap_idle(self):
+        """Close browsers idle past the timeout. The session row stays for resume."""
+        cutoff = time.time() - self.idle_min * 60
+        with self._cond:
+            ids = list(self._sessions)
+        for session_id in ids:
+            entry = self._entry(session_id)
+            if entry is None or entry.get("browser") is None:
+                continue
+            if entry.get("thread") is not None and entry["thread"].is_alive():
+                continue
+            if entry["last_active"] > cutoff:
+                continue
+            with entry["lock"]:
+                viewer, entry["viewer"] = entry.get("viewer"), None
+                browser, entry["browser"] = entry.get("browser"), None
+            if viewer is not None:
+                try:
+                    viewer.shutdown()
+                except Exception:
+                    pass
+            if browser is not None:
+                try:
+                    browser.close()
+                except Exception:
+                    pass
+            LOG.info(f"[jev:server] session {session_id[:8]} idle; browser closed")
+
+    def _ensure_browser(self, session_id, browser_mode):
+        entry = self._entry(session_id)
+        browser = entry.get("browser")
+        if browser is not None:
+            return browser
+        with self._create_lock:
+            previous = os.environ.get("JEV_BROWSER")
+            os.environ["JEV_BROWSER"] = browser_mode
+            try:
+                browser = Browser("about:blank")
+            finally:
+                if previous is None:
+                    os.environ.pop("JEV_BROWSER", None)
+                else:
+                    os.environ["JEV_BROWSER"] = previous
+        entry["browser"] = browser
+        entry["live_url"] = live_url_for_agent_browser(browser)
+        try:
+            self._publish(session_id, {"type": "tabs", "tabs": session_tabs(browser)})
+        except Exception:
+            pass
+        return browser
+
+    def _create_agent(self, session_id, run_id, goal, browser, max_decisions):
+        with self._create_lock:
+            previous_browser = os.environ.get("JEV_BROWSER")
+            previous_run = os.environ.get("JEV_RUN_ID")
+            session = self.store.get_session(session_id, with_steps=False)
+            os.environ["JEV_BROWSER"] = (session or {}).get("browser", "local")
+            os.environ["JEV_RUN_ID"] = run_id
+            try:
+                agent = self.agent_factory("about:blank", goal, browser=browser)
+            finally:
+                if previous_browser is None:
+                    os.environ.pop("JEV_BROWSER", None)
+                else:
+                    os.environ["JEV_BROWSER"] = previous_browser
+                if previous_run is None:
+                    os.environ.pop("JEV_RUN_ID", None)
+                else:
+                    os.environ["JEV_RUN_ID"] = previous_run
+        config = getattr(agent, "config", None)
+        if isinstance(config, dict):
+            if max_decisions is not None:
+                config["max_decisions"] = max_decisions
+            config["files_dir"] = str(self.session_files_dir(session_id))
+        trace = getattr(agent, "trace", None)
+        if trace is not None:
+            trace.attach(run_id, self.store)
+        return agent
+
+    def _run_message(self, session_id, message_id, text, max_decisions):
+        entry = self._entry(session_id)
+        if entry is None:
+            return
+        with entry["lock"]:
+            if not self._wait_slot(entry["stop"]):
+                self.store.update_message(message_id, status="blocked", error="stopped by user")
+                return
+            try:
+                self._drive_message(session_id, message_id, text, max_decisions, entry)
+            finally:
+                self._release_slot()
+                entry["last_active"] = time.time()
+
+    def _drive_message(self, session_id, message_id, text, max_decisions, entry):
+        session = self.store.get_session(session_id, with_steps=False)
+        if session is None:
+            return
+        run_id = uuid.uuid4().hex
+        started = time.monotonic()
+        self.store.update_message(message_id, status="running", run_id=run_id)
+        self._publish(session_id, {"type": "message", "message_id": message_id, "status": "running"})
+        agent = trace = None
+        try:
+            browser = self._ensure_browser(session_id, session["browser"])
+            current_url = self._browser_url(browser)
+            goal = session_context(
+                self._prior_turns(session_id, message_id),
+                current_url, session_tabs(browser), text,
+            )
+            agent = self._create_agent(session_id, run_id, goal, browser, max_decisions)
+            trace = getattr(agent, "trace", None)
+            entry["agent"] = agent
+            recorded = 0
+            while True:
+                snapshot = agent.command("tick")
+                history = snapshot.get("history") or []
+                new_entries = history[recorded:]
+                recorded = self._record_new_steps(run_id, snapshot, recorded)
+                self._publish(session_id, {
+                    "type": "step", "message_id": message_id,
+                    "steps": [
+                        {"n": item.get("step"), "operation": item.get("operation"),
+                         "target_label": item.get("action"), "url": item.get("url"),
+                         "ms": item.get("elapsed_ms"), "note": item.get("note")}
+                        for item in new_entries
+                    ],
+                })
+                if entry["stop"].is_set():
+                    self._finish_message(
+                        session_id, message_id, snapshot, "blocked", "stopped by user",
+                        trace, started, browser,
+                    )
+                    return
+                if snapshot.get("status") in TERMINAL - {"failed"}:
+                    self._finish_message(
+                        session_id, message_id, snapshot, snapshot["status"], None,
+                        trace, started, browser,
+                    )
+                    return
+        except Exception as error:
+            try:
+                snapshot = agent.snapshot() if agent is not None else {}
+            except Exception:
+                snapshot = {}
+            if trace is not None:
+                trace.emit(
+                    "error", step=len((snapshot or {}).get("history") or []),
+                    type=type(error).__name__, message=str(error)[:300],
+                    where="run", retried=False,
+                )
+            safe = str(redact_secrets(f"{type(error).__name__}: {error}"))[:500]
+            snapshot = snapshot if isinstance(snapshot, dict) else {}
+            self._finish_message(
+                session_id, message_id, snapshot, "failed", safe, trace, started,
+                getattr(agent, "browser", None),
+            )
+        finally:
+            if agent is not None:
+                try:
+                    agent.close(keep_browser=True)
+                except Exception:
+                    pass
+            entry["agent"] = None
+
+    def _prior_turns(self, session_id, message_id):
+        current = self.store.get_message(message_id) or {}
+        cutoff = current.get("n") or 0
+        turns = self.store.session_messages(session_id)
+        # session_messages is n-ordered with no ids; the current turn is last.
+        return turns[: max(0, cutoff - 1)] if cutoff else turns[:-1]
+
+    @staticmethod
+    def _browser_url(browser):
+        tabs = getattr(browser, "tabs", None) or {}
+        active = getattr(browser, "active", None)
+        if active in tabs:
+            return tabs[active].get("url") or ""
+        return ""
+
+    def _record_new_steps(self, run_id, snapshot, recorded):
+        history = snapshot.get("history") or []
+        for entry in history[recorded:]:
+            self.store.add_step(
+                run_id,
+                entry.get("step", recorded + 1),
+                entry.get("operation"),
+                entry.get("action"),
+                entry.get("url"),
+                entry.get("elapsed_ms"),
+                entry.get("note"),
+            )
+        return len(history)
+
+    def _finish_message(self, session_id, message_id, snapshot, status, error, trace, started, browser):
+        prompt, completion = tally_tokens(snapshot)
+        cost = cost_estimate_usd(prompt, completion)
+        reply = compose_reply(snapshot, status, error)
+        duration_ms = round((time.monotonic() - started) * 1000)
+        self.store.update_message(
+            message_id,
+            status=status,
+            ended_at=time.time(),
+            agent_reply=reply,
+            input_tokens=prompt,
+            output_tokens=completion,
+            cost_usd_estimate=cost,
+            duration_ms=duration_ms,
+            error=error,
+            blocked_reason=snapshot.get("blocked_reason"),
+            partial=int(bool(snapshot.get("partial"))),
+        )
+        session = self.store.get_session(session_id, with_steps=False) or {}
+        self.store.update_session(
+            session_id,
+            last_active_at=time.time(),
+            total_input_tokens=(session.get("total_input_tokens") or 0) + prompt,
+            total_output_tokens=(session.get("total_output_tokens") or 0) + completion,
+            total_cost_usd=(session.get("total_cost_usd") or 0) + cost,
+            last_url=(snapshot.get("page") or {}).get("url") or self._browser_url(browser),
+            last_tabs=json.dumps(session_tabs(browser)),
+        )
+        if trace is not None and not trace.ended:
+            trace.emit(
+                "end", step=len(snapshot.get("history") or []), status=status,
+                blocked_reason=snapshot.get("blocked_reason"), error=(error or "")[:200],
+                decisions=len(snapshot.get("decisions") or []),
+                input_tokens=prompt, output_tokens=completion,
+                cost_usd_estimate=cost, wall_ms=snapshot.get("elapsed_ms"),
+                phases={phase: round(value) for phase, value in trace.phase_ms.items()},
+            )
+            trace.flush()
+        self._publish(session_id, {
+            "type": "reply", "message_id": message_id, "status": status,
+            "reply": reply, "cost": cost, "duration_ms": duration_ms,
+        })
+        LOG.info(f"[jev:server] session {session_id[:8]} message {message_id[:8]} {status}")
+
+    def get_viewer(self, session_id):
+        """The session's live frame source, following the agent's active tab."""
+        entry = self._entry(session_id)
+        session = self.store.get_session(session_id, with_steps=False) if entry else None
+        if session is None:
+            return None, 404
+        if session["browser"] != "local":
+            return None, 409
+        browser = entry.get("browser")
+        active_session = getattr(browser, "session", None)
+        call = getattr(browser, "call", None)
+        if active_session is None or call is None:
+            return None, 409
+        with self._cond:
+            viewer = entry.get("viewer")
+            if viewer is not None and viewer.session != active_session:
+                try:
+                    viewer.shutdown()
+                except Exception:
+                    pass
+                viewer = entry["viewer"] = None
+            if viewer is None:
+                viewer = Viewer(self.pump, call, active_session)
+                entry["viewer"] = viewer
+        return viewer, 200
+
+    def live_url(self, session_id):
+        entry = self._entry(session_id)
+        if entry is None:
+            return None
+        return entry.get("live_url")
+
+
+def live_url_for_agent_browser(browser):
+    """A cloud session's live view, only when the operator opted into showing it."""
+    if not env_bool("JEV_CLOUD_SHOW_LIVE_URL", False):
+        return None
+    handle = getattr(browser, "cloud", None)
+    if isinstance(handle, dict):
+        return handle.get("live_url")
+    return None
 
 
 class Handler(BaseHTTPRequestHandler):
