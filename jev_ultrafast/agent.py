@@ -186,6 +186,14 @@ def normalize_link_url(url):
     return (parsed.hostname.lower() + (parsed.path or "").rstrip("/")).rstrip("/")
 
 
+def page_host(url):
+    """Lowercased hostname, or None for blank/hostless URLs."""
+    try:
+        return (urlparse(url or "").hostname or "").lower() or None
+    except ValueError:
+        return None
+
+
 _OPAQUE_TOKEN = re.compile(r"^[A-Za-z0-9_-]{16,}$")
 
 
@@ -457,6 +465,13 @@ def apply_judgment(state, judgment, source_url):
                 break
     state["leave_site"] = bool(judgment.get("leave_site"))
     state["leave_site_url"] = source_url
+    if state.get("home_host") is None and (
+        any(item.get("satisfied") for item in subgoals) or state.get("memo")
+    ):
+        # The home host: where evidence was first satisfied (or the start URL).
+        host = page_host(source_url)
+        if host:
+            state["home_host"] = host
 
 
 def add_event_note(state, text):
@@ -911,6 +926,7 @@ class Agent:
             record=bool(self.record_dir),
             visited_urls=[],
             failed_urls=[],
+            home_host=page_host(page.get("url")),
         )
         note_visit(self.state, page.get("url"))
         if self.record_dir:
@@ -2039,12 +2055,19 @@ class Agent:
             and not any(words & page_words for words in todo_words)
             and not state["page"].get("modal_scoped")
             and not state["page"].get("overlay")
+            and not state.get("page_target")
         ):
             # Nothing here speaks the todo's language: skip the judge call.
-            # complete=False (todos remain); leave_site=True (go look elsewhere).
+            # A content page is never a reason to leave; only blank/error
+            # pages and blocked hosts force a way out.
+            must_leave = (
+                not page_host(url)
+                or "ERR_" in (state["page"].get("text") or "")
+                or on_blocked_host(state)
+            )
             state["judged_url"] = url
             state["judged_step"] = step
-            apply_judgment(state, {"satisfied": [], "facts": [], "leave_site": True}, url)
+            apply_judgment(state, {"satisfied": [], "facts": [], "leave_site": must_leave}, url)
             subgoals = state.get("subgoals") or []
             self.trace.emit(
                 "progress", step=step,
@@ -2054,7 +2077,7 @@ class Agent:
                     for item in subgoals if item.get("satisfied")
                 ],
                 todo=[item["text"] for item in subgoals if not item.get("satisfied")],
-                facts_added=[], leave_site=True, complete=False, early_exit=True,
+                facts_added=[], leave_site=must_leave, complete=False, early_exit=True,
             )
             self._maybe_go_back(state, url, False, [], step)
             return
@@ -2085,6 +2108,14 @@ class Agent:
         had = sum(1 for item in state.get("subgoals") or [] if item.get("satisfied"))
         memo_before = len(state.get("memo") or [])
         apply_judgment(state, judgment, url)
+        if (
+            judgment.get("leave_site")
+            and state.get("home_host")
+            and page_host(url) == state["home_host"]
+        ):
+            state["home_leave_votes"] = state.get("home_leave_votes", 0) + 1
+        else:
+            state["home_leave_votes"] = 0
         gained = sum(1 for item in state.get("subgoals") or [] if item.get("satisfied")) > had
         new_facts = [item["fact"] for item in (state.get("memo") or [])[memo_before:]]
         subgoals = state.get("subgoals") or []
@@ -2302,11 +2333,17 @@ class Agent:
             left > 0 and key.split("\u0000", 1)[0] == "navigate"
             for key, left in (state.get("held_actions") or {}).items()
         )
+        home = state.get("home_host")
+        at_home = bool(home) and page_host(state["page"].get("url")) == home
+        if not at_home:
+            state["home_leave_votes"] = 0
+        votes_ok = (state.get("home_leave_votes") or 0) >= 2 or not at_home
         forced = bool(
             todo
             and state.get("leave_site")
             and state.get("leave_site_url") == state["page"].get("url")
             and not held_nav
+            and votes_ok
         ) or on_blocked_host(state)
         if not forced:
             state.pop("forced_override_used", None)

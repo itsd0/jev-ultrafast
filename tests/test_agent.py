@@ -1646,15 +1646,76 @@ def test_evidence_rules_survive_in_prompts():
     assert "same items on both sides" in TRACK_SYSTEM
 
 
-def test_judge_early_exits_without_overlap(runner, monkeypatch):
+def test_judge_early_exits_without_leaving(runner, monkeypatch):
     judge = Mock(return_value=_judgment())
     monkeypatch.setattr(loop, "decompose_goal", lambda goal: ["population of Bangkok", "Bangkok weather"])
     monkeypatch.setattr(loop, "judge_progress", judge)
     monkeypatch.setattr(loop, "choose", lambda *_args, **kwargs: decision("e3"))
     runner.command("predict", {})
     judge.assert_not_called()
-    assert runner.state["leave_site"] is True
+    assert runner.state["leave_site"] is False  # a content page never forces a leave
+    assert runner.state["force_navigate"] is False
     assert runner.state["judged_url"] == "https://example.test/"
+
+
+def test_early_exit_still_leaves_blank_and_error_pages(runner, monkeypatch):
+    judge = Mock(return_value=_judgment())
+    monkeypatch.setattr(loop, "decompose_goal", lambda goal: ["population of Bangkok", "Bangkok weather"])
+    monkeypatch.setattr(loop, "judge_progress", judge)
+    monkeypatch.setattr(loop, "choose", lambda *_args, **kwargs: decision("e3"))
+    runner.state["page"]["url"] = "about:blank"
+    runner.state["page"]["text"] = ""
+    runner.command("predict", {})
+    assert runner.state["leave_site"] is True
+    assert runner.state["force_navigate"] is True
+    runner.state["page"]["url"] = "https://example.test/"
+    runner.state["page"]["text"] = "This site can't be reached. ERR_NAME_NOT_RESOLVED."
+    runner.state["judged_url"] = None
+    runner.state["judged_step"] = -9
+    runner.state["leave_site"] = False
+    runner.command("predict", {})
+    assert runner.state["leave_site"] is True
+
+
+def test_pagination_run_never_early_exits(runner, monkeypatch):
+    judge = Mock(return_value=_judgment())
+    monkeypatch.setattr(loop, "decompose_goal", lambda goal: ["population of Bangkok", "Bangkok weather"])
+    monkeypatch.setattr(loop, "judge_progress", judge)
+    monkeypatch.setattr(loop, "choose", lambda *_args, **kwargs: decision("e3"))
+    runner.state["page_target"] = 3
+    runner.command("predict", {})
+    judge.assert_called()  # no early skip while paginating
+    assert runner.state["leave_site"] is False
+
+
+def test_home_host_needs_two_judge_votes_to_force(runner):
+    runner.state["subgoals"] = [{"id": 0, "text": "population"}, {"id": 1, "text": "weather"}]
+    runner.state["leave_site"] = True
+    runner.state["leave_site_url"] = runner.state["page"]["url"]
+    runner.state["home_host"] = "example.test"
+    runner.state["home_leave_votes"] = 1
+    runner._update_suppression(runner.state)
+    assert runner.state["force_navigate"] is False
+    runner.state["home_leave_votes"] = 2
+    runner._update_suppression(runner.state)
+    assert runner.state["force_navigate"] is True
+    runner.state["page"]["url"] = "https://away.test/"
+    runner.state["leave_site_url"] = "https://away.test/"
+    runner._update_suppression(runner.state)
+    assert runner.state["home_leave_votes"] == 0  # votes reset off the home host
+
+
+def test_home_host_set_from_first_evidence():
+    state = {"subgoals": [{"id": 0, "text": "population"}], "memo": []}
+    loop.apply_judgment(state, {"satisfied": [{"id": 0, "value": "9M"}], "facts": [], "leave_site": False},
+                        "https://one.test/x")
+    assert state["home_host"] == "one.test"
+    loop.apply_judgment(state, {"satisfied": [], "facts": ["more"], "leave_site": False},
+                        "https://two.test/y")
+    assert state["home_host"] == "one.test"  # first evidence wins
+    blank = {"subgoals": [{"id": 0, "text": "population"}], "memo": []}
+    loop.apply_judgment(blank, {"satisfied": [{"id": 0, "value": "9M"}], "facts": [], "leave_site": False}, "")
+    assert blank.get("home_host") is None
 
 
 def test_judge_runs_with_overlap_or_dialog(runner, monkeypatch):
