@@ -673,10 +673,14 @@ def files_signature(files_dir):
     return tuple((row["name"], row["bytes"], row["mtime"]) for row in session_files(files_dir))
 
 
-def session_context(prior, url, tabs, message):
-    """The goal a follow-up runs with: past turns plus where the browser is."""
+def session_background(prior, url, tabs):
+    """Earlier turns plus where the browser is. Never part of the goal, so
+    mechanical consumers (search fallback, sub-goal splitting) only see the
+    current message. Empty on the first turn."""
+    if not prior:
+        return ""
     lines = []
-    for turn in (prior or [])[-4:]:
+    for turn in prior[-4:]:
         lines.append(f"- They asked: {(turn.get('user_text') or '')[:300]}")
         if turn.get("agent_reply"):
             lines.append(f"  You did: {(turn['agent_reply'] or '')[:300]}")
@@ -686,8 +690,7 @@ def session_context(prior, url, tabs, message):
             f"{tab['key']}{'*' if tab['active'] else ''} {tab['url'] or 'blank'}"
             for tab in tabs
         ))
-    context = "Session so far:\n" + "\n".join(lines)
-    return f"{context}\n\nNew request: {message}" if prior else message
+    return "Session so far:\n" + "\n".join(lines)
 
 
 def _first_sentences(text, limit=2, cap=500):
@@ -1179,7 +1182,7 @@ class SessionRunner:
             pass
         return browser
 
-    def _create_agent(self, session_id, run_id, goal, browser, max_decisions):
+    def _create_agent(self, session_id, run_id, goal, browser, max_decisions, background=""):
         with self._create_lock:
             previous_browser = os.environ.get("JEV_BROWSER")
             previous_run = os.environ.get("JEV_RUN_ID")
@@ -1187,7 +1190,7 @@ class SessionRunner:
             os.environ["JEV_BROWSER"] = (session or {}).get("browser", "local")
             os.environ["JEV_RUN_ID"] = run_id
             try:
-                agent = self.agent_factory("about:blank", goal, browser=browser)
+                agent = self.agent_factory("about:blank", goal, browser=browser, background=background)
             finally:
                 if previous_browser is None:
                     os.environ.pop("JEV_BROWSER", None)
@@ -1364,11 +1367,13 @@ class SessionRunner:
                     navigate(url)
                 entry["navigated"] = True
             current_url = self._browser_url(browser)
-            goal = session_context(
+            background = session_background(
                 self._prior_turns(session_id, message_id),
-                current_url, session_tabs(browser), text,
+                current_url, session_tabs(browser),
             )
-            agent = self._create_agent(session_id, run_id, goal, browser, max_decisions)
+            agent = self._create_agent(
+                session_id, run_id, text, browser, max_decisions, background=background,
+            )
             trace = getattr(agent, "trace", None)
             entry["agent"] = agent
             recorded = 0

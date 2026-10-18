@@ -1822,6 +1822,14 @@ def test_required_cue_verbs_mark_strict_items():
     assert any("Must still: must find the price" in line for line in guidance)
 
 
+def test_session_background_reaches_guidance_first():
+    state = {"history": [], "goal": "now click the second result", "session_background": "They asked: open x.com"}
+    guidance = loop.compose_guidance(state)
+    assert guidance[0].startswith("Session background (earlier turns, same browser):")
+    assert "They asked: open x.com" in guidance[0]
+    assert loop.compose_guidance({"history": [], "goal": "g"}) == []
+
+
 def test_outcome_requirements_drop_procedural_goals():
     mdn = [{"id": 0, "text": "Open MDN Web Docs website"}, {"id": 1, "text": "Report the flatMap syntax"}]
     assert [item["text"] for item in loop.outcome_requirements(mdn, {})] == ["Report the flatMap syntax"]

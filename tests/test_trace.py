@@ -161,9 +161,10 @@ def test_events_roundtrip(tmp_path):
 class SilentAgent:
     """A finished task with no trace of its own; the server still ends it cleanly."""
 
-    def __init__(self, url, goal, browser=None, screenshots=False):
+    def __init__(self, url, goal, browser=None, screenshots=False, background=""):
         self.config = {}
         self.browser = browser
+        self.background = background
 
     def command(self, name, body=None):
         return {"status": "done", "history": [], "decisions": [], "text_calls": [], "page": {"url": "u"}}

@@ -29,10 +29,11 @@ class FakeBrowser:
 class FakeAgent:
     seen = []
 
-    def __init__(self, url, goal, browser=None, script=None):
+    def __init__(self, url, goal, browser=None, script=None, background=""):
         self.url = url
         self.goal = goal
         self.browser = browser
+        self.background = background
         self.config = {}
         self.trace = None
         self.closed_keep = None
@@ -135,7 +136,7 @@ def test_message_reuses_browser_across_turns(tmp_path):
     assert [m["n"] for m in session["messages"]] == [1, 2]
 
 
-def test_followup_goal_includes_session_context(tmp_path):
+def test_followup_keeps_clean_goal_with_background(tmp_path):
     FakeAgent.seen.clear()
     runner = _runner(tmp_path, agent_factory=FakeAgent)
     sid = runner.create_session("local")
@@ -145,9 +146,12 @@ def test_followup_goal_includes_session_context(tmp_path):
     second = runner.submit_message(sid, "now click the second result")
     _wait_done(runner, sid, second)
     assert FakeAgent.seen[0].goal == "open x.com"
-    followup = FakeAgent.seen[1].goal
-    assert "open x.com" in followup and "Current page: https://x.com" in followup
-    assert "New request: now click the second result" in followup
+    assert FakeAgent.seen[0].background == ""
+    # The goal stays the bare message: mechanical consumers (search fallback,
+    # sub-goal splitting) must never see the context blob.
+    assert FakeAgent.seen[1].goal == "now click the second result"
+    background = FakeAgent.seen[1].background
+    assert "open x.com" in background and "Current page: https://x.com" in background
 
 
 def test_idle_timeout_closes_cloud_browser_and_bills_nothing_more(tmp_path):
@@ -200,8 +204,8 @@ def test_tabs_event_published_on_tab_change(tmp_path):
             return {"status": "running", "history": [], "page": {"url": browser.tabs["t2"]["url"]}}
         return {"status": "done", "history": [], "answer": "Two tabs."}
 
-    def factory(url, goal, browser=None):
-        return FakeAgent(url, goal, browser=browser, script=script)
+    def factory(url, goal, browser=None, background=""):
+        return FakeAgent(url, goal, browser=browser, script=script, background=background)
 
     runner = _runner(tmp_path, agent_factory=factory)
     sid = runner.create_session("local")
@@ -261,8 +265,8 @@ def test_files_event_published_when_agent_writes(tmp_path):
             return {"status": "running", "history": [], "page": {"url": "about:blank"}}
         return {"status": "done", "history": [], "answer": "Saved."}
 
-    def factory(url, goal, browser=None):
-        return FakeAgent(url, goal, browser=browser, script=script)
+    def factory(url, goal, browser=None, background=""):
+        return FakeAgent(url, goal, browser=browser, script=script, background=background)
 
     runner.agent_factory = factory
     _inject(runner, sid, FakeBrowser())
@@ -320,8 +324,8 @@ def test_ensure_browser_routes_downloads(tmp_path):
 
 
 class WallAgent(FakeAgent):
-    def __init__(self, url, goal, browser=None):
-        super().__init__(url, goal, browser=browser)
+    def __init__(self, url, goal, browser=None, background=""):
+        super().__init__(url, goal, browser=browser, background=background)
         self.state = {
             "history": [], "browser": browser,
             "page": {"url": "https://wall.test/sorry"},
@@ -359,8 +363,8 @@ def test_cloud_restart_swaps_browser_once(tmp_path, monkeypatch):
     made = []
     seen_agents = []
 
-    def agent_factory(url, goal, browser=None):
-        agent = WallAgent(url, goal, browser=browser)
+    def agent_factory(url, goal, browser=None, background=""):
+        agent = WallAgent(url, goal, browser=browser, background=background)
         seen_agents.append(agent)
         return agent
 
@@ -427,8 +431,8 @@ def test_local_wall_never_restarts(tmp_path):
     made = []
     seen_agents = []
 
-    def agent_factory(url, goal, browser=None):
-        agent = WallAgent(url, goal, browser=browser)
+    def agent_factory(url, goal, browser=None, background=""):
+        agent = WallAgent(url, goal, browser=browser, background=background)
         seen_agents.append(agent)
         return agent
 

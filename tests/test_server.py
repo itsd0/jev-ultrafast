@@ -55,12 +55,13 @@ class FakeBrowser:
 
 
 class FakeAgent:
-    def __init__(self, url, goal, script, browser=None, screenshots=False):
+    def __init__(self, url, goal, script, browser=None, screenshots=False, background=""):
         self.url = url
         self.goal = goal
         self.script = script
         self.config = {}
         self.browser = browser
+        self.background = background
         self.closed = False
         self.ticks = 0
         self.last = snap("running", 0)
@@ -87,8 +88,8 @@ def start_service(tmp_path, monkeypatch):
     def start(script, max_concurrent=2, token="", browser=None):
         fakes = []
 
-        def factory(url, goal, browser=None):
-            fake = FakeAgent(url, goal, script, browser=browser)
+        def factory(url, goal, browser=None, background=""):
+            fake = FakeAgent(url, goal, script, browser=browser, background=background)
             fakes.append(fake)
             return fake
 
@@ -316,9 +317,9 @@ def test_live_waits_for_browser_startup(monkeypatch):
             return snap("running", 0)
         return snap("done", 0)
 
-    def factory(url, goal, browser=None):
+    def factory(url, goal, browser=None, background=""):
         gate.wait(timeout=10)
-        return FakeAgent(url, goal, script, browser=browser)
+        return FakeAgent(url, goal, script, browser=browser, background=background)
 
     # A service whose factory blocks until the viewer is already waiting.
     store = hosted.Store(":memory:")

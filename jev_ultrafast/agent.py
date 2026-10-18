@@ -648,6 +648,9 @@ def compose_guidance(state):
     fresh = [note for note in state.get("event_notes") or [] if step - note.get("step", 0) <= 4]
     state["event_notes"] = fresh
     guidance = [note["text"] for note in fresh]
+    background = (state.get("session_background") or "").strip()
+    if background:
+        guidance.insert(0, f"Session background (earlier turns, same browser): {background[-1500:]}")
     if state.get("winding_down"):
         guidance.append("Budget nearly used: finish now with what you have.")
     subgoals = state.get("subgoals") or []
@@ -1086,6 +1089,7 @@ class Agent:
         select_inline_max=None,
         vision=None,
         browser=None,
+        background="",
     ):
         task = goals.strip() if isinstance(goals, str) else "\n".join(goals).strip()
         if not task:
@@ -1127,6 +1131,7 @@ class Agent:
         self.state = dict(
             browser=self.browser,
             goal="\n".join(plan),
+            session_background=background or "",
             page=page,
             decision=None,
             history=[],
