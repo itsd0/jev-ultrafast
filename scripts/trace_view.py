@@ -44,70 +44,72 @@ def load(path):
     return events
 
 
+def one_line(event):
+    kind, step, item = event.get("kind"), event.get("step"), event.get("data") or {}
+    head = f"#{step}"
+    if kind == "snapshot":
+        modal = " modal" if item.get("modal_scoped") else ""
+        overlay = f" [{item.get('overlay')}]" if item.get("overlay") else ""
+        return (
+            f"{head} page {short_url(item.get('url'))} · {item.get('controls')} controls"
+            f"{modal}{overlay} · changed={item.get('page_changed')} · indexer={item.get('duration_ms')}ms"
+        )
+    if kind == "offered":
+        hidden = {**item.get("held", {}), **item.get("suppressed", {})}
+        return f"{head} offered {item.get('offered_count')} controls, hidden={hidden or '-'}"
+    if kind == "decision":
+        return (
+            f"{head} decide {item.get('provider')}/{item.get('model')} {item.get('operation')}"
+            f"->{item.get('choice')} conf={item.get('confidence')} {item.get('latency_ms')}ms"
+            f" retries={item.get('retries')}"
+            + (f" INVALID {item.get('invalid_reason')}" if item.get("invalid_reason") else "")
+        )
+    if kind == "text":
+        value = item.get("value")
+        shown = ("'" + str(value)[:40] + "'") if value else "-"
+        return (
+            f"{head} text {item.get('purpose')} {shown} {item.get('latency_ms')}ms"
+            f" valid={item.get('valid')} filtered={item.get('filtered')}"
+            + (f" {item.get('reason')}" if item.get("reason") else "")
+        )
+    if kind == "action":
+        return (
+            f"{head} {item.get('operation')} '{item.get('target')}'"
+            f" [{item.get('strategy')}] {'ok' if item.get('ok', True) else 'FAIL'}"
+            f" {item.get('duration_ms')}ms cdp={item.get('cdp_calls')}/{item.get('cdp_ms')}ms"
+        )
+    if kind == "verify":
+        return (
+            f"{head} verify {item.get('kind')} {'ok' if item.get('success') else 'FAIL'}"
+            f" {item.get('before')} -> {item.get('after')}"
+            + (f" next: {item.get('next_strategy')}" if item.get("next_strategy") else "")
+        )
+    if kind == "guard":
+        return (f"{head} guard {item.get('type')}: {item.get('pattern') or item.get('label') or ''}"
+                f" {item.get('evidence') or ''}".rstrip())
+    if kind == "progress":
+        if item.get("gate_missing") is not None:
+            return (
+                f"{head} gate accept={item.get('gate_accept')} partial={item.get('gate_partial')}"
+                f" missing={item.get('gate_missing')}"
+            )
+        return (
+            f"{head} progress satisfied={[s['text'] for s in item.get('satisfied', [])]}"
+            f" todo={item.get('todo')} facts+={len(item.get('facts_added', []))}"
+        )
+    if kind == "error":
+        return f"{head} ERROR {item.get('type')}: {item.get('message')} ({item.get('where')})"
+    return None
+
+
 def render(events):
     lines = []
-    steps = sorted({event.get("step") for event in events if event.get("step") is not None})
-    for step in steps:
-        at = [event for event in events if event.get("step") == step]
-        by_kind = {}
-        for event in at:
-            by_kind.setdefault(event.get("kind"), []).append(event.get("data") or {})
-        head = f"#{step}"
-        snap = (by_kind.get("snapshot") or [{}])[-1]
-        if snap:
-            modal = " modal" if snap.get("modal_scoped") else ""
-            overlay = f" [{snap.get('overlay')}]" if snap.get("overlay") else ""
-            lines.append(
-                f"{head} page {short_url(snap.get('url'))} · {snap.get('controls')} controls"
-                f"{modal}{overlay} · changed={snap.get('page_changed')} · indexer={snap.get('duration_ms')}ms"
-            )
-        offered = (by_kind.get("offered") or [{}])[0]
-        if offered:
-            hidden = {**offered.get("held", {}), **offered.get("suppressed", {})}
-            lines.append(f"{head} offered {offered.get('offered_count')} controls, hidden={hidden or '-'}")
-        for item in by_kind.get("decision", []):
-            lines.append(
-                f"{head} decide {item.get('provider')}/{item.get('model')} {item.get('operation')}"
-                f"->{item.get('choice')} conf={item.get('confidence')} {item.get('latency_ms')}ms"
-                f" retries={item.get('retries')}"
-                + (f" INVALID {item.get('invalid_reason')}" if item.get("invalid_reason") else "")
-            )
-        for item in by_kind.get("text", []):
-            value = item.get("value")
-            shown = ("'" + str(value)[:40] + "'") if value else "-"
-            lines.append(
-                f"{head} text {item.get('purpose')} {shown} {item.get('latency_ms')}ms"
-                f" valid={item.get('valid')} filtered={item.get('filtered')}"
-                + (f" {item.get('reason')}" if item.get("reason") else "")
-            )
-        for item in by_kind.get("action", []):
-            lines.append(
-                f"{head} {item.get('operation')} '{item.get('target')}'"
-                f" [{item.get('strategy')}] {'ok' if item.get('ok', True) else 'FAIL'}"
-                f" {item.get('duration_ms')}ms cdp={item.get('cdp_calls')}/{item.get('cdp_ms')}ms"
-            )
-        for item in by_kind.get("verify", []):
-            lines.append(
-                f"{head} verify {item.get('kind')} {'ok' if item.get('success') else 'FAIL'}"
-                f" {item.get('before')} -> {item.get('after')}"
-                + (f" next: {item.get('next_strategy')}" if item.get("next_strategy") else "")
-            )
-        for item in by_kind.get("guard", []):
-            lines.append(f"{head} guard {item.get('type')}: {item.get('pattern') or item.get('label') or ''}"
-                         f" {item.get('evidence') or ''}".rstrip())
-        for item in by_kind.get("progress", []):
-            if item.get("gate_missing") is not None:
-                lines.append(
-                    f"{head} gate accept={item.get('gate_accept')} partial={item.get('gate_partial')}"
-                    f" missing={item.get('gate_missing')}"
-                )
-            else:
-                lines.append(
-                    f"{head} progress satisfied={[s['text'] for s in item.get('satisfied', [])]}"
-                    f" todo={item.get('todo')} facts+={len(item.get('facts_added', []))}"
-                )
-        for item in by_kind.get("error", []):
-            lines.append(f"{head} ERROR {item.get('type')}: {item.get('message')} ({item.get('where')})")
+    for event in sorted(events, key=lambda event: event.get("seq", 0)):
+        if event.get("kind") == "end":
+            continue
+        line = one_line(event)
+        if line:
+            lines.append(line)
     end = next((event.get("data") or {} for event in events if event.get("kind") == "end"), {})
     if end:
         phases = " ".join(f"{key}={value}ms" for key, value in (end.get("phases") or {}).items())

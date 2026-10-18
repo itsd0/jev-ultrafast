@@ -81,10 +81,17 @@ def test_sensitive_field_values_are_redacted(tmp_path, monkeypatch):
 
 
 def test_scrub_handles_headers_and_inline_keys():
-    assert scrub({"Authorization": "Bearer xyz", "other": "ok"}) == {"[redacted]": "[redacted]", "other": "ok"}
+    assert scrub({"Authorization": "Bearer xyz", "other": "ok"}) == {"Authorization": "[redacted]", "other": "ok"}
     assert scrub("call with api_key=supersecret9 here") == "call with api_key=[redacted] here"
     assert scrub("Bearer abc.def-ghi") == "Bearer [redacted]"
-    assert scrub({"nested": [{"X-Browser-Use-API-Key": "k"}]}) == {"nested": [{"[redacted]": "[redacted]"}]}
+    assert scrub({"nested": [{"X-Browser-Use-API-Key": "k"}]}) == {"nested": [{"X-Browser-Use-API-Key": "[redacted]"}]}
+
+
+def test_scrub_keeps_token_counts():
+    usage = {"prompt_tokens": 100, "completion_tokens": 50, "outputTokens": 9, "access_token": "secret"}
+    cleaned = scrub(usage)
+    assert cleaned["access_token"] == "[redacted]"
+    assert (cleaned["prompt_tokens"], cleaned["completion_tokens"], cleaned["outputTokens"]) == (100, 50, 9)
 
 
 def test_debug_payloads_are_truncated(tmp_path, monkeypatch):

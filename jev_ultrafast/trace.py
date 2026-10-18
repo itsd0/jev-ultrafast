@@ -32,7 +32,10 @@ SECRET_ENV_NAMES = (
     "BROWSER_USE_API_KEY",
     "JEV_SERVER_TOKEN",
 )
-SECRET_HEADER = re.compile(r"(?i)^(authorization|x-browser-use-api-key|api[_-]?key|.*token.*|.*secret.*)$")
+SECRET_KEY = re.compile(
+    r"(?i)^(authorization|x-browser-use-api-key|api[_\- ]?key|token|.*[_\-]token|.*Token"
+    r"|.*secret.*|password|passwd|pwd)$"
+)
 BEARER = re.compile(r"(?i)bearer\s+[A-Za-z0-9\-._~+/=]+")
 INLINE_KEY = re.compile(r"(?i)(api[_-]?key\s*[:=]\s*)([^\s\"']+)")
 LONG_TOKEN = re.compile(r"\b(sk-[A-Za-z0-9_\-]{8,}|tsafe-[A-Za-z0-9_\-]{8,}|x-bu-[A-Za-z0-9_\-]{8,})\b")
@@ -89,9 +92,7 @@ def scrub(value, _secrets=None):
             _secrets = [secret for secret in _secrets if len(secret) >= 8]
         if isinstance(value, dict):
             return {
-                ("[redacted]" if SECRET_HEADER.match(str(key)) else key): (
-                    "[redacted]" if SECRET_HEADER.match(str(key)) else scrub(item, _secrets)
-                )
+                key: ("[redacted]" if SECRET_KEY.match(str(key)) else scrub(item, _secrets))
                 for key, item in value.items()
             }
         if isinstance(value, list):
@@ -278,12 +279,14 @@ def diagnose_trace(events):
     """
     kinds = [event.get("kind") for event in events]
     data = [event.get("data") or {} for event in events]
+    end = next((item for kind, item in zip(kinds, data) if kind == "end"), {})
+    if end.get("status") == "done":
+        return None, ""
     errors = [item for kind, item in zip(kinds, data) if kind == "error"]
     for item in errors:
         message = f"{item.get('type', '')} {item.get('message', '')}".lower()
         if any(word in message for word in ("connection", "http 4", "http 5", "429", "timeout", "unavailable")):
             return "environment/API error", f"{item.get('type')}: {item.get('message')}"[:160]
-    end = next((item for kind, item in zip(kinds, data) if kind == "end"), {})
     reason = (end.get("blocked_reason") or "").lower()
     if "budget" in reason:
         return "budget", end.get("blocked_reason", "")
