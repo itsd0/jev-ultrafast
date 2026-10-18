@@ -86,6 +86,48 @@ def test_classify_success_is_none():
     assert bench.classify(task, evidence(), good, False) is None
 
 
+def _event(kind, **data):
+    return {"kind": kind, "data": data}
+
+
+def test_env_blocked_needs_a_wall_and_no_route():
+    wall = _event("guard", type="captcha", host="google.com")
+    stranded = _event("guard", type="navigate_fallback", proposed="u", fallback=None)
+    assert bench.env_blocked([wall, stranded]) is not None
+    assert bench.env_blocked([wall]) is None  # alternate routes remain
+    assert bench.env_blocked([stranded]) is None  # no wall
+    transport = _event("error", type="ClientError", message="connection reset")
+    assert bench.env_blocked([transport, stranded]) is not None
+    other = _event("error", type="ValueError", message="bad choice")
+    assert bench.env_blocked([other, stranded]) is None
+
+
+def test_summary_pass_at_3_and_env_excluded():
+    suite = {"tasks": [{"id": "a"}, {"id": "b"}]}
+
+    def record(task, rep, reason, env=None):
+        return {
+            "task": task, "rep": rep, "reason": reason, "env_blocked": env,
+            "wall_s": 1.0, "steps": 2, "decisions": 2, "tokens": 3, "cost_usd": 0.0,
+        }
+
+    records = [
+        record("a", 1, None),
+        record("a", 2, "loop"),
+        record("a", 3, "loop", "wall at x; no search route left"),
+        record("b", 1, "loop"),
+    ]
+    summary = bench.summarize(suite, records)
+    assert summary["pass_at_1"] == {"ok": 1, "total": 4}
+    assert summary["pass_at_3"] == {"ok": 1, "total": 2}
+    assert summary["env_excluded"]["total"] == 3
+    assert summary["env_excluded"]["excluded"] == [
+        {"task": "a", "rep": 3, "evidence": "wall at x; no search route left"}
+    ]
+    text = bench.report(suite, records)
+    assert "pass@3" in text and "Env-excluded: 1/3" in text and "a r3" in text
+
+
 def test_git_info_reports_sha_dirty_and_diff():
     git = bench.git_info()
     assert re.fullmatch(r"[0-9a-f]{40}", git["sha"] or "")
