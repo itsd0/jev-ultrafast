@@ -45,6 +45,7 @@ from .browser import (
     validate_navigate_url,
 )
 from .config import resolve_config
+from .done_check import check_done
 from .llm.base import ProviderError, RefusalError
 from .llm.reflection import ReflectionProvider
 from .llm.schema import EXTRACT_SCHEMA, JUDGE_SCHEMA, STEP_SCHEMA, response_format
@@ -551,11 +552,26 @@ class BeamAgent:
             self._emit_end(state, "blocked")
             self.trace.flush()
             return self.snapshot()
-        verdict = self._run_judge(state, page, text, step_no)
-        if verdict is None:
-            return self._register_failure(
-                state, step_no, "Verification was unavailable; re-check the page and retry done.",
-            )
+        try:
+            tabs = len(self._tabs(state)) or None
+        except Exception:
+            tabs = None
+        det = check_done(
+            state["goal"], text=self._page_text(page), title=page.get("title"),
+            memo=state.get("memo") or [], visited=state.get("visited_urls") or [],
+            tabs_open=tabs, widget_commits=state.get("_widget_commits", 0),
+            controls=page.get("actions") or [],
+        )
+        if det["missing"]:
+            verdict: dict = {"complete": False, "missing": det["missing"], "source": "evidence"}
+        else:
+            verdict = self._run_judge(state, page, text, step_no)
+            if verdict is None:
+                return self._register_failure(
+                    state, step_no,
+                    "Verification was unavailable; re-check the page and retry done.",
+                )
+            verdict["source"] = "judge"
         if verdict["complete"]:
             self._record(
                 state, output, result, step_no, summary,
@@ -589,7 +605,10 @@ class BeamAgent:
             self._emit_end(state, "blocked")
             self.trace.flush()
             return self.snapshot()
-        self.trace.emit("guard", step=step_no, type="done_rejected", missing=missing[:300])
+        self.trace.emit(
+            "guard", step=step_no, type="done_rejected", missing=missing[:300],
+            source=verdict.get("source") or "judge",
+        )
         add_event_note(state, f"Done was rejected: {missing[:300]}. Re-verify from the page.")
         self.transcript.add_turn(
             step_no, "", json.dumps(result.output, sort_keys=True),
@@ -751,6 +770,8 @@ class BeamAgent:
                 verified = bool(fresh_fp) and fresh_fp != (entry.get("fingerprint") or "")
             else:
                 continue
+            if verified:
+                state["_widget_commits"] = state.get("_widget_commits", 0) + 1
             event = self._widget_stall.note(
                 key, label=label, verified=bool(verified), strategy=entry.get("name"),
                 fingerprint=fresh_fp,

@@ -507,6 +507,23 @@ def _prompt(agent, call=-1):
     return agent._provider_override.calls[call]["messages"][-1]["content"]
 
 
+def test_done_skips_judge_when_evidence_missing():
+    page = _page([], text="Amsterdam stays")
+    agent, _browser = _agent(
+        page, [
+            (_step(("done", {"text": "Found it.", "success": True})), {}),
+            (_step(("wait", {"amount": 0})), {}),
+        ],
+        helpers=[({"complete": True, "missing": []}, {})],
+    )
+    agent.state["goal"] = "Find Zurich hotels"
+    snapshot = agent.command("tick")
+    assert snapshot["status"] == "ready"
+    assert agent._helper_override.calls == []
+    agent.command("tick")
+    assert "goal names Zurich" in _prompt(agent)
+
+
 def test_unverified_clicks_escalate_then_suppress():
     page = _page([_action("e1", "click", "Nonstop", node=1)])
     script = [(_step(("click", {"index": 1})), {})] * 7

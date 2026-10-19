@@ -405,6 +405,23 @@ def test_guidance_ranks_buttons_and_stems_plurals():
     assert any("Filter" in line and "consider" in line for line in guidance)
 
 
+def test_done_gate_rejects_judge_complete_without_entity_evidence(runner, monkeypatch):
+    monkeypatch.setattr(
+        loop, "judge_progress",
+        lambda context, system: (
+            {"satisfied": [], "facts": [], "complete": True, "missing": ""},
+            {"model": "t", "latency_ms": 1, "usage": {}},
+        ),
+    )
+    runner.state["goal"] = "Find Zurich hotels"
+    runner.state["page"]["text"] = "Amsterdam stays"
+    runner.state.pop("subgoals", None)
+    verdict = runner._done_verdict(runner.state, runner.state["page"], 1)
+    assert verdict["accept"] is False
+    assert "goal names Zurich" in verdict["missing"]
+    assert "Zurich" in runner.state["_done_missing"]
+
+
 def test_done_runs_the_judge_on_demand(runner, monkeypatch):
     calls = []
 
@@ -1637,6 +1654,7 @@ def test_done_retries_vague_number_answer_once(runner, monkeypatch):
         ),
     )
     runner.state["goal"] = "find the population of Bangkok"
+    runner.state["page"]["text"] = "Bangkok census table"
     runner.state["decision"] = decision("DONE")
     runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
     assert runner.state["status"] == "done"
@@ -2062,7 +2080,7 @@ def test_done_gate_rejects_twice_then_partial_accepts(runner, monkeypatch):
     runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
     assert runner.state["status"] == "done"
     assert runner.state["partial"] is True
-    assert runner.state["answer"] == "answer"
+    assert runner.state["answer"] == "answer\n\nStill missing: the temperature"
 
 
 def test_done_gate_accepts_complete(runner, monkeypatch):

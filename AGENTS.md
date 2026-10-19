@@ -8,6 +8,7 @@ Read README.md before editing. Keep the loop small: page -> indexed elements -> 
 - TYPE_TEXT invokes the text LLM. Cache a stale retry's value only while its entire helper input is identical.
 - Never retry a browser mutation. Log execution before observing its result.
 - Widget-stall guard is shared: N=3 unverified actions on one control/dialog forces a strategy change, a second round marks it unmet and moves on (`JEV_WIDGET_STALL_N`).
+- Done honesty is deterministic: before success=true, goal entities must appear in evidence, widget goals need a verified commit, filter values must not look unselected; missing items force success=false and join the reply.
 - Screenshots are optional; the model does not consume them. Keep demonstration footage at its original speed.
 - Keep credentials server-side and .env ignored. Tests must not call paid APIs.
 - Secrets travel as `<secret>NAME</secret>` placeholders; values substitute at execution on matching domains only and never reach prompts, history, traces, or logs.

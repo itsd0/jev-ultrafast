@@ -12,6 +12,7 @@ from urllib.parse import parse_qsl, quote_plus, urlparse
 
 from .browser import Browser, CoveredTarget, StalePage
 from .config import parse_search_engines, resolve_config
+from .done_check import check_done, page_text, tabs_open
 from .model import (
     INVALID_RESPONSE,
     SAVE_FILE_SCHEMA,
@@ -2256,6 +2257,8 @@ class Agent:
             state["text_calls"].append(
                 {**attempt_helper, "field": "final answer", "value": attempt_text}
             )
+        if state.get("partial") and state.get("_done_missing") and text:
+            text = f"{text}\n\nStill missing: {state['_done_missing'][:300]}"
         return text
 
     def _unblock_scroll(self, state, page, decision):
@@ -2346,6 +2349,8 @@ class Agent:
             return
         modal = is_modal_key(key)
         success = changed if modal else verify.get("success", False)
+        if success:
+            state["_widget_commits"] = state.get("_widget_commits", 0) + 1
         tracker = self._widget_tracker()
         here = (state.get("page") or {}).get("url") or ""
         if state.get("_widget_url") != here:
@@ -3059,6 +3064,20 @@ class Agent:
                 missing = ""
             else:
                 missing = (judgment or {}).get("missing") or "unverified completion"
+        det = check_done(
+            state["goal"], text=page_text(page), title=page.get("title"),
+            memo=state.get("memo") or [], visited=state.get("visited_urls") or [],
+            tabs_open=tabs_open(state.get("browser")),
+            widget_commits=state.get("_widget_commits", 0),
+            controls=page.get("actions") or [],
+        )
+        if det["missing"]:
+            missing = "; ".join(part for part in [missing, "; ".join(det["missing"])] if part)
+            self.trace.emit(
+                "guard", step=step, type="done_evidence",
+                missing=det["missing"], done=det["done"],
+            )
+        state["_done_missing"] = missing
         if not missing:
             return {"accept": True, "partial": False, "missing": ""}
         todo_remain = state.get("subgoals") is not None and any(

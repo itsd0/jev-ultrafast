@@ -56,6 +56,7 @@ The default core is the classic TypeSafe-decision + Mercury-text split: TypeSafe
 
 - `JEV_AGENT=classic` (default) keeps TypeSafe-decision + Mercury-text; `new` selects Beam.
 - Both cores share the widget-stall guard: after `JEV_WIDGET_STALL_N` (default 3) unverified actions on one control or dialog, the run must change strategy; after a second round it marks the widget unmet and moves on.
+- Both cores share the pre-done evidence check: named goal entities must appear in observed text, filter/date/traveler goals need a verified widget commit, and named filter values must not look unselected — otherwise the run ends success=false with done-vs-missing listed.
 - `REFLECTION_API_KEY` authenticates Beam at `https://api.reflection.ai/openai/v1`; `JEV_MODEL` (default `Beam-1.0-501B-A23B`) and `JEV_REASONING_EFFORT` (`low`–`max`, default `low`) tune it. Structured output uses strict `json_schema`, one schema per call, never tool calls.
 - Domain-scoped secrets: `JEV_SECRET_<NAME>` plus `JEV_SECRET_<NAME>_DOMAINS` (comma-separated hosts). The model only sees `<secret>NAME</secret>`; the executor substitutes the value at input time on matching hosts only. Secret values never reach prompts, history, traces, or logs.
 - Token cost uses `JEV_PRICE_<MODEL>_IN/OUT` per 1M tokens (for Beam: `JEV_PRICE_BEAM_1_0_501B_A23B_IN/OUT`), blank by default with a "price not set" display.
